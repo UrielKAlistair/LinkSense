@@ -1,0 +1,5 @@
+# captured/generated data, not source
+*.pcap
+*.csv
+__pycache__/
+*.pyc
