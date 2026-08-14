@@ -23,13 +23,34 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("WifiSimpleInfra");
 uint64_t g_totalBytes = 0;
 static const uint16_t BASE_PORT = 8000;
-static const uint16_t SAT_CAP = 55; // Mbps
+
+// Simulated time at which the candidate finished associating, and the AP it
+// actually landed on. -1 means "never associated" (too far, or the target
+// was unreachable), which is itself a meaningful outcome to record.
+double g_candidateAssocTime = -1.0;
+Mac48Address g_candidateAssocAp;
+
+/**
+ * Fired by StaWifiMac's "Assoc" trace when the candidate completes
+ * association. Only the first association is recorded: the label is defined
+ * over the window starting at the candidate's initial join.
+ */
+void
+CandidateAssociated(Mac48Address apAddr)
+{
+    if (g_candidateAssocTime < 0.0)
+    {
+        g_candidateAssocTime = Simulator::Now().GetSeconds();
+        g_candidateAssocAp = apAddr;
+    }
+}
 
 /**
  * Bytes received since the last PrintStats tick for one tracked socket
@@ -137,6 +158,7 @@ main(int argc, char* argv[])
     double simStopTime{30.0};
     uint32_t rngSeed{0}; // 0 (default) means "pick a random seed"
     std::string outDir{"runs"};
+    std::string runTag; // empty => auto-generate a unique run id
     bool verbose{false};
     // candidate's position is an explicit, independently controllable
     // offset from its target AP (polar coordinates), not a derived
@@ -144,6 +166,14 @@ main(int argc, char* argv[])
     // sweep for a throughput-vs-signal-quality dataset
     double candidateDistance{10.0}; // metres from targetAP
     double candidateAngleDeg{0.0};  // degrees from the +x axis
+    // absolute placement, overriding the polar spec above when set. Needed
+    // for matched-set runs: to compare "candidate joins AP0" against
+    // "candidate joins AP1" fairly, the candidate has to stay in one fixed
+    // spot while only targetAP changes - which a targetAP-relative offset
+    // can't express, since it moves the candidate along with the target.
+    double candidateX{0.0};
+    double candidateY{0.0};
+    bool candidateAbsolute{false};
     // stddev (metres) of Gaussian jitter applied to background STA
     // placement (x and y); 0 keeps the old fully-deterministic 1D line
     double jitterStd{2.0};
@@ -151,6 +181,19 @@ main(int argc, char* argv[])
     // by AP index; 1 (default) reproduces the old co-channel-everywhere
     // behaviour, >1 gives each AP group its own interference domain
     uint32_t nChannels{1};
+    // Offered load per background STA. Total background load is therefore
+    // nSTAs * bgPerStaMbps, so adding clients genuinely makes an AP busier -
+    // the previous scheme pinned TOTAL offered load to a constant and split
+    // it among however many STAs existed, which meant "more clients" changed
+    // nothing about congestion, only per-client granularity.
+    double bgPerStaMbps{6.0};
+    // Offered load for the candidate. Deliberately far above what an 802.11n
+    // 20MHz link can carry (~40-50 Mbps of UDP goodput), so the candidate is
+    // always backlogged and its measured throughput reports the capacity it
+    // could actually win. If this is set at or below achievable capacity the
+    // label degenerates into "did it get its offered rate", which measures
+    // the traffic generator rather than the network.
+    double candidateOfferedMbps{100.0};
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("packetSize", "size of application packet sent", packetSize);
@@ -164,17 +207,29 @@ main(int argc, char* argv[])
     cmd.AddValue("simStopTime", "total simulated seconds to run", simStopTime);
     cmd.AddValue("rngSeed", "RNG seed to use; 0 (default) picks a random seed", rngSeed);
     cmd.AddValue("outDir", "directory to write per-run output (metadata + pcap) under", outDir);
+    cmd.AddValue("runTag", "explicit run directory name; empty (default) auto-generates a unique one", runTag);
     cmd.AddValue("candidateDistance", "metres from targetAP the candidate sits", candidateDistance);
     cmd.AddValue("candidateAngleDeg", "angle (degrees, from +x axis) from targetAP to candidate", candidateAngleDeg);
+    cmd.AddValue("candidateX", "absolute x of candidate; requires candidateAbsolute=1", candidateX);
+    cmd.AddValue("candidateY", "absolute y of candidate; requires candidateAbsolute=1", candidateY);
+    cmd.AddValue("candidateAbsolute", "use candidateX/candidateY instead of candidateDistance/Angle", candidateAbsolute);
     cmd.AddValue("jitterStd", "stddev (metres) of Gaussian jitter on background STA placement", jitterStd);
     cmd.AddValue("nChannels", "number of distinct wifi channels APs round-robin across", nChannels);
+    cmd.AddValue("bgPerStaMbps", "offered load per background STA in Mbps", bgPerStaMbps);
+    cmd.AddValue("candidateOfferedMbps",
+                "offered load for the candidate in Mbps; keep well above link capacity so the "
+                "measured throughput reflects available capacity rather than the generator",
+                candidateOfferedMbps);
     cmd.Parse(argc, argv);
 
     NS_ABORT_MSG_IF(targetAP >= nAPs, "targetAP must be less than nAPs");
     NS_ABORT_MSG_IF(simStopTime - candidateStartTime < 1.0,
                     "candidateStartTime leaves less than 1s to measure throughput before simStopTime");
     NS_ABORT_MSG_IF(nChannels == 0, "nChannels must be at least 1");
-    NS_ABORT_MSG_IF(candidateDistance <= 0.0, "candidateDistance must be positive");
+    NS_ABORT_MSG_IF(!candidateAbsolute && candidateDistance <= 0.0,
+                    "candidateDistance must be positive");
+    NS_ABORT_MSG_IF(bgPerStaMbps <= 0.0, "bgPerStaMbps must be positive");
+    NS_ABORT_MSG_IF(candidateOfferedMbps <= 0.0, "candidateOfferedMbps must be positive");
 
     // if the caller didn't pin a seed, draw a real one so repeated runs
     // aren't silently identical; either way, the seed actually used gets
@@ -198,15 +253,19 @@ main(int argc, char* argv[])
     std::mt19937 placementRng(rngSeed);
     std::normal_distribution<double> jitter(0.0, jitterStd);
 
+    // per-packet spacing that realises the requested offered rates; the
+    // background and the candidate get their own, since the candidate is
+    // deliberately driven far harder (see candidateOfferedMbps above)
     Time interval;
     if (intervalArg.empty())
     {
-        interval = Seconds(packetSize * 8.0 * nSTAs / (SAT_CAP * 1e6));
+        interval = Seconds(packetSize * 8.0 / (bgPerStaMbps * 1e6));
     }
     else
     {
         interval = Time(intervalArg);
     }
+    Time candidateInterval = Seconds(packetSize * 8.0 / (candidateOfferedMbps * 1e6));
 
     if (verbose)
     {
@@ -296,9 +355,22 @@ main(int argc, char* argv[])
     // target" are controlled, comparable scenarios rather than a side
     // effect of topology
     double angleRad = candidateAngleDeg * kPi / 180.0;
-    Vector candidatePosition(apPosition[targetAP].x + candidateDistance * std::cos(angleRad),
-                            apPosition[targetAP].y + candidateDistance * std::sin(angleRad),
-                            0.0);
+    Vector candidatePosition =
+        candidateAbsolute
+            ? Vector(candidateX, candidateY, 0.0)
+            : Vector(apPosition[targetAP].x + candidateDistance * std::cos(angleRad),
+                    apPosition[targetAP].y + candidateDistance * std::sin(angleRad),
+                    0.0);
+
+    // true distance from the candidate to every AP, recorded as ground
+    // truth so the Python side can check its RSSI-derived proxies against
+    // the real geometry (and so matched-set runs can be reasoned about)
+    std::vector<double> candidateApDistance(nAPs);
+    for (uint32_t ap = 0; ap < nAPs; ++ap)
+    {
+        candidateApDistance[ap] = std::hypot(candidatePosition.x - apPosition[ap].x,
+                                            candidatePosition.y - apPosition[ap].y);
+    }
 
     NodeContainer APNodes;
     NodeContainer staNodes; // all background STAs, flat - staNearestAp says who they belong to
@@ -430,41 +502,73 @@ main(int argc, char* argv[])
     source->Connect(remote);
 
     // actually associate the candidate with its target AP at join time, by
-    // switching it off the bogus SSID it was installed with
+    // switching it off the bogus SSID it was installed with. StaWifiMac
+    // re-reads GetSsid() every time it restarts scanning (and it keeps
+    // rescanning while nothing matches), so swapping the SSID here is what
+    // triggers the join - association completes a scan interval later, not
+    // instantly, which is why the actual time is traced rather than assumed.
     Ptr<WifiNetDevice> candidateWifiDev = DynamicCast<WifiNetDevice>(candidateDevice.Get(0));
     Simulator::Schedule(Seconds(candidateStartTime), &WifiMac::SetSsid, candidateWifiDev->GetMac(), apSsid[targetAP]);
+    candidateWifiDev->GetMac()->TraceConnectWithoutContext("Assoc",
+                                                        MakeCallback(&CandidateAssociated));
 
     Simulator::ScheduleWithContext(source->GetNode()->GetId(),
                                 Seconds(candidateStartTime),
                                 &GenerateTraffic,
                                 source,
                                 packetSize,
-                                interval);
+                                candidateInterval);
 
-    // every run gets its own output directory, named from when it started
-    // and the seed it used, so a batch of runs never collides on disk
-    auto epochSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+    // Every run gets its own output directory. Nanosecond timestamp AND pid
+    // AND seed: second-resolution alone collides whenever two runs share a
+    // seed within the same second, which is exactly what matched-set runs do
+    // on purpose (same seed, one variant per targetAP) - that silently made
+    // later variants overwrite earlier ones. runTag lets an orchestrator
+    // pin a name instead, so it can group related runs itself.
+    auto epochNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
                             .count();
-    std::string runId = "run_" + std::to_string(epochSeconds) + "_" + std::to_string(rngSeed);
+    std::string runId = runTag.empty()
+                            ? ("run_" + std::to_string(epochNanos) + "_" +
+                            std::to_string(static_cast<long>(getpid())) + "_" +
+                            std::to_string(rngSeed))
+                            : runTag;
     std::string runDir = outDir + "/" + runId;
     std::filesystem::create_directories(runDir);
 
     // Tracing
     wifiPhy.EnablePcap(runDir + "/candidate-trace", candidateDevice.Get(0), true);
     // Output what we are doing
-    std::cout << "Saturated Transmission from " << nSTAs << " total STAs across " << nAPs
-              << " APs, candidate targeting AP " << targetAP << ", intervals of "
-              << interval.As(Time::MS) << ", rngSeed=" << rngSeed << std::endl;
+    std::cout << nSTAs << " background STAs across " << nAPs << " APs at "
+              << bgPerStaMbps << " Mbps each (" << (bgPerStaMbps * nSTAs)
+              << " Mbps offered total), candidate targeting AP " << targetAP << " at "
+              << candidateOfferedMbps << " Mbps (saturating), rngSeed=" << rngSeed << std::endl;
 
     Simulator::Stop(Seconds(simStopTime));
     Simulator::Run();
 
     // candidate's throughput label: uplink bytes it delivered to its AP,
-    // averaged over the window from association to the end of the run
-    double observedSeconds = simStopTime - candidateStartTime;
+    // averaged over the window from ACTUAL association to the end of the run.
+    // Measuring from candidateStartTime instead would fold the scan/assoc
+    // delay into the average and understate throughput by however long the
+    // join took. No bytes can arrive before association, so this is exactly
+    // the achieved rate while connected.
+    bool candidateAssociated = g_candidateAssocTime >= 0.0;
+    double observedSeconds =
+        candidateAssociated ? (simStopTime - g_candidateAssocTime) : 0.0;
     double candidateMbps =
-        (g_staTraffic[candidateStatsIndex].bytesTotal * 8.0) / 1e6 / observedSeconds;
+        (candidateAssociated && observedSeconds > 0.0)
+            ? (g_staTraffic[candidateStatsIndex].bytesTotal * 8.0) / 1e6 / observedSeconds
+            : 0.0;
+
+    // did it land on the AP we aimed it at? Distinct SSIDs per AP should
+    // guarantee this, but recording it means a silent mis-association shows
+    // up in the data instead of quietly corrupting the label.
+    std::ostringstream assocApStream;
+    if (candidateAssociated)
+    {
+        assocApStream << g_candidateAssocAp;
+    }
 
     // background STAs start sending at t=1s (see the scheduling loop above);
     // used for their mean-throughput figures below, which are ground-truth
@@ -487,9 +591,17 @@ main(int argc, char* argv[])
     meta << "    \"ap_spacing\": " << apSpacing << ",\n";
     meta << "    \"candidate_start_time\": " << candidateStartTime << ",\n";
     meta << "    \"sim_stop_time\": " << simStopTime << ",\n";
-    meta << "    \"interval_ms\": " << interval.GetMilliSeconds() << ",\n";
+    // seconds, not truncated milliseconds: sub-ms spacings are normal here
+    // (a 100 Mbps offered rate at 1250B is 100us) and GetMilliSeconds()
+    // silently floors those to 0
+    meta << "    \"bg_interval_s\": " << interval.GetSeconds() << ",\n";
+    meta << "    \"candidate_interval_s\": " << candidateInterval.GetSeconds() << ",\n";
+    meta << "    \"bg_per_sta_mbps\": " << bgPerStaMbps << ",\n";
+    meta << "    \"bg_total_offered_mbps\": " << (bgPerStaMbps * nSTAs) << ",\n";
+    meta << "    \"candidate_offered_mbps\": " << candidateOfferedMbps << ",\n";
     meta << "    \"candidate_distance\": " << candidateDistance << ",\n";
     meta << "    \"candidate_angle_deg\": " << candidateAngleDeg << ",\n";
+    meta << "    \"candidate_absolute\": " << (candidateAbsolute ? "true" : "false") << ",\n";
     meta << "    \"jitter_std\": " << jitterStd << ",\n";
     meta << "    \"n_channels\": " << nChannels << "\n";
     meta << "  },\n";
@@ -519,12 +631,21 @@ main(int argc, char* argv[])
              << "\", \"mac\": \"" << macStream.str() << "\", \"channel\": " << (ap % nChannels)
              << ", \"position\": {\"x\": " << apPosition[ap].x << ", \"y\": " << apPosition[ap].y
              << "}, \"sta_count\": " << apStaGlobalIndex[ap].size()
-             << ", \"background_mbps\": " << apBackgroundMbps << "}"
+             << ", \"background_mbps\": " << apBackgroundMbps
+             << ", \"offered_mbps\": " << (apStaGlobalIndex[ap].size() * bgPerStaMbps)
+             << ", \"candidate_distance\": " << candidateApDistance[ap] << "}"
              << (ap + 1 < nAPs ? ",\n" : "\n");
     }
     meta << "  ],\n";
     meta << "  \"candidate\": {\n";
     meta << "    \"target_ap\": " << targetAP << ",\n";
+    meta << "    \"associated\": " << (candidateAssociated ? "true" : "false") << ",\n";
+    meta << "    \"assoc_time\": " << g_candidateAssocTime << ",\n";
+    meta << "    \"assoc_delay\": "
+        << (candidateAssociated ? (g_candidateAssocTime - candidateStartTime) : -1.0) << ",\n";
+    meta << "    \"assoc_ap_mac\": \"" << assocApStream.str() << "\",\n";
+    meta << "    \"observed_seconds\": " << observedSeconds << ",\n";
+    meta << "    \"bytes_total\": " << g_staTraffic[candidateStatsIndex].bytesTotal << ",\n";
     meta << "    \"throughput_mbps\": " << candidateMbps << "\n";
     meta << "  }\n";
     meta << "}\n";
