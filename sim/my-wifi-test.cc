@@ -5,6 +5,7 @@
 #include "ns3/internet-stack-helper.h"
 #include "ns3/ipv4-address-helper.h"
 #include "ns3/log.h"
+#include "ns3/mac48-address.h"
 #include "ns3/mobility-helper.h"
 #include "ns3/mobility-model.h"
 #include "ns3/rng-seed-manager.h"
@@ -121,6 +122,8 @@ GenerateTraffic(Ptr<Socket> socket, uint32_t pktSize, Time pktInterval)
                         pktInterval);
 }
 
+static constexpr double kPi = 3.14159265358979323846;
+
 int
 main(int argc, char* argv[])
 {
@@ -130,11 +133,24 @@ main(int argc, char* argv[])
     uint32_t targetAP{0};
     double apSpacing{40.0}; // metres between neighbouring APs
     std::string intervalArg;
-    double newSTAStartTime{5.0};
+    double candidateStartTime{5.0};
     double simStopTime{30.0};
     uint32_t rngSeed{0}; // 0 (default) means "pick a random seed"
     std::string outDir{"runs"};
     bool verbose{false};
+    // candidate's position is an explicit, independently controllable
+    // offset from its target AP (polar coordinates), not a derived
+    // function of topology - this is the single most important axis to
+    // sweep for a throughput-vs-signal-quality dataset
+    double candidateDistance{10.0}; // metres from targetAP
+    double candidateAngleDeg{0.0};  // degrees from the +x axis
+    // stddev (metres) of Gaussian jitter applied to background STA
+    // placement (x and y); 0 keeps the old fully-deterministic 1D line
+    double jitterStd{2.0};
+    // number of distinct wifi channels to spread APs across, round-robin
+    // by AP index; 1 (default) reproduces the old co-channel-everywhere
+    // behaviour, >1 gives each AP group its own interference domain
+    uint32_t nChannels{1};
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("packetSize", "size of application packet sent", packetSize);
@@ -144,15 +160,21 @@ main(int argc, char* argv[])
     cmd.AddValue("nAPs", "number of APs", nAPs);
     cmd.AddValue("targetAP", "index of the AP the candidate joins", targetAP);
     cmd.AddValue("apSpacing", "distance in metres between neighbouring APs", apSpacing);
-    cmd.AddValue("candidateStartTime", "Time when candidate STA starts sending", newSTAStartTime);
+    cmd.AddValue("candidateStartTime", "Time when candidate STA starts sending", candidateStartTime);
     cmd.AddValue("simStopTime", "total simulated seconds to run", simStopTime);
     cmd.AddValue("rngSeed", "RNG seed to use; 0 (default) picks a random seed", rngSeed);
     cmd.AddValue("outDir", "directory to write per-run output (metadata + pcap) under", outDir);
+    cmd.AddValue("candidateDistance", "metres from targetAP the candidate sits", candidateDistance);
+    cmd.AddValue("candidateAngleDeg", "angle (degrees, from +x axis) from targetAP to candidate", candidateAngleDeg);
+    cmd.AddValue("jitterStd", "stddev (metres) of Gaussian jitter on background STA placement", jitterStd);
+    cmd.AddValue("nChannels", "number of distinct wifi channels APs round-robin across", nChannels);
     cmd.Parse(argc, argv);
 
     NS_ABORT_MSG_IF(targetAP >= nAPs, "targetAP must be less than nAPs");
-    NS_ABORT_MSG_IF(simStopTime - newSTAStartTime < 1.0,
+    NS_ABORT_MSG_IF(simStopTime - candidateStartTime < 1.0,
                     "candidateStartTime leaves less than 1s to measure throughput before simStopTime");
+    NS_ABORT_MSG_IF(nChannels == 0, "nChannels must be at least 1");
+    NS_ABORT_MSG_IF(candidateDistance <= 0.0, "candidateDistance must be positive");
 
     // if the caller didn't pin a seed, draw a real one so repeated runs
     // aren't silently identical; either way, the seed actually used gets
@@ -167,6 +189,14 @@ main(int argc, char* argv[])
         }
     }
     RngSeedManager::SetSeed(rngSeed);
+
+    // separate PRNG (not ns-3's own event-scheduling RNG stream) used only
+    // for the one-time placement jitter computed below, before
+    // Simulator::Run() - seeded off the same rngSeed so layouts stay
+    // reproducible for a given seed without perturbing ns-3's packet-level
+    // randomness (backoff draws, fading, etc.)
+    std::mt19937 placementRng(rngSeed);
+    std::normal_distribution<double> jitter(0.0, jitterStd);
 
     Time interval;
     if (intervalArg.empty())
@@ -201,7 +231,16 @@ main(int argc, char* argv[])
                                "ReferenceDistance", DoubleValue(1.0),
                                "ReferenceLoss", DoubleValue(46.6777));
     wifiChannel.AddPropagationLoss("ns3::NakagamiPropagationLossModel"); // fast-fading, stacked on the mean loss above
-    wifiPhy.SetChannel(wifiChannel.Create());
+
+    // one independent YansWifiChannel per wifi channel slot; APs (and their
+    // bucketed STAs) round-robin across these by AP index, so with
+    // nChannels>1 APs on different slots don't interfere with each other at
+    // all, matching real non-overlapping-channel deployment planning
+    std::vector<Ptr<YansWifiChannel>> channels(nChannels);
+    for (uint32_t c = 0; c < nChannels; ++c)
+    {
+        channels[c] = wifiChannel.Create();
+    }
 
     // Set up MAC
     WifiMacHelper wifiMac;
@@ -224,20 +263,25 @@ main(int argc, char* argv[])
 
     // spread the STAs evenly across the AP span, then bucket each one under
     // whichever AP is physically closest to it - background load per AP is
-    // now a consequence of topology, not a fixed count handed out per AP
+    // now a consequence of topology, not a fixed count handed out per AP.
+    // Small Gaussian jitter on both axes breaks the perfectly deterministic
+    // 1D line (same seed -> same jitter, different seed -> a different but
+    // still reproducible layout).
     double staSpan = (nAPs - 1) * apSpacing;
     std::vector<Vector> staPosition(nSTAs);
     std::vector<uint32_t> staNearestAp(nSTAs);
     for (uint32_t i = 0; i < nSTAs; ++i)
     {
-        double x = (nSTAs > 1) ? (i * staSpan / (nSTAs - 1)) : (staSpan / 2.0);
-        staPosition[i] = Vector(x, 0.0, 0.0);
+        double baseX = (nSTAs > 1) ? (i * staSpan / (nSTAs - 1)) : (staSpan / 2.0);
+        double x = baseX + jitter(placementRng);
+        double y = jitter(placementRng);
+        staPosition[i] = Vector(x, y, 0.0);
 
         uint32_t nearest = 0;
-        double bestDist = std::abs(x - apPosition[0].x);
+        double bestDist = std::hypot(x - apPosition[0].x, y - apPosition[0].y);
         for (uint32_t ap = 1; ap < nAPs; ++ap)
         {
-            double dist = std::abs(x - apPosition[ap].x);
+            double dist = std::hypot(x - apPosition[ap].x, y - apPosition[ap].y);
             if (dist < bestDist)
             {
                 bestDist = dist;
@@ -246,6 +290,15 @@ main(int argc, char* argv[])
         }
         staNearestAp[i] = nearest;
     }
+
+    // candidate sits at an explicit polar offset from its target AP -
+    // independent of apSpacing/nAPs, so "close to target" and "far from
+    // target" are controlled, comparable scenarios rather than a side
+    // effect of topology
+    double angleRad = candidateAngleDeg * kPi / 180.0;
+    Vector candidatePosition(apPosition[targetAP].x + candidateDistance * std::cos(angleRad),
+                            apPosition[targetAP].y + candidateDistance * std::sin(angleRad),
+                            0.0);
 
     NodeContainer APNodes;
     NodeContainer staNodes; // all background STAs, flat - staNearestAp says who they belong to
@@ -272,6 +325,7 @@ main(int argc, char* argv[])
 
     for (uint32_t ap = 0; ap < nAPs; ++ap)
     {
+        wifiPhy.SetChannel(channels[ap % nChannels]);
         wifiMac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(apSsid[ap]));
         apGroupDevices[ap].Add(wifi.Install(wifiPhy, wifiMac, APNodes.Get(ap)));
     }
@@ -279,13 +333,17 @@ main(int argc, char* argv[])
     for (uint32_t i = 0; i < nSTAs; ++i)
     {
         uint32_t ap = staNearestAp[i];
+        wifiPhy.SetChannel(channels[ap % nChannels]);
         wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(apSsid[ap]));
         apGroupDevices[ap].Add(wifi.Install(wifiPhy, wifiMac, staNodes.Get(i)));
         apStaGlobalIndex[ap].push_back(i);
     }
 
     // candidate starts on a bogus SSID so it can't associate with any AP yet -
-    // its target AP's real SSID gets swapped in below, scheduled at newSTAStartTime
+    // its target AP's real SSID gets swapped in below, scheduled at
+    // candidateStartTime. It shares targetAP's channel slot, since it has to
+    // actually be able to hear/associate with that AP.
+    wifiPhy.SetChannel(channels[targetAP % nChannels]);
     wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(Ssid("pending-join")));
     NetDeviceContainer candidateDevice = wifi.Install(wifiPhy, wifiMac, newSTA.Get(0));
     apGroupDevices[targetAP].Add(candidateDevice);
@@ -303,9 +361,7 @@ main(int argc, char* argv[])
     {
         positionAlloc->Add(staPosition[i]);
     }
-    // candidate sits at the midpoint of the AP span, independent of targetAP,
-    // so its physical position stays fixed across runs that vary targetAP
-    positionAlloc->Add(Vector((nAPs - 1) * apSpacing / 2.0, 5.0, 0.0));
+    positionAlloc->Add(candidatePosition);
 
     mobility.SetPositionAllocator(positionAlloc);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
@@ -376,10 +432,10 @@ main(int argc, char* argv[])
     // actually associate the candidate with its target AP at join time, by
     // switching it off the bogus SSID it was installed with
     Ptr<WifiNetDevice> candidateWifiDev = DynamicCast<WifiNetDevice>(candidateDevice.Get(0));
-    Simulator::Schedule(Seconds(newSTAStartTime), &WifiMac::SetSsid, candidateWifiDev->GetMac(), apSsid[targetAP]);
+    Simulator::Schedule(Seconds(candidateStartTime), &WifiMac::SetSsid, candidateWifiDev->GetMac(), apSsid[targetAP]);
 
     Simulator::ScheduleWithContext(source->GetNode()->GetId(),
-                                Seconds(newSTAStartTime),
+                                Seconds(candidateStartTime),
                                 &GenerateTraffic,
                                 source,
                                 packetSize,
@@ -406,9 +462,15 @@ main(int argc, char* argv[])
 
     // candidate's throughput label: uplink bytes it delivered to its AP,
     // averaged over the window from association to the end of the run
-    double observedSeconds = simStopTime - newSTAStartTime;
+    double observedSeconds = simStopTime - candidateStartTime;
     double candidateMbps =
         (g_staTraffic[candidateStatsIndex].bytesTotal * 8.0) / 1e6 / observedSeconds;
+
+    // background STAs start sending at t=1s (see the scheduling loop above);
+    // used for their mean-throughput figures below, which are ground-truth
+    // load numbers for validating (not for feeding directly into) the
+    // pre-association features the Python side derives from the pcap alone
+    double backgroundObservedSeconds = simStopTime - 1.0;
 
     // structured run metadata: settings used (including the RNG seed), the
     // AP index/SSID/MAC mapping so the pcap's source addresses can be
@@ -423,18 +485,42 @@ main(int argc, char* argv[])
     meta << "    \"n_aps\": " << nAPs << ",\n";
     meta << "    \"target_ap\": " << targetAP << ",\n";
     meta << "    \"ap_spacing\": " << apSpacing << ",\n";
-    meta << "    \"candidate_start_time\": " << newSTAStartTime << ",\n";
+    meta << "    \"candidate_start_time\": " << candidateStartTime << ",\n";
     meta << "    \"sim_stop_time\": " << simStopTime << ",\n";
-    meta << "    \"interval_ms\": " << interval.GetMilliSeconds() << "\n";
+    meta << "    \"interval_ms\": " << interval.GetMilliSeconds() << ",\n";
+    meta << "    \"candidate_distance\": " << candidateDistance << ",\n";
+    meta << "    \"candidate_angle_deg\": " << candidateAngleDeg << ",\n";
+    meta << "    \"jitter_std\": " << jitterStd << ",\n";
+    meta << "    \"n_channels\": " << nChannels << "\n";
     meta << "  },\n";
+    meta << "  \"candidate_position\": {\"x\": " << candidatePosition.x << ", \"y\": "
+        << candidatePosition.y << "},\n";
     meta << "  \"aps\": [\n";
     for (uint32_t ap = 0; ap < nAPs; ++ap)
     {
+        // GetAddress() returns a generic ns3::Address, which streams as
+        // "<type>-<len>-<bytes>" (eg "05-06-00:00:00:00:00:01"); converting
+        // to Mac48Address first gives a plain "xx:xx:xx:xx:xx:xx" string
+        // that matches what tshark reports for wlan.bssid, which the
+        // Python feature extractor matches against
         std::ostringstream macStream;
-        macStream << apGroupDevices[ap].Get(0)->GetAddress();
+        macStream << Mac48Address::ConvertFrom(apGroupDevices[ap].Get(0)->GetAddress());
+
+        uint64_t apBytes = 0;
+        for (uint32_t localI = 0; localI < apStaGlobalIndex[ap].size(); ++localI)
+        {
+            std::size_t idx = g_staIndexByAddress.at(
+                InetSocketAddress(apAddress[ap], BASE_PORT + localI));
+            apBytes += g_staTraffic[idx].bytesTotal;
+        }
+        double apBackgroundMbps = (apBytes * 8.0) / 1e6 / backgroundObservedSeconds;
+
         meta << "    {\"index\": " << ap << ", \"ssid\": \"" << apSsid[ap].PeekString()
-             << "\", \"mac\": \"" << macStream.str() << "\", \"sta_count\": "
-             << apStaGlobalIndex[ap].size() << "}" << (ap + 1 < nAPs ? ",\n" : "\n");
+             << "\", \"mac\": \"" << macStream.str() << "\", \"channel\": " << (ap % nChannels)
+             << ", \"position\": {\"x\": " << apPosition[ap].x << ", \"y\": " << apPosition[ap].y
+             << "}, \"sta_count\": " << apStaGlobalIndex[ap].size()
+             << ", \"background_mbps\": " << apBackgroundMbps << "}"
+             << (ap + 1 < nAPs ? ",\n" : "\n");
     }
     meta << "  ],\n";
     meta << "  \"candidate\": {\n";
@@ -448,9 +534,6 @@ main(int argc, char* argv[])
 
     return 0;
 }
-
-// 2. Drop in multiple APs to reach the real problem
-// 3. Make a rudimentary ML solution
 
 // Note: we are not currently logging CCA_BUSY state (channel occupancy as seen
 // by the candidate's own radio - the real signal a WiFi chip uses for carrier
