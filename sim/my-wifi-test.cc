@@ -335,7 +335,7 @@ main(int argc, char* argv[])
     cmd.AddValue("candidateStartTime", "Time when candidate STA starts sending", candidateStartTime);
     cmd.AddValue("simStopTime", "total simulated seconds to run", simStopTime);
     cmd.AddValue("rngSeed", "RNG seed to use; 0 (default) picks a random seed", rngSeed);
-    cmd.AddValue("outDir", "directory to write per-run output (metadata + pcap) under", outDir);
+    cmd.AddValue("outDir", "directory to write per-run output (metadata + observation) under", outDir);
     cmd.AddValue("runTag", "explicit run directory name; empty (default) auto-generates a unique one", runTag);
     cmd.AddValue("candidateDistance", "metres from targetAP the candidate sits", candidateDistance);
     cmd.AddValue("candidateAngleDeg", "angle (degrees, from +x axis) from targetAP to candidate", candidateAngleDeg);
@@ -367,6 +367,9 @@ main(int argc, char* argv[])
     NS_ABORT_MSG_IF(featureGuard < 0.0, "featureGuard must be non-negative");
     NS_ABORT_MSG_IF(candidateStartTime - featureGuard <= 1.0,
                     "feature window must be longer than 1s (raise candidateStartTime or lower featureGuard)");
+    NS_ABORT_MSG_IF(staClusterFrac < 0.0 || staClusterFrac > 1.0,
+                    "staClusterFrac must lie in [0,1]");
+    NS_ABORT_MSG_IF(staClusterRadius <= 0.0, "staClusterRadius must be positive");
     NS_ABORT_MSG_IF(bgPerStaMbps <= 0.0, "bgPerStaMbps must be positive");
     NS_ABORT_MSG_IF(candidateOfferedMbps <= 0.0, "candidateOfferedMbps must be positive");
 

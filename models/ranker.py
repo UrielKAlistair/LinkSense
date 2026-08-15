@@ -83,14 +83,27 @@ def make_groups(df, feats: list[str], scaler: Standardizer | None = None):
 
 
 class SetRanker(nn.Module):
+    """Scores each option, optionally conditioned on the whole option set.
+
+    use_context=False turns this into a plain pointwise MLP of the same
+    capacity, which is the ablation that isolates what the set context is
+    actually worth: any difference between the two is attributable to
+    seeing the alternatives rather than to depth or parameter count.
+    """
+
     def __init__(self, n_features: int, hidden: int = 96, embed: int = 64,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, use_context: bool = True):
         super().__init__()
+        self.use_context = use_context
         self.encoder = nn.Sequential(
             nn.Linear(n_features, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, embed), nn.ReLU(),
         )
-        # score head sees the option and the set it belongs to (mean + max)
+        # The head input width is the same either way. Without context the
+        # context slots are fed zeros, so the ablation carries strictly no
+        # cross-option information while keeping the parameter count
+        # identical - otherwise a win for the context model could just be a
+        # win for having more parameters.
         self.head = nn.Sequential(
             nn.Linear(embed * 3, hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(hidden, 1),
@@ -98,6 +111,9 @@ class SetRanker(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         h = self.encoder(x)                       # (B, N, E)
+        if not self.use_context:
+            zeros = torch.zeros_like(h)
+            return self.head(torch.cat([h, zeros, zeros], dim=-1)).squeeze(-1)
         m = mask.unsqueeze(-1).float()
         # masked pooling: padded slots must not influence the context
         mean = (h * m).sum(1) / m.sum(1).clamp(min=1.0)

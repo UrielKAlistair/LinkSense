@@ -5,11 +5,14 @@ One row per (scenario, AP option). Rows sharing a group_id describe the
 same physical situation and the same pre-association observation; they
 differ only in which AP the candidate joined, and therefore in the label.
 
-Everything under feat_ is derived solely from frames the candidate's radio
-captured in [0, candidate_start_time) - before it transmits anything or
-joins anything. Three families:
+Everything under feat_ is derived solely from frames the candidate's
+scanner radios recorded in the guarded pre-association window - before it
+transmits anything or joins anything. Three families:
 
-  feat_env_*  channel-wide conditions (identical across a group's rows)
+  feat_chan_* conditions on the channel THIS option occupies. With APs
+              spread across channels these differ between options, and
+              they are what makes the choice a load decision rather than
+              a signal-strength comparison.
   feat_ap_*   what was observed about THIS option's BSS
   feat_rel_*  this option relative to the alternatives (RSSI rank, margin
               over the best other AP, share of observed airtime). These

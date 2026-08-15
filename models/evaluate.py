@@ -75,12 +75,25 @@ def selection_metrics(df: pd.DataFrame, pred: np.ndarray,
 
 
 def regression_metrics(y: np.ndarray, pred: np.ndarray) -> dict:
+    """Calibration on both the linear and the log scale.
+
+    Reporting only linear r2 would be misleading here: models trained on a
+    log target (or predominantly on a scale-free ranking loss) can order
+    options almost perfectly and still score a negative linear r2, because
+    squared error in Mbps is dominated by the largest values. r2_log is the
+    fairer calibration measure for those; r2 is the one that matters if the
+    prediction is to be read as a throughput estimate in Mbps.
+    """
     resid = y - pred
     ss_tot = float(np.sum((y - y.mean()) ** 2))
+    ly, lp = np.log1p(np.clip(y, 0, None)), np.log1p(np.clip(pred, 0, None))
+    lresid = ly - lp
+    lss_tot = float(np.sum((ly - ly.mean()) ** 2))
     return {
         "mae": float(np.mean(np.abs(resid))),
         "rmse": float(np.sqrt(np.mean(resid ** 2))),
         "r2": float(1.0 - np.sum(resid ** 2) / ss_tot) if ss_tot > 0 else float("nan"),
+        "r2_log": float(1.0 - np.sum(lresid ** 2) / lss_tot) if lss_tot > 0 else float("nan"),
     }
 
 
@@ -115,10 +128,15 @@ def evaluate_all(df: pd.DataFrame, model_preds: dict[str, np.ndarray]) -> pd.Dat
             row.update(regression_metrics(y, pred))
         row.update(selection_metrics(df, pred))
         rows.append(row)
-    cols = ["model", "top1_accuracy", "mean_regret_mbps", "median_regret_mbps",
-            "mean_regret_frac", "mean_spearman", "mae", "rmse", "r2", "groups"]
+    # Preferred ordering first, then anything else that turned up. Listing
+    # the columns exhaustively meant a newly added metric was silently
+    # dropped here and only surfaced as a KeyError much later.
+    preferred = ["model", "top1_accuracy", "mean_regret_mbps", "median_regret_mbps",
+                 "mean_regret_frac", "mean_spearman", "mae", "rmse", "r2", "r2_log",
+                 "groups"]
     out = pd.DataFrame(rows)
-    return out[[c for c in cols if c in out.columns]]
+    ordered = [c for c in preferred if c in out.columns]
+    return out[ordered + [c for c in out.columns if c not in ordered]]
 
 
 def oracle_ceiling(df: pd.DataFrame) -> dict:

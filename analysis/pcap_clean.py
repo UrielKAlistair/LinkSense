@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""SUPERSEDED - kept for reference only.
+
+This was the original prototype: shell out to tshark, summarise one pcap
+over a fixed window, append a row to a CSV. It is no longer part of the
+pipeline and will not work against current simulation output, which no
+longer writes pcap at all - the simulator records observations directly
+from the PHY into observation.csv (smaller, exact signal/noise values, no
+tshark dependency).
+
+Use scripts/build_dataset.py instead.
+"""
 
 import argparse
 import csv
