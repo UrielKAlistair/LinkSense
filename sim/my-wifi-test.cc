@@ -1,4 +1,5 @@
 #include "ns3/abort.h"
+#include "ns3/boolean.h"
 #include "ns3/command-line.h"
 #include "ns3/config.h"
 #include "ns3/double.h"
@@ -12,7 +13,9 @@
 #include "ns3/ssid.h"
 #include "ns3/string.h"
 #include "ns3/wifi-mac.h"
+#include "ns3/wifi-mac-header.h"
 #include "ns3/wifi-net-device.h"
+#include "ns3/wifi-phy.h"
 #include "ns3/yans-wifi-channel.h"
 #include "ns3/yans-wifi-helper.h"
 #include <chrono>
@@ -36,6 +39,89 @@ static const uint16_t BASE_PORT = 8000;
 // was unreachable), which is itself a meaningful outcome to record.
 double g_candidateAssocTime = -1.0;
 Mac48Address g_candidateAssocAp;
+
+// ---------------------------------------------------------------------------
+// Pre-association observation recording.
+//
+// Earlier revisions captured pcap on the scanner radios. That was both
+// wasteful and imprecise: pcap runs for the whole simulation (including the
+// saturating post-association traffic nothing reads, which reached ~84 MB per
+// run and exhausted the disk quota), and radiotap only carries a rounded
+// signal value. Tapping MonitorSnifferRx instead yields exact signal and
+// noise, the real TX vector, and lets recording stop at the end of the
+// feature window - a few hundred KB per run, and no tshark dependency.
+// ---------------------------------------------------------------------------
+std::ofstream g_obsFile;
+double g_obsWindowEnd = 0.0;
+
+/** Mac48Address -> "xx:xx:xx:xx:xx:xx" (its stream operator's format). */
+static std::string
+MacToString(Mac48Address addr)
+{
+    std::ostringstream os;
+    os << addr;
+    return os.str();
+}
+
+void
+MonitorSniffRx(Ptr<const Packet> packet,
+            uint16_t channelFreqMhz,
+            WifiTxVector txVector,
+            MpduInfo /*aMpdu*/,
+            SignalNoiseDbm signalNoise,
+            uint16_t /*staId*/)
+{
+    double now = Simulator::Now().GetSeconds();
+    if (!g_obsFile.is_open() || now >= g_obsWindowEnd)
+    {
+        return;
+    }
+
+    Ptr<Packet> copy = packet->Copy();
+    WifiMacHeader hdr;
+    if (copy->PeekHeader(hdr) == 0)
+    {
+        return;
+    }
+
+    // Which address carries the BSSID depends on the DS bits; control frames
+    // (ACK, CTS) carry only a receiver address and no BSSID at all.
+    std::string bssid;
+    if (hdr.IsMgt())
+    {
+        bssid = MacToString(hdr.GetAddr3());
+    }
+    else if (hdr.IsData())
+    {
+        if (hdr.IsToDs() && !hdr.IsFromDs())
+        {
+            bssid = MacToString(hdr.GetAddr1());
+        }
+        else if (!hdr.IsToDs() && hdr.IsFromDs())
+        {
+            bssid = MacToString(hdr.GetAddr2());
+        }
+        else
+        {
+            bssid = MacToString(hdr.GetAddr3());
+        }
+    }
+
+    std::string ta = hdr.IsCtl() && !hdr.IsRts() ? "" : MacToString(hdr.GetAddr2());
+
+    Time duration = WifiPhy::CalculateTxDuration(packet->GetSize(), txVector, WIFI_PHY_BAND_5GHZ);
+
+    // 0/1/2 = management/control/data, matching the 802.11 frame-type field,
+    // rather than ns-3's internal WifiMacType enum which mixes all three
+    const int cat = hdr.IsMgt() ? 0 : (hdr.IsCtl() ? 1 : 2);
+
+    g_obsFile << now << ',' << channelFreqMhz << ',' << bssid << ',' << ta << ','
+              << cat << ',' << (hdr.IsBeacon() ? 1 : 0) << ','
+              << (hdr.IsRetry() ? 1 : 0) << ',' << packet->GetSize() << ','
+              << signalNoise.signal << ',' << signalNoise.noise << ','
+              << duration.GetMicroSeconds() << ','
+              << txVector.GetMode().GetDataRate(txVector) / 1e6 << '\n';
+}
 
 /**
  * Fired by StaWifiMac's "Assoc" trace when the candidate completes
@@ -145,6 +231,30 @@ GenerateTraffic(Ptr<Socket> socket, uint32_t pktSize, Time pktInterval)
 
 static constexpr double kPi = 3.14159265358979323846;
 
+// Non-overlapping 20 MHz channels in the 5 GHz band. YansWifiChannel drops
+// any frame whose channel number differs from the receiver's, so APs placed
+// on different numbers neither hear nor interfere with each other - which is
+// what makes AP choice a load decision rather than purely a signal decision.
+// (The 46.68 dB reference loss used above is free-space loss at 1 m for
+// ~5.2 GHz, so 5 GHz operation is the self-consistent choice here.)
+static const std::vector<uint8_t> kApChannels = {36, 40, 44, 48};
+
+// A channel no AP ever occupies. The candidate's association radio parks
+// here until it joins. This is not cosmetic: propagation loss (including
+// the Nakagami fading draw) is only evaluated for receivers that share the
+// transmitter's channel, so a radio sitting on a live channel consumes RNG
+// draws and shifts every subsequent random value. Parking keeps the
+// pre-association capture bit-identical across the variants of a matched
+// set, so the options in a choice set differ only by the choice itself.
+static constexpr uint8_t kParkChannel = 149;
+
+/** Build the ChannelSettings attribute string for a 20 MHz 5 GHz channel. */
+static std::string
+ChannelSettings(uint8_t number)
+{
+    return "{" + std::to_string(number) + ", 20, BAND_5GHZ, 0}";
+}
+
 int
 main(int argc, char* argv[])
 {
@@ -177,6 +287,14 @@ main(int argc, char* argv[])
     // stddev (metres) of Gaussian jitter applied to background STA
     // placement (x and y); 0 keeps the old fully-deterministic 1D line
     double jitterStd{2.0};
+    // Load hotspots. Spreading background STAs evenly gives every AP a
+    // similar client count, so the only thing separating two APs is signal -
+    // and AP selection collapses back into "pick the strongest". Real
+    // deployments are lumpy (a full meeting room next to an empty corridor),
+    // and it is exactly that lumpiness that makes the choice interesting.
+    int32_t staClusterAp{-1};       // -1 disables clustering
+    double staClusterFrac{0.0};     // share of STAs drawn into the hotspot
+    double staClusterRadius{10.0};  // metres
     // number of distinct wifi channels to spread APs across, round-robin
     // by AP index; 1 (default) reproduces the old co-channel-everywhere
     // behaviour, >1 gives each AP group its own interference domain
@@ -194,6 +312,17 @@ main(int argc, char* argv[])
     // label degenerates into "did it get its offered rate", which measures
     // the traffic generator rather than the network.
     double candidateOfferedMbps{100.0};
+    // Features are read from [0, candidateStartTime - featureGuard). The
+    // guard exists because the candidate's own join machinery starts
+    // perturbing the medium slightly before candidateStartTime (observed:
+    // the last ~0.11 s of the window stops matching across the variants of
+    // a matched set when APs sit on different channels). Cutting the window
+    // short restores exact cross-variant identity, and is also the honest
+    // model: a client decides which AP to join a moment before it acts.
+    double featureGuard{0.5};
+    // Every variant of a matched set observes exactly the same thing, so the
+    // orchestrator records it for one variant only.
+    bool captureObs{true};
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("packetSize", "size of application packet sent", packetSize);
@@ -214,7 +343,12 @@ main(int argc, char* argv[])
     cmd.AddValue("candidateY", "absolute y of candidate; requires candidateAbsolute=1", candidateY);
     cmd.AddValue("candidateAbsolute", "use candidateX/candidateY instead of candidateDistance/Angle", candidateAbsolute);
     cmd.AddValue("jitterStd", "stddev (metres) of Gaussian jitter on background STA placement", jitterStd);
+    cmd.AddValue("staClusterAp", "AP index to cluster background STAs around; -1 disables", staClusterAp);
+    cmd.AddValue("staClusterFrac", "fraction of background STAs placed in the cluster", staClusterFrac);
+    cmd.AddValue("staClusterRadius", "radius (metres) of the STA cluster", staClusterRadius);
     cmd.AddValue("nChannels", "number of distinct wifi channels APs round-robin across", nChannels);
+    cmd.AddValue("featureGuard", "seconds before candidateStartTime at which the feature window ends", featureGuard);
+    cmd.AddValue("captureObs", "write observation.csv for this run (one variant per matched set is enough)", captureObs);
     cmd.AddValue("bgPerStaMbps", "offered load per background STA in Mbps", bgPerStaMbps);
     cmd.AddValue("candidateOfferedMbps",
                 "offered load for the candidate in Mbps; keep well above link capacity so the "
@@ -226,8 +360,13 @@ main(int argc, char* argv[])
     NS_ABORT_MSG_IF(simStopTime - candidateStartTime < 1.0,
                     "candidateStartTime leaves less than 1s to measure throughput before simStopTime");
     NS_ABORT_MSG_IF(nChannels == 0, "nChannels must be at least 1");
+    NS_ABORT_MSG_IF(nChannels > kApChannels.size(),
+                    "nChannels exceeds the number of non-overlapping channels available");
     NS_ABORT_MSG_IF(!candidateAbsolute && candidateDistance <= 0.0,
                     "candidateDistance must be positive");
+    NS_ABORT_MSG_IF(featureGuard < 0.0, "featureGuard must be non-negative");
+    NS_ABORT_MSG_IF(candidateStartTime - featureGuard <= 1.0,
+                    "feature window must be longer than 1s (raise candidateStartTime or lower featureGuard)");
     NS_ABORT_MSG_IF(bgPerStaMbps <= 0.0, "bgPerStaMbps must be positive");
     NS_ABORT_MSG_IF(candidateOfferedMbps <= 0.0, "candidateOfferedMbps must be positive");
 
@@ -291,14 +430,19 @@ main(int argc, char* argv[])
                                "ReferenceLoss", DoubleValue(46.6777));
     wifiChannel.AddPropagationLoss("ns3::NakagamiPropagationLossModel"); // fast-fading, stacked on the mean loss above
 
-    // one independent YansWifiChannel per wifi channel slot; APs (and their
-    // bucketed STAs) round-robin across these by AP index, so with
-    // nChannels>1 APs on different slots don't interfere with each other at
-    // all, matching real non-overlapping-channel deployment planning
-    std::vector<Ptr<YansWifiChannel>> channels(nChannels);
-    for (uint32_t c = 0; c < nChannels; ++c)
+    // A single shared medium: separation between APs comes from channel
+    // NUMBERS, which YansWifiChannel already enforces, rather than from
+    // separate channel objects. Using one object keeps every radio in the
+    // same propagation world, so a scanning radio can be tuned to any
+    // channel and hear exactly what a real one would.
+    Ptr<YansWifiChannel> sharedChannel = wifiChannel.Create();
+    wifiPhy.SetChannel(sharedChannel);
+
+    // which channel each AP operates on, round-robin by index
+    std::vector<uint8_t> apChannel(nAPs);
+    for (uint32_t ap = 0; ap < nAPs; ++ap)
     {
-        channels[c] = wifiChannel.Create();
+        apChannel[ap] = kApChannels[ap % nChannels];
     }
 
     // Set up MAC
@@ -329,11 +473,35 @@ main(int argc, char* argv[])
     double staSpan = (nAPs - 1) * apSpacing;
     std::vector<Vector> staPosition(nSTAs);
     std::vector<uint32_t> staNearestAp(nSTAs);
+    // STAs assigned to the hotspot, if one was requested; the remainder keep
+    // the even spread across the AP span
+    uint32_t nClustered = (staClusterAp >= 0 && staClusterAp < static_cast<int32_t>(nAPs))
+                            ? static_cast<uint32_t>(std::lround(staClusterFrac * nSTAs))
+                            : 0;
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+
     for (uint32_t i = 0; i < nSTAs; ++i)
     {
-        double baseX = (nSTAs > 1) ? (i * staSpan / (nSTAs - 1)) : (staSpan / 2.0);
-        double x = baseX + jitter(placementRng);
-        double y = jitter(placementRng);
+        double x;
+        double y;
+        if (i < nClustered)
+        {
+            // uniform over the disc around the hotspot AP (sqrt keeps it
+            // area-uniform rather than bunched at the centre)
+            double r = staClusterRadius * std::sqrt(unit(placementRng));
+            double th = 2.0 * kPi * unit(placementRng);
+            x = apPosition[staClusterAp].x + r * std::cos(th);
+            y = apPosition[staClusterAp].y + r * std::sin(th);
+        }
+        else
+        {
+            uint32_t spreadIdx = i - nClustered;
+            uint32_t nSpread = nSTAs - nClustered;
+            double baseX = (nSpread > 1) ? (spreadIdx * staSpan / (nSpread - 1))
+                                         : (staSpan / 2.0);
+            x = baseX + jitter(placementRng);
+            y = jitter(placementRng);
+        }
         staPosition[i] = Vector(x, y, 0.0);
 
         uint32_t nearest = 0;
@@ -397,7 +565,7 @@ main(int argc, char* argv[])
 
     for (uint32_t ap = 0; ap < nAPs; ++ap)
     {
-        wifiPhy.SetChannel(channels[ap % nChannels]);
+        wifiPhy.Set("ChannelSettings", StringValue(ChannelSettings(apChannel[ap])));
         wifiMac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(apSsid[ap]));
         apGroupDevices[ap].Add(wifi.Install(wifiPhy, wifiMac, APNodes.Get(ap)));
     }
@@ -405,18 +573,36 @@ main(int argc, char* argv[])
     for (uint32_t i = 0; i < nSTAs; ++i)
     {
         uint32_t ap = staNearestAp[i];
-        wifiPhy.SetChannel(channels[ap % nChannels]);
+        wifiPhy.Set("ChannelSettings", StringValue(ChannelSettings(apChannel[ap])));
         wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(apSsid[ap]));
         apGroupDevices[ap].Add(wifi.Install(wifiPhy, wifiMac, staNodes.Get(i)));
         apStaGlobalIndex[ap].push_back(i);
     }
 
-    // candidate starts on a bogus SSID so it can't associate with any AP yet -
-    // its target AP's real SSID gets swapped in below, scheduled at
-    // candidateStartTime. It shares targetAP's channel slot, since it has to
-    // actually be able to hear/associate with that AP.
-    wifiPhy.SetChannel(channels[targetAP % nChannels]);
-    wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(Ssid("pending-join")));
+    // Scanner radios: one per occupied channel, living on the candidate node,
+    // listening promiscuously and never associating (a bogus SSID plus
+    // passive scanning, so they transmit nothing and perturb nothing). Their
+    // captures ARE the pre-association observation. A real client sweeps one
+    // radio across channels sequentially; modelling that as parallel radios
+    // gives the full window on every channel instead of a ~100 ms slice, so
+    // these features are somewhat cleaner than a real scan would produce.
+    std::vector<NetDeviceContainer> scannerDevices(nChannels);
+    for (uint32_t c = 0; c < nChannels; ++c)
+    {
+        wifiPhy.Set("ChannelSettings", StringValue(ChannelSettings(kApChannels[c])));
+        wifiMac.SetType("ns3::StaWifiMac",
+                        "Ssid", SsidValue(Ssid("scanner-never-associates")),
+                        "ActiveProbing", BooleanValue(false));
+        scannerDevices[c].Add(wifi.Install(wifiPhy, wifiMac, newSTA.Get(0)));
+    }
+
+    // The candidate's association radio. It parks on an empty channel so it
+    // hears nothing (and therefore disturbs nothing) until join time, then
+    // retunes to the target's channel and adopts its SSID - which is also a
+    // fair description of what a real client does once it has picked an AP.
+    wifiPhy.Set("ChannelSettings", StringValue(ChannelSettings(kParkChannel)));
+    wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(Ssid("pending-join")),
+                    "ActiveProbing", BooleanValue(false));
     NetDeviceContainer candidateDevice = wifi.Install(wifiPhy, wifiMac, newSTA.Get(0));
     apGroupDevices[targetAP].Add(candidateDevice);
 
@@ -508,6 +694,15 @@ main(int argc, char* argv[])
     // triggers the join - association completes a scan interval later, not
     // instantly, which is why the actual time is traced rather than assumed.
     Ptr<WifiNetDevice> candidateWifiDev = DynamicCast<WifiNetDevice>(candidateDevice.Get(0));
+    // retune off the parking channel onto the target's channel, then adopt
+    // its SSID; the retune must land first, or the MAC would start scanning
+    // for the target while still listening to an empty channel
+    auto setChannel =
+        static_cast<void (WifiPhy::*)(const WifiPhy::ChannelTuple&)>(&WifiPhy::SetOperatingChannel);
+    Simulator::Schedule(Seconds(candidateStartTime),
+                        setChannel,
+                        candidateWifiDev->GetPhy(),
+                        WifiPhy::ChannelTuple{apChannel[targetAP], 20, WIFI_PHY_BAND_5GHZ, 0});
     Simulator::Schedule(Seconds(candidateStartTime), &WifiMac::SetSsid, candidateWifiDev->GetMac(), apSsid[targetAP]);
     candidateWifiDev->GetMac()->TraceConnectWithoutContext("Assoc",
                                                         MakeCallback(&CandidateAssociated));
@@ -536,8 +731,36 @@ main(int argc, char* argv[])
     std::string runDir = outDir + "/" + runId;
     std::filesystem::create_directories(runDir);
 
-    // Tracing
-    wifiPhy.EnablePcap(runDir + "/candidate-trace", candidateDevice.Get(0), true);
+    // Record the pre-association observation from the scanner radios. Within
+    // a matched set every variant would record exactly the same thing, so
+    // the orchestrator only asks for it once per group (--captureObs).
+    if (captureObs)
+    {
+        g_obsWindowEnd = candidateStartTime - featureGuard;
+        g_obsFile.open(runDir + "/observation.csv");
+        g_obsFile << "t,freq_mhz,bssid,ta,cat,is_beacon,retry,len,signal_dbm,noise_dbm,"
+                     "duration_us,rate_mbps\n";
+        for (uint32_t c = 0; c < nChannels; ++c)
+        {
+            Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(scannerDevices[c].Get(0));
+            dev->GetPhy()->TraceConnectWithoutContext("MonitorSnifferRx",
+                                                    MakeCallback(&MonitorSniffRx));
+        }
+    }
+
+    // Once the observation window closes the scanners have no further job, so
+    // park them on an empty channel. This is not only tidiness: leaving them
+    // decoding the candidate's saturating post-association traffic costs real
+    // simulation time for data nothing consumes.
+    for (uint32_t c = 0; c < nChannels; ++c)
+    {
+        Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(scannerDevices[c].Get(0));
+        Simulator::Schedule(Seconds(candidateStartTime - featureGuard),
+                            static_cast<void (WifiPhy::*)(const WifiPhy::ChannelTuple&)>(
+                                &WifiPhy::SetOperatingChannel),
+                            dev->GetPhy(),
+                            WifiPhy::ChannelTuple{kParkChannel, 20, WIFI_PHY_BAND_5GHZ, 0});
+    }
     // Output what we are doing
     std::cout << nSTAs << " background STAs across " << nAPs << " APs at "
               << bgPerStaMbps << " Mbps each (" << (bgPerStaMbps * nSTAs)
@@ -590,6 +813,8 @@ main(int argc, char* argv[])
     meta << "    \"target_ap\": " << targetAP << ",\n";
     meta << "    \"ap_spacing\": " << apSpacing << ",\n";
     meta << "    \"candidate_start_time\": " << candidateStartTime << ",\n";
+    meta << "    \"feature_guard\": " << featureGuard << ",\n";
+    meta << "    \"feature_window_end\": " << (candidateStartTime - featureGuard) << ",\n";
     meta << "    \"sim_stop_time\": " << simStopTime << ",\n";
     // seconds, not truncated milliseconds: sub-ms spacings are normal here
     // (a 100 Mbps offered rate at 1250B is 100us) and GetMilliSeconds()
@@ -603,6 +828,9 @@ main(int argc, char* argv[])
     meta << "    \"candidate_angle_deg\": " << candidateAngleDeg << ",\n";
     meta << "    \"candidate_absolute\": " << (candidateAbsolute ? "true" : "false") << ",\n";
     meta << "    \"jitter_std\": " << jitterStd << ",\n";
+    meta << "    \"sta_cluster_ap\": " << staClusterAp << ",\n";
+    meta << "    \"sta_cluster_frac\": " << staClusterFrac << ",\n";
+    meta << "    \"sta_cluster_radius\": " << staClusterRadius << ",\n";
     meta << "    \"n_channels\": " << nChannels << "\n";
     meta << "  },\n";
     meta << "  \"candidate_position\": {\"x\": " << candidatePosition.x << ", \"y\": "
@@ -628,7 +856,7 @@ main(int argc, char* argv[])
         double apBackgroundMbps = (apBytes * 8.0) / 1e6 / backgroundObservedSeconds;
 
         meta << "    {\"index\": " << ap << ", \"ssid\": \"" << apSsid[ap].PeekString()
-             << "\", \"mac\": \"" << macStream.str() << "\", \"channel\": " << (ap % nChannels)
+             << "\", \"mac\": \"" << macStream.str() << "\", \"channel\": " << +apChannel[ap]
              << ", \"position\": {\"x\": " << apPosition[ap].x << ", \"y\": " << apPosition[ap].y
              << "}, \"sta_count\": " << apStaGlobalIndex[ap].size()
              << ", \"background_mbps\": " << apBackgroundMbps
@@ -650,6 +878,11 @@ main(int argc, char* argv[])
     meta << "  }\n";
     meta << "}\n";
     meta.close();
+
+    if (g_obsFile.is_open())
+    {
+        g_obsFile.close();
+    }
 
     Simulator::Destroy();
 

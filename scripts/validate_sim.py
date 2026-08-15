@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import shutil
 import statistics
@@ -159,6 +160,31 @@ def main():
           f"cv={sd / mean if mean else float('nan'):.2f}")
     print(f"    values: {', '.join(f'{v:.1f}' for v in vals)}")
     verdicts.append(("V6 seeds vary but not degenerately", sd > 0.01, f"sd={sd:.2f}"))
+
+    # ---- V7: matched-set observation identity ----
+    # The choice-set framing depends on every variant of a group sharing one
+    # pre-association observation. Verify it at the bytes rather than
+    # assuming it, on both a co-channel and a multi-channel deployment.
+    print("\nV7 matched-set observation identity")
+    v7_ok = True
+    for nch in (1, 3):
+        digests = []
+        for t in range(3):
+            meta = run(args.binary, tmp, f"v7_c{nch}_t{t}", nAPs=3, nSTAs=9, apSpacing=30,
+                      targetAP=t, candidateAbsolute=1, candidateX=35, candidateY=12,
+                      nChannels=nch, bgPerStaMbps=4, rngSeed=4242)
+            obs = tmp / f"v7_c{nch}_t{t}" / "observation.csv"
+            if not obs.exists():
+                raise FileNotFoundError(f"{obs} missing; V7 cannot verify anything")
+            body = obs.read_bytes()
+            digests.append((hashlib.md5(body).hexdigest()[:10], len(body)))
+        # guard against the check passing because nothing was compared
+        assert all(d[1] > 1000 for d in digests), "observation files suspiciously small"
+        same = len(set(digests)) == 1
+        v7_ok &= same
+        print(f"    nChannels={nch}: {'identical' if same else 'DIFFERENT'} across 3 variants "
+              f"({digests[0]})")
+    verdicts.append(("V7 group variants share one observation", v7_ok, "byte-identical scans"))
 
     print("\n" + "=" * 68)
     for name, ok, detail in verdicts:
