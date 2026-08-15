@@ -125,21 +125,29 @@ def pointwise_loss(scores, y, mask):
     return diff.masked_fill(~mask, 0.0).sum() / mask.sum().clamp(min=1)
 
 
-def train(model, tr, va, epochs, lr, weight_decay, alpha, temperature, seed, verbose=True):
+def train(model, tr, va, epochs, lr, weight_decay, alpha, temperature, seed,
+          verbose=True, batch_size=32):
     torch.manual_seed(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     Xtr, ytr, mtr, _ = tr
     Xva, yva, mva, _ = va
 
     best = (float("inf"), None)
+    n = Xtr.size(0)
     for epoch in range(epochs):
         model.train()
-        opt.zero_grad()
-        s = model(Xtr, mtr)
-        loss = alpha * listwise_loss(s, ytr, mtr, temperature) + \
-            (1 - alpha) * pointwise_loss(s, ytr, mtr)
-        loss.backward()
-        opt.step()
+        # Minibatch over GROUPS (a group is the atomic unit - the listwise
+        # loss is defined across the options within one). Full-batch descent
+        # gave one step per epoch, far too few to fit this model.
+        perm = torch.randperm(n)
+        for start in range(0, n, batch_size):
+            idx = perm[start:start + batch_size]
+            opt.zero_grad()
+            s = model(Xtr[idx], mtr[idx])
+            loss = alpha * listwise_loss(s, ytr[idx], mtr[idx], temperature) + \
+                (1 - alpha) * pointwise_loss(s, ytr[idx], mtr[idx])
+            loss.backward()
+            opt.step()
 
         model.eval()
         with torch.no_grad():
@@ -149,7 +157,8 @@ def train(model, tr, va, epochs, lr, weight_decay, alpha, temperature, seed, ver
         if vloss < best[0]:
             best = (vloss, {k: v.detach().clone() for k, v in model.state_dict().items()})
         if verbose and (epoch + 1) % 50 == 0:
-            print(f"  epoch {epoch + 1:>4}  train={loss.item():.4f}  val={vloss:.4f}  best={best[0]:.4f}")
+            print(f"  epoch {epoch + 1:>4}  train={loss.item():.4f}  val={vloss:.4f}  "
+                  f"best={best[0]:.4f}")
 
     if best[1] is not None:
         model.load_state_dict(best[1])

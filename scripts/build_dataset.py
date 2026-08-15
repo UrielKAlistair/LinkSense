@@ -233,7 +233,7 @@ def build_group_rows(group_id: str, variants: list[tuple[int, Path, dict]]) -> l
             "group_id": group_id,
             "ap_index": target_ap,
             "run_id": meta["run_id"],
-            "feat_env_window_s": window,
+            "meta_window_s": window,  # constant across runs; not a feature
             **chan, **apf, **rel,
             "label_throughput_mbps": c["throughput_mbps"],
             "label_associated": int(c["associated"]),
