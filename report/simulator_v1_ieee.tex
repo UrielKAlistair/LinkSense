@@ -1,0 +1,432 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{tabularx}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\tbd}{\textbf{[\,--\,]}}  % result pending re-run
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\renewcommand{\arraystretch}{1.05}
+
+\title{Passive Pre-Association Wi-Fi Access-Point Selection}
+
+\author{
+\IEEEauthorblockN{Alistair}
+\IEEEauthorblockA{Wi-Fi AP Selection Research Project}
+}
+
+% IEEEtran typesets the abstract in bold. Restore normal weight, keeping the
+% italic "Abstract---" lead-in that the format expects.
+\makeatletter
+\let\@IEEEoldabstract\abstract
+\def\abstract{\@IEEEoldabstract\normalfont\normalsize}
+\makeatother
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A Wi-Fi client in overlapping coverage must select an access point (AP)
+before it can directly measure the service that each candidate would provide.
+Signal strength describes link quality, but not contention or load, and may
+therefore favor a nearby but congested AP. This project investigates whether a
+client can make a better decision using only passive observations collected
+before association, without probe requests or assistance from the network.
+This report defines the experimental foundation of that investigation: a
+controlled ns-3 simulator that creates multi-AP deployments, records decoded
+frames and physical carrier-sense activity, and replays each fixed topology
+once per candidate AP, changing only the AP the candidate joins. Every replay
+of a topology therefore shares one identical pre-association observation while
+yielding its own measured throughput. The simulator separates physical-topology
+randomness from radio randomness and produces a structured choice-set dataset.
+The resulting method supports a reproducible comparison between conventional
+signal-based selection and selection based on richer passive evidence.
+\end{abstract}
+
+\section{Problem Formulation}
+\label{sec:problem}
+
+Throughput depends on channel contention, competing stations, transmission
+rates, retries, and the airtime consumed by neighboring basic service sets.
+Received signal strength reflects none of them directly. Those effects do,
+however, leave traces a client can hear without transmitting: the frames
+themselves, and the time the medium spends busy. This work asks whether such traces are enough:
+\emph{can a client choose the AP that will provide the greatest throughput
+using only what its radio can passively observe before association?}
+
+Existing load-aware methods \cite{dely2014bestap,adame2021channel} make their
+load estimate after association, from AP-provided reports, or from a network
+controller. A client making its first choice has none of these: only beacons
+and some data frames, in which AP distance and offered traffic appear only
+through their effects.
+
+Let $\mathcal{A}=\{a_1,\ldots,a_N\}$ be the APs in one deployment and let $O$
+be the candidate station's passive observation before it joins any AP. If
+$y_i$ is the throughput obtained after joining $a_i$, the desired decision is
+
+\begin{equation}
+    a^* = \underset{a_i\in\mathcal{A}}{\operatorname{arg\,max}}\; y_i,
+\end{equation}
+
+using a decision function whose inputs are derived only from $O$. In a live
+network only one $y_i$ is ever measurable: the station joins a single AP and
+observes that AP's throughput, while the values of $y_j$ for every AP it did
+not join are counterfactual. The simulator recovers all $N$ values by replaying
+the same scenario once per target AP, changing only the AP the candidate joins.
+Every choice set therefore carries its true $a^*$.
+
+The replay is sound only if $O$ is identical across all $N$ runs of a scenario.
+If any part of the observation varied with the AP eventually joined, a decision
+function could reach the right answer through a simulation artifact rather than
+through the network. This is checked rather than assumed. The assumptions that
+do remain are stated next.
+
+\section{Experimental Scope and Assumptions}
+
+Simulator 1 isolates the relationship among path quality, background load,
+and passive evidence. It does not attempt to reproduce every feature of a
+deployed WLAN. Table~\ref{tab:assumptions} states the principal assumptions so
+that conclusions can be interpreted within the intended scope.
+
+\begin{table}[!ht]
+\caption{Controlled assumptions of Simulator 1.}
+\label{tab:assumptions}
+\centering
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}p{0.27\columnwidth}Y@{}}
+\toprule
+\textbf{Aspect} & \textbf{Current assumption} \\
+\midrule
+Deployment & Static, single-floor, no walls; one stationary candidate and
+stationary background stations. \\
+Radios & Homogeneous IEEE 802.11n devices at 5 GHz with 20 MHz channels and
+Minstrel-HT rate control \cite{ieee80211}. \\
+Propagation & Yans Wi-Fi channel; log-distance loss (exponent 3.0, 46.6777 dB
+reference loss at 1 m) followed by Nakagami fading. \\
+Traffic & Uplink UDP; constant background offered rates and a saturated
+candidate. Wired backhaul is not a bottleneck. \\
+Observation & Passive and client-side; no probe request, association, or
+network-provided load report during feature collection. \\
+Target & Mean candidate uplink throughput from successful association until
+the simulation stops; failed association is assigned zero. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The environment is static and open, so it excludes mobility, walls, hardware
+diversity, and application demand that varies over time. The label is uplink
+UDP throughput, so it says little about TCP goodput, downlink performance, or
+latency.
+
+The choice set contains only APs discovered during the projected scan. In
+passive mode, discovery requires at least one decoded beacon, and observations
+with fewer than two discovered APs are excluded because no selection decision
+exists.
+
+\section{Simulator Design}
+
+The simulator is built on ns-3.45 and its Wi-Fi models \cite{ns3models}. APs
+sit 30 m apart in a fixed layout: two form a pair, three an equilateral
+triangle, and four, six, and eight fill $2\times2$, $3\times2$, and $4\times2$
+grids. Channels 36, 40, 44, and 48 are assigned in AP-index order and reused
+once a deployment exceeds four APs. Because the layout is fixed as well, co-channel
+separation takes a single value per deployment size --- 30 m at eight APs, 42 m
+at six, and no reuse at or below four --- which ties channel reuse to AP count.
+Section~\ref{sec:next} returns to this.
+
+Each scenario draws 2, 3, 4, 6, or 8 APs and 2, 3, or 4 background stations
+per AP. A quarter of scenarios spread those stations uniformly. The
+rest place one or more hotspot APs, with fewer hotspots more likely and the
+count capped at $\lceil N_{AP}/3\rceil$. Around those hotspots 70\% of
+background stations fall in 10 m discs, and the remainder cover the
+footprint. Mixing uniform and deliberately clustered regimes follows common
+practice in WLAN studies \cite{wong2018daga,zhang2020placement}, and matters
+here because under uniform load every AP is about equally busy and the choice
+collapses back to signal strength. Each station
+associates with its nearest AP, and every background station in a scenario
+offers the same load, drawn uniformly at random from 1.0, 2.5, 4.0, and
+6.0 Mbit/s.
+Candidate positions are drawn to keep the decision non-trivial: 70\% near a
+boundary between neighboring APs, 30\% at 4--16 m from a single AP. These are
+sampling policies rather than radio parameters, and they are recorded with the
+dataset because they set its difficulty.
+
+Background traffic starts at $t=1$ s. Passive recording runs until $t=5.5$ s,
+covering 4.5 s of loaded traffic; the candidate associates at $t=6$ s and the
+run ends at $t=18$ s. The 0.5 s gap between recording and association is a
+guard: ns-3 performs target-dependent polling just before a join, and without
+the gap that polling would land inside the observation window. After joining,
+the candidate offers 100 Mbit/s in 1250-byte packets, which keeps it backlogged
+so that measured throughput reflects the service the network gives it rather
+than the limits of its own traffic generator.
+
+\subsection{Matched Counterfactual Replays}
+
+For each sampled topology and radio seed, the experiment runs once per target
+AP. AP and station positions, background traffic, the candidate's position, and
+every pre-association device stay fixed; only the AP selected at $t=6$ s
+changes. A \code{topologySeed} controls background-station placement and an
+independent \code{rngSeed} controls fading, contention, and rate adaptation,
+with five radio seeds generated per topology. Separating the two streams is
+what allows stochastic radio behavior to be repeated without the physical
+deployment shifting underneath it.
+
+\subsection{Validation}
+
+Validation runs before any model is fitted, so that a good accuracy number
+cannot mask a defective data-generating process.
+
+Three properties carry the experimental design, and each is checked
+automatically. Repeating a seed reproduces throughput exactly, so any run can
+be regenerated. Changing only the radio seed varies the outcome while every
+physical position stays fixed. And the recorded frame and channel-busy
+traces are byte-identical across all target-AP replays of a matched scenario
+--- the check that enforces the constant $O$ required in
+Section~\ref{sec:problem}, and the most important of the three.
+
+These establish internal consistency, not that the simulator behaves like a
+real network.
+
+\section{Observation and Dataset Construction}
+\label{sec:obs}
+
+\subsection{Recording and Projection}
+
+The candidate carries one receive-only scanner PHY per occupied channel, plus
+a separate PHY reserved for association. The scanner PHYs never transmit and
+never associate; the association PHY is parked on unused channel 149 until the
+decision time, so the AP the candidate will eventually join cannot alter what
+is heard, or consume random draws, while the observation is being collected.
+At $t=5.5$ s the scanner PHYs move to the parking channel as well.
+
+Watching every channel at once is not a claim that real clients have several
+radios. It is a recording device: it captures a superset of what any single
+radio could have heard, from which a realistic single-radio observation is cut
+afterwards.
+
+Two traces are recorded. The monitor-sniffer trace holds every frame a scanner
+decodes, with time, frequency, BSSID, transmitter, frame category, beacon and
+retry flags, length, RSSI, noise, airtime, and PHY rate. The PHY-state trace
+gives the fraction of each 102.4 ms beacon interval in which carrier sense
+marked the channel busy. This clear-channel-assessment (CCA) measurement
+registers energy a frame-only view misses: interference, and transmissions too
+distant to decode. Real chipsets expose such a counter, though whether a driver
+surfaces it varies by platform.
+
+The superset is then projected onto one passive radio. That radio rotates
+through the four channels in random order, dwelling 110 ms on each with
+0.15 ms to retune, and repeats the cycle for as much of the window as it
+fits, so every channel is revisited many times before the decision. Frames
+and CCA intervals falling outside a dwell are discarded. A 110 ms dwell
+spans just over one 102.4~ms beacon interval, so each visit yields about one
+beacon from every AP on that channel. RSSI is then perturbed by uniform
+error within $\pm3$ dB and quantized to 1 dB. Both steps run after ns-3 from
+a recorded scan seed, so scan policy and measurement noise can be varied
+without repeating a simulation.
+
+\subsection{From Trace to Training Data}
+
+The projected trace is a long list, one entry per decoded frame, with the
+channel-busy series recorded alongside it. Turning that list into training
+data means collapsing it once per discovered AP. For a given AP the builder
+first selects the parts of the trace that bear on it --- frames sent by or to
+its BSSID, and activity on the channel it occupies --- which yields a shorter
+list, not yet a single description. It then reduces that shorter list to a
+fixed-size summary of the AP, and it is the summary, not the frames, that a
+model ever sees. Four discovered APs therefore give four summaries over
+identical evidence, differing only in which AP each describes and in the
+throughput that AP delivered when it was the target of a replay.
+
+That reduction is carried out twice, in two different ways. The first
+produces a fixed vector of summary statistics --- these are the
+\code{feat\_} columns, and they are hand-chosen. The second keeps time: the
+window is cut into equal bins and each measurement is recorded separately in
+every bin, producing a sequence per option instead of a vector. Tabular
+models are trained on the first, the transformer on the second, and
+Section~V compares them.
+
+The summary vector carries three kinds of feature. AP-level features describe
+that BSS itself: RSSI, beacons, observed clients, frames, airtime, retries,
+and PHY rates. Channel-level features describe the option's channel as a
+whole, decoded traffic and CCA busy time together. Relative features place the
+option against its rivals: how many options there are, its RSSI rank, and its
+margin over the best alternative.
+
+Ground truth is kept but quarantined. True distance, configured load, station
+count, positions, and seeds are all recorded, because they are needed to check
+that the observable features behave and to break results down by scenario type.
+None may reach a model. The two are separated by name: only \code{feat\_}
+columns are admissible inputs, everything with a \code{gt\_} prefix is not,
+and the loader enforces the split rather than trusting discipline.
+
+Rows are grouped twice over. Each physical topology carries a
+\code{topology\_id}, and each of its five radio-seed realizations carries its
+own \code{group\_id}. Rows sharing a \code{group\_id} were produced from one
+identical observation and differ only in which AP was joined. Partitions must
+therefore be cut by \code{topology\_id}: the five realizations of a layout are
+near-duplicates of each other, and letting them fall on both sides of a
+train/test split would inflate every result.
+
+\section{Models and Evaluation Protocol}
+
+Two observations are compared. The \emph{rotating} observation is the
+single-radio projection of Section~\ref{sec:obs}, in which one radio cycles
+through the channels for the whole window. The \emph{continuous} observation
+keeps the parallel-scanner superset instead, so every channel is watched at
+once. One radio cannot do this, so the continuous condition is an upper bound
+on what observation could provide rather than a deployable alternative. Both
+carry the same RSSI realism, and both are binned into per-option sequences.
+
+The dataset holds \tbd{} AP options across \tbd{} observations of \tbd{}
+topologies, a median of \tbd{} discovered APs per decision. Choosing the best
+AP rather than at random is worth \tbd{} against \tbd{} Mbit/s on average, and
+the mean spread between the best and worst option in a choice set is \tbd{}
+Mbit/s.
+
+Four families of decision function are compared. Heuristics score an option
+directly: strongest RSSI, least busy channel, and RSSI minus channel-busy
+fraction. Tabular models take one feature vector per option, under three
+encodings of the same sequence --- its window means, a set of summary
+statistics per measurement (mean, standard deviation, minimum, maximum, last
+value, and least-squares slope), and the whole sequence flattened with bin
+order preserved. A ridge regression takes the flattened sequence as a linear
+control. The transformer encodes each AP's sequence with a learned positional
+embedding, then compares APs through a permutation-invariant set stage, and is
+trained twice: once to predict throughput, once to rank options directly.
+
+Every model sees the same five splits, cut by \code{topology\_id} and
+stratified by AP count. Metrics are top-1 accuracy with a 0.5 Mbit/s tie
+tolerance, mean regret in Mbit/s against the oracle choice, and $R^2$ where a
+model predicts throughput. Significance is a paired $t$-test across the five
+splits.
+
+\section{Results}
+
+Table~\ref{tab:results} gives top-1 accuracy for every model under both
+observations. Heuristic reference points are identical in the two columns,
+since they read the same features: random selection reaches \tbd{}, least busy
+channel \tbd{}, strongest RSSI \tbd{}, and RSSI minus busy \tbd{}.
+
+\begin{table}[!ht]
+\caption{Top-1 accuracy by model and observation. Within a column every model
+receives identical input.}
+\label{tab:results}
+\centering
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}Yrrr@{}}
+\toprule
+\textbf{Model} & \textbf{Rotating} & \textbf{Continuous} & \textbf{Gain} \\
+\midrule
+Ridge, flattened sequence   & \tbd & \tbd & \tbd \\
+MLP, flattened sequence     & \tbd & \tbd & \tbd \\
+MLP, summary statistics     & \tbd & \tbd & \tbd \\
+GBM, summary statistics     & \tbd & \tbd & \tbd \\
+GBM, flattened sequence     & \tbd & \tbd & \tbd \\
+Transformer                 & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three comparisons are read off this table. The first is which model wins under
+each observation, and by how much, given that every model in a column receives
+identical input. The second is what widening the observation is worth, model
+by model, which the gain column reports. The third is whether the winner
+changes between the two columns.
+
+Two ablations accompany it. Giving every tabular model the mean of the other
+options and its own deviation from that mean supplies the cross-option
+comparison the transformer's set stage performs, and isolates how much of any
+transformer margin is attributable to it. Shuffling the time bins within each
+option, leaving bin position intact, removes temporal order while preserving
+everything else, and isolates aggregation from tracking.
+
+\section{Does the Sequence Carry Anything?}
+
+The matched design allows the label's variance to be split directly. Across
+cells of one topology paired with one target AP, each realized under five
+independent radio seeds, the intraclass correlation separates what is fixed
+when the topology is drawn from what varies with the radio alone. A high value
+bounds what any time-sensitive model can contribute, because it says the
+outcome is settled before the observation begins; a low one leaves room for
+the trajectory to matter. The measured value is \tbd{}, against a between-cell
+variance of \tbd{} and a within-cell variance of \tbd{}.
+
+The shuffle ablation is the independent check on the same question. If order
+carries information, destroying it must cost accuracy; if the sequence is
+repeated sampling of a stationary environment, it will not. The two
+instruments are reported together because agreement between them is what makes
+either conclusive.
+
+\section{What Simulator 2 Must Change}
+\label{sec:next}
+
+The requirement is measurable rather than a matter of judgement.
+Recomputing the intraclass correlation on a successor dataset is a direct test
+of whether the question can be asked at all: unless it falls well below 0.9,
+no amount of model engineering will make a temporal model useful, because
+there will again be nothing for it to track. What must change is therefore not
+the model but the environment --- load that arrives and departs, interference
+that appears part-way through the window, stations that join and leave ---
+and it must be visible in the passive trace while remaining invisible to a
+window average.
+
+Four smaller decisions follow from the present work. Channel assignment by AP
+index, over a fixed layout, leaves co-channel separation with no variance and
+ties reuse to deployment size; sampling the assignment instead would decouple
+the two. AP spacing of 30 m pairs an obstructed-indoor path-loss exponent with
+an open-field geometry, and the two should be reconciled. The BSS Load element, which a passive client can
+read from a single beacon, is absent here and is the strongest baseline this
+comparison currently lacks. And the restriction to complete silence, rather
+than to the pre-association period, is a scope choice that could be relaxed
+to admit probe requests.
+
+One practical consequence deserves separating from the rest. Since observation
+budget moved accuracy further than any change of model, and one radio cannot
+watch every channel at once, the lever a real client actually holds is how
+long it may scan before deciding. Dwell time and number of passes are
+therefore worth treating as experimental variables in their own right, rather
+than as fixed properties of the projection.
+
+\begin{thebibliography}{00}
+
+\bibitem{dely2014bestap}
+P. Dely, A. Kassler, L. Chow, N. Bambos, N. Bayer, H. Einsiedler, and
+C. Peylo, ``BEST-AP: Non-intrusive estimation of available bandwidth and its
+application for dynamic access point selection,'' \emph{Computer
+Communications}, vol. 39, pp. 78--91, 2014,
+doi: 10.1016/j.comcom.2013.11.006.
+
+\bibitem{adame2021channel}
+T. Adame, M. Carrascosa, B. Bellalta, I. Pretel, and I. Etxebarria, ``Channel
+load aware AP/Extender selection in home WiFi networks using IEEE
+802.11k/v,'' \emph{IEEE Access}, vol. 9, pp. 30095--30112, 2021,
+doi: 10.1109/ACCESS.2021.3059473.
+
+\bibitem{wong2018daga}
+W. Wong and S.-H. G. Chan, ``Distributed joint AP grouping and user
+association for MU-MIMO networks,'' in \emph{Proc. IEEE INFOCOM}, 2018,
+pp. 252--260, doi: 10.1109/INFOCOM.2018.8486284.
+
+\bibitem{zhang2020placement}
+Y. Zhang and L. Dai, ``Joint optimization of placement and coverage of access
+points for IEEE 802.11 networks,'' in \emph{Proc. IEEE ICC}, 2020,
+pp. 1--7, doi: 10.1109/ICC40277.2020.9149098.
+
+\bibitem{ieee80211}
+IEEE Standard for Information Technology---Telecommunications and Information
+Exchange between Systems---Local and Metropolitan Area Networks---Specific
+Requirements---Part 11: Wireless LAN Medium Access Control (MAC) and Physical
+Layer (PHY) Specifications, IEEE Std. 802.11-2024, 2025.
+
+\bibitem{ns3models}
+ns-3 Project, \emph{ns-3 Model Library, Release 3.45}, 2025. [Online].
+Available: \url{https://www.nsnam.org/docs/release/3.45/models/}
+
+\end{thebibliography}
+
+\end{document}

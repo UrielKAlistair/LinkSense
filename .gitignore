@@ -8,4 +8,10 @@ __pycache__/
 data/
 runs/
 results/
-report/
+# Everything in report/ is scratch EXCEPT the paper source and its PDF.
+# Note this must be `report/*`, not `report/`: a trailing slash tells git not
+# to descend into the directory at all, and negations below would never be
+# consulted.
+report/*
+!report/*.tex
+!report/*.pdf
