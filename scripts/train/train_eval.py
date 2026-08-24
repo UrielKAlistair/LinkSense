@@ -13,9 +13,9 @@ sloppiness here would dominate the results:
     could run instead - a model that cannot beat strongest-RSSI has not
     justified itself
 
-Outputs a results table (CSV + LaTeX) and figures for the report.
+Outputs a results table (CSV + LaTeX) and evaluation figures.
 
-Run:  python scripts/train_eval.py data/dataset.csv --out-dir report/
+Run:  python scripts/train_eval.py data/dataset.csv --out-dir results/main/
 """
 
 from __future__ import annotations
@@ -28,14 +28,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from models.data import (assert_no_leakage, feature_columns, impute_features,  # noqa: E402
-                         load_dataset, split_by_group, to_xy)
+from models.data import (assert_no_leakage, feature_columns, group_sample_weights,  # noqa: E402
+                         impute_features, load_dataset, split_by_group, to_xy)
 from models.evaluate import evaluate_all, oracle_ceiling, selection_metrics  # noqa: E402
 
 METRICS = ["top1_accuracy", "mean_regret_mbps", "median_regret_mbps",
-           "mean_regret_frac", "mean_spearman", "mae", "rmse", "r2", "r2_log"]
+           "mean_regret_frac", "mean_spearman", "topology_top1_accuracy",
+           "topology_mean_regret_mbps", "mae", "rmse", "r2", "r2_log"]
 
 
 def _select(candidates, val):
@@ -48,7 +49,8 @@ def _select(candidates, val):
     best = ((np.inf, np.inf), None)
     for key_extra, pred in candidates:
         sm = selection_metrics(val, pred)
-        key = (sm["mean_regret_mbps"], -sm["mean_spearman"])
+        regret = sm.get("topology_mean_regret_mbps", sm["mean_regret_mbps"])
+        key = (regret, -sm["mean_spearman"])
         if key < best[0]:
             best = (key, key_extra)
     return best
@@ -63,6 +65,7 @@ def fit_tree_models(train, val, test, feats, seed):
     X_tr, y_tr = to_xy(train, feats)
     X_va, _ = to_xy(val, feats)
     X_te, _ = to_xy(test, feats)
+    train_weights = group_sample_weights(train)
 
     grids = {
         # A fitted linear model separates two questions that the tree
@@ -88,19 +91,28 @@ def fit_tree_models(train, val, test, feats, seed):
         for log_target in (False, True):
             for cfg in grid:
                 m = ctor(**cfg)
-                m.fit(X_tr, np.log1p(y_tr) if log_target else y_tr)
+                target = np.log1p(y_tr) if log_target else y_tr
+                fit_args = ({"ridge__sample_weight": train_weights}
+                            if name == "ridge_linear" else
+                            {"sample_weight": train_weights})
+                m.fit(X_tr, target, **fit_args)
                 p = m.predict(X_va)
                 p = np.expm1(np.clip(p, -5, 12)) if log_target else p
                 cands.append(((cfg, log_target), p))
         (regret, _), (cfg, log_target) = _select(cands, val)
 
         m = ctor(**cfg)
-        m.fit(X_tr, np.log1p(y_tr) if log_target else y_tr)
+        target = np.log1p(y_tr) if log_target else y_tr
+        fit_args = ({"ridge__sample_weight": train_weights}
+                    if name == "ridge_linear" else
+                    {"sample_weight": train_weights})
+        m.fit(X_tr, target, **fit_args)
         for X, store in ((X_va, val_pred), (X_te, test_pred)):
             p = m.predict(X)
             store[name] = np.expm1(np.clip(p, -5, 12)) if log_target else p
         chosen[name] = {k: v for k, v in cfg.items() if k not in ("random_state", "n_jobs")}
-        chosen[name].update(log_target=log_target, val_regret=round(regret, 4))
+        chosen[name].update(log_target=log_target,
+                            val_topology_regret=round(regret, 4))
     return val_pred, test_pred, chosen
 
 
@@ -112,8 +124,14 @@ def stratified_report(preds_df: pd.DataFrame, models: list[str]) -> pd.DataFrame
     the value has to come from the groups where signal strength is
     misleading, and those are worth looking at separately.
     """
+    # The same physical choice set may enter the test partition under more
+    # than one repeated split. Keep those evaluations separate; grouping only
+    # by group_id would concatenate duplicate option rows into one fake set.
+    pooled = preds_df.copy()
+    pooled["group_id"] = (pooled["split_seed"].astype(str) + ":" +
+                          pooled["group_id"].astype(str))
     rows = []
-    for label, sub in preds_df.groupby("stratum"):
+    for label, sub in pooled.groupby("stratum"):
         row = {"stratum": label, "groups": sub.group_id.nunique()}
         for m in models + ["strongest_rssi"]:
             row[m] = selection_metrics(sub, sub[f"pred_{m}"].to_numpy())["mean_regret_mbps"]
@@ -121,7 +139,30 @@ def stratified_report(preds_df: pd.DataFrame, models: list[str]) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-def fit_ranker(train, val, test, feats, seed):
+def dimension_report(preds_df: pd.DataFrame, models: list[str]) -> pd.DataFrame:
+    """Regret by simulator regime and full/partial passive discovery."""
+    pooled = preds_df.copy()
+    pooled["group_id"] = (pooled["split_seed"].astype(str) + ":" +
+                          pooled["group_id"].astype(str))
+    rows = []
+    for dimension in ("gt_n_aps", "gt_n_hotspots", "gt_candidate_stratum",
+                      "discovery"):
+        if dimension not in pooled:
+            continue
+        for value, subset in pooled.groupby(dimension):
+            row = {
+                "dimension": dimension,
+                "value": value,
+                "groups": subset.group_id.nunique(),
+            }
+            for model in models:
+                row[model] = selection_metrics(
+                    subset, subset[f"pred_{model}"].to_numpy())["mean_regret_mbps"]
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def fit_ranker(train, val, test, feats, seed, epochs, patience):
     import torch
 
     from models.ranker import (SetRanker, Standardizer, make_groups, predict_rows,
@@ -137,31 +178,37 @@ def fit_ranker(train, val, test, feats, seed):
     for name, use_context in (("set_ranker", True), ("mlp_pointwise", False)):
         cands, models = [], {}
         # alpha stays below 1 so the pointwise term is always present: a
-        # purely listwise score is defined only up to a monotone transform,
+        # purely ranking-based score is defined only up to a monotone transform,
         # which leaves ranking intact but makes regression metrics meaningless.
-        for alpha in (0.3, 0.5, 0.7, 0.9):
-            for temp in (2.0, 5.0, 10.0):
-                torch.manual_seed(seed)
-                m = SetRanker(len(feats), dropout=0.1, use_context=use_context)
-                m = train_ranker(m, tr, va, epochs=300, lr=3e-3, weight_decay=1e-3,
-                                 alpha=alpha, temperature=temp, seed=seed, verbose=False)
-                p = np.expm1(np.clip(predict_rows(m, va, len(val)), -5, 12))
-                cands.append(((alpha, temp), p))
-                models[(alpha, temp)] = m
+        # Five configurations cover calibration-heavy, balanced, and
+        # ranking-heavy objectives while varying the regret scale around the
+        # balanced setting. The old 4 x 3 Cartesian grid mostly repeated the
+        # same saturated pair weights and multiplied training cost by 2.4.
+        for alpha, temp in ((0.3, 5.0), (0.7, 2.0), (0.7, 5.0),
+                            (0.7, 10.0), (0.9, 5.0)):
+            torch.manual_seed(seed)
+            m = SetRanker(len(feats), dropout=0.1, use_context=use_context)
+            m = train_ranker(m, tr, va, epochs=epochs, lr=3e-3,
+                             weight_decay=1e-3, alpha=alpha, temperature=temp,
+                             seed=seed, verbose=False, patience=patience)
+            p = np.expm1(np.clip(predict_rows(m, va, len(val)), -5, 12))
+            cands.append(((alpha, temp), p))
+            models[(alpha, temp)] = m
         (regret, _), (alpha, temp) = _select(cands, val)
         model = models[(alpha, temp)]
         val_pred[name] = np.expm1(np.clip(predict_rows(model, va, len(val)), -5, 12))
         test_pred[name] = np.expm1(np.clip(predict_rows(model, te, len(test)), -5, 12))
         chosen[name] = {"alpha": alpha, "temperature": temp,
-                        "val_regret": round(regret, 4)}
+                        "val_topology_regret": round(regret, 4)}
     return val_pred, test_pred, chosen
 
 
-def run_once(df, feats, seed, skip_ranker):
+def run_once(df, feats, seed, skip_ranker, ranker_epochs, ranker_patience):
     train, val, test = split_by_group(df, seed=seed)
     val_pred, test_pred, chosen = fit_tree_models(train, val, test, feats, seed)
     if not skip_ranker:
-        v, t, c = fit_ranker(train, val, test, feats, seed)
+        v, t, c = fit_ranker(train, val, test, feats, seed,
+                             ranker_epochs, ranker_patience)
         val_pred.update(v)
         test_pred.update(t)
         chosen.update(c)
@@ -170,18 +217,23 @@ def run_once(df, feats, seed, skip_ranker):
 
     # keep per-row test predictions so results can be sliced afterwards
     from models.evaluate import baseline_predictions
-    keep = ["group_id", "ap_index", "label_throughput_mbps", "gt_n_channels",
-            "gt_true_distance", "feat_ap_rssi_mean"]
+    keep = ["topology_id", "group_id", "ap_index", "label_throughput_mbps",
+            "gt_n_aps", "gt_n_hotspots", "gt_candidate_stratum",
+            "gt_n_channels", "gt_true_distance", "feat_ap_rssi_mean"]
     rows = test[[c for c in keep if c in test.columns]].copy()
     rows["split_seed"] = seed
     for name, p in {**baseline_predictions(test), **test_pred}.items():
         rows[f"pred_{name}"] = p
+    group_sizes = rows.groupby("group_id")["group_id"].transform("size")
+    rows["discovery"] = np.where(group_sizes == rows["gt_n_aps"], "full", "partial")
 
     # a group is "rssi-optimal" when the strongest AP is already the best one
     rssi_regret = {}
     for gid, g in rows.groupby("group_id"):
         y = g["label_throughput_mbps"].to_numpy()
-        chosen_y = y[int(np.argmax(g["pred_strongest_rssi"].to_numpy()))]
+        scores = g["pred_strongest_rssi"].to_numpy()
+        tied = np.isclose(scores, scores.max(), rtol=1e-12, atol=1e-12)
+        chosen_y = float(y[tied].mean())
         rssi_regret[gid] = y.max() - chosen_y
     rows["stratum"] = rows.group_id.map(
         lambda g: "RSSI already optimal" if rssi_regret[g] <= 0.5 else "RSSI misleading")
@@ -212,7 +264,9 @@ def make_figures(test, preds, agg, out_dir: Path):
     fig.savefig(out_dir / "regret.pdf")
     plt.close(fig)
 
-    best_model = min(preds, key=lambda k: selection_metrics(test, preds[k])["mean_regret_mbps"])
+    # Pick the learned model by aggregate test reporting, not whichever model
+    # happened to win the final repeated split used for this scatter plot.
+    best_model = min(preds, key=lambda name: agg.loc[name, ("mean_regret_mbps", "mean")])
     y = test["label_throughput_mbps"].to_numpy()
     fig, ax = plt.subplots(figsize=(4.4, 4.2))
     ax.scatter(y, preds[best_model], s=12, alpha=0.45, edgecolor="none")
@@ -232,10 +286,12 @@ def make_figures(test, preds, agg, out_dir: Path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path)
-    parser.add_argument("--out-dir", type=Path, default=Path("report"))
+    parser.add_argument("--out-dir", type=Path, default=Path("results/main"))
     parser.add_argument("--repeats", type=int, default=5,
                         help="number of independent group splits to average over")
     parser.add_argument("--skip-ranker", action="store_true")
+    parser.add_argument("--ranker-epochs", type=int, default=200)
+    parser.add_argument("--ranker-patience", type=int, default=25)
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -250,7 +306,9 @@ def main():
     last = None
     for i in range(args.repeats):
         print(f"--- split seed {i} ---")
-        res, chosen, test, test_pred, rows = run_once(df, feats, i, args.skip_ranker)
+        res, chosen, test, test_pred, rows = run_once(
+            df, feats, i, args.skip_ranker, args.ranker_epochs,
+            args.ranker_patience)
         pred_rows.append(rows)
         print(res[["model", "top1_accuracy", "mean_regret_mbps", "mean_spearman"]]
               .to_string(index=False))
@@ -269,10 +327,12 @@ def main():
         "regret_mbps": agg[("mean_regret_mbps", "mean")].map("{:.3f}".format) + " +/- "
                        + agg[("mean_regret_mbps", "std")].map("{:.3f}".format),
         "regret_frac": agg[("mean_regret_frac", "mean")].map("{:.3f}".format),
+        "topology_regret": agg[("topology_mean_regret_mbps", "mean")].map("{:.3f}".format),
         "spearman": agg[("mean_spearman", "mean")].map("{:.3f}".format),
         "r2": agg[("r2", "mean")].map(lambda v: "-" if pd.isna(v) else f"{v:.3f}"),
         "r2_log": agg[("r2_log", "mean")].map(lambda v: "-" if pd.isna(v) else f"{v:.3f}"),
-    }).sort_values("regret_mbps")
+    })
+    show = show.loc[agg[("mean_regret_mbps", "mean")].sort_values().index]
     print(show.to_string())
 
     preds_df = pd.concat(pred_rows, ignore_index=True)
@@ -292,6 +352,13 @@ def main():
                     "already selects the best AP. Pooled across all test splits.",
             label="tab:stratified"))
 
+    dimension_models = [column[5:] for column in preds_df.columns
+                        if column.startswith("pred_") and column != "pred_random"]
+    dimensions = dimension_report(preds_df, dimension_models)
+    print("\n=== MEAN REGRET BY DATASET DIMENSION (Mbps, pooled over splits) ===")
+    print(dimensions.to_string(index=False))
+    dimensions.to_csv(args.out_dir / "stratified_dimensions.csv", index=False)
+
     best_model = make_figures(*last, agg, args.out_dir)
     res_all.to_csv(args.out_dir / "results_raw.csv", index=False)
     agg.to_csv(args.out_dir / "results.csv")
@@ -301,7 +368,8 @@ def main():
     tex["model"] = tex["model"].str.replace("_", r"\_", regex=False)
     tex = tex.rename(columns={
         "model": "Model", "top1": "Top-1", "regret_mbps": "Regret (Mbps)",
-        "regret_frac": "Regret (frac)", "spearman": "Spearman",
+        "regret_frac": "Regret (frac)", "topology_regret": "Topology regret",
+        "spearman": "Spearman",
         "r2": "$R^2$", "r2_log": "$R^2_{\\log}$"})
     latex = tex.to_latex(
         index=False, escape=False,
@@ -315,6 +383,7 @@ def main():
 
     (args.out_dir / "summary.json").write_text(json.dumps({
         "rows": int(len(df)), "groups": int(df.group_id.nunique()),
+        "topologies": int(df.topology_id.nunique()) if "topology_id" in df else None,
         "n_features": len(feats), "repeats": args.repeats,
         "oracle": oracle_ceiling(df), "best_model": best_model,
     }, indent=2))

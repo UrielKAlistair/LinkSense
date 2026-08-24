@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A set-based listwise ranker over the APs available in one scenario.
+"""A set-based pairwise ranker over the APs available in one scenario.
 
 Why not just regress each option independently (models/baseline.py does
 exactly that)? Because the quantity that matters is a comparison. The best
@@ -16,16 +16,16 @@ which is a DeepSets-style permutation-invariant set encoder. The context
 term lets the network express "this AP is only mildly loaded *compared to
 the others here*" without that comparison being precomputed.
 
-Groups hold 2-4 options, so batches are padded to the largest group and
+Groups hold 2-8 discovered options, so batches are padded to the largest group and
 masked; padding must never leak into pooling, the loss, or the argmax.
 
 Two objectives, combined by default:
-  listwise  softmax cross-entropy between predicted scores and a softened
-            distribution over the true throughputs. Optimises the ordering
-            directly, which is what selection needs.
+  ranking   pairwise logistic loss over every valid AP pair, weighted by the
+            true throughput gap. Optimises the ordering directly and spends
+            little capacity separating operationally equivalent near-ties.
   pointwise MSE on log1p(throughput). Keeps the outputs interpretable as
-            throughput estimates rather than bare scores, and regularises
-            the ranking objective (which is indifferent to scale).
+            throughput estimates rather than bare scores. Pairwise ordering
+            and log-throughput calibration are scale-compatible objectives.
 
 Run:  python -m models.ranker data/dataset.csv --epochs 300
 """
@@ -123,36 +123,53 @@ class SetRanker(nn.Module):
         return self.head(torch.cat([h, ctx], dim=-1)).squeeze(-1)
 
 
-def listwise_loss(scores, y, mask, temperature: float = 5.0):
-    """Softmax CE against a softened distribution over true throughputs.
+def ranking_loss(scores, y, mask, temperature: float = 5.0, tie_tol: float = 0.5):
+    """Regret-weighted pairwise ordering loss.
 
-    Temperature controls how sharply the target concentrates on the best
-    option: too low and near-ties become arbitrary hard labels, too high and
-    the target washes out to uniform.
+    A softmax target formed from linear Mbps requires optimal scores to be
+    linear in Mbps, while the calibration term below requires the same scores
+    to equal log1p(Mbps). Those objectives cannot both be satisfied. Pairwise
+    logistic loss requires only the correct score order, so it is compatible
+    with calibrated log-throughput outputs.
+
+    Throughput gaps at or below tie_tol carry no weight. Above it, tanh(gap /
+    temperature) smoothly gives costly mistakes more influence without
+    allowing one extreme pair to dominate a group.
     """
-    neg = torch.finfo(scores.dtype).min
-    log_p = torch.log_softmax(scores.masked_fill(~mask, neg), dim=1)
-    target = torch.softmax((y / temperature).masked_fill(~mask, neg), dim=1)
-    return -(target * log_p).masked_fill(~mask, 0.0).sum(dim=1).mean()
+    score_gap = scores.unsqueeze(2) - scores.unsqueeze(1)
+    throughput_gap = y.unsqueeze(2) - y.unsqueeze(1)
+    valid = mask.unsqueeze(2) & mask.unsqueeze(1)
+    upper = torch.triu(torch.ones_like(valid, dtype=torch.bool), diagonal=1)
+    valid &= upper & (throughput_gap.abs() > tie_tol)
+
+    direction = throughput_gap.sign()
+    weights = torch.tanh(throughput_gap.abs() / temperature).masked_fill(~valid, 0.0)
+    losses = F.softplus(-direction * score_gap) * weights
+    per_group = losses.sum(dim=(1, 2)) / weights.sum(dim=(1, 2)).clamp(min=1e-9)
+    has_pairs = valid.any(dim=(1, 2))
+    return per_group[has_pairs].mean() if has_pairs.any() else scores.sum() * 0.0
 
 
 def pointwise_loss(scores, y, mask):
     diff = (scores - torch.log1p(y)) ** 2
-    return diff.masked_fill(~mask, 0.0).sum() / mask.sum().clamp(min=1)
+    per_group = (diff.masked_fill(~mask, 0.0).sum(dim=1) /
+                 mask.sum(dim=1).clamp(min=1))
+    return per_group.mean()
 
 
 def train(model, tr, va, epochs, lr, weight_decay, alpha, temperature, seed,
-          verbose=True, batch_size=32):
+          verbose=True, batch_size=32, patience: int | None = 30):
     torch.manual_seed(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     Xtr, ytr, mtr, _ = tr
     Xva, yva, mva, _ = va
 
     best = (float("inf"), None)
+    stale = 0
     n = Xtr.size(0)
     for epoch in range(epochs):
         model.train()
-        # Minibatch over GROUPS (a group is the atomic unit - the listwise
+        # Minibatch over GROUPS (a group is the atomic unit - the ranking
         # loss is defined across the options within one). Full-batch descent
         # gave one step per epoch, far too few to fit this model.
         perm = torch.randperm(n)
@@ -160,7 +177,7 @@ def train(model, tr, va, epochs, lr, weight_decay, alpha, temperature, seed,
             idx = perm[start:start + batch_size]
             opt.zero_grad()
             s = model(Xtr[idx], mtr[idx])
-            loss = alpha * listwise_loss(s, ytr[idx], mtr[idx], temperature) + \
+            loss = alpha * ranking_loss(s, ytr[idx], mtr[idx], temperature) + \
                 (1 - alpha) * pointwise_loss(s, ytr[idx], mtr[idx])
             loss.backward()
             opt.step()
@@ -168,13 +185,18 @@ def train(model, tr, va, epochs, lr, weight_decay, alpha, temperature, seed,
         model.eval()
         with torch.no_grad():
             sv = model(Xva, mva)
-            vloss = (alpha * listwise_loss(sv, yva, mva, temperature) +
+            vloss = (alpha * ranking_loss(sv, yva, mva, temperature) +
                      (1 - alpha) * pointwise_loss(sv, yva, mva)).item()
         if vloss < best[0]:
             best = (vloss, {k: v.detach().clone() for k, v in model.state_dict().items()})
+            stale = 0
+        else:
+            stale += 1
         if verbose and (epoch + 1) % 50 == 0:
             print(f"  epoch {epoch + 1:>4}  train={loss.item():.4f}  val={vloss:.4f}  "
                   f"best={best[0]:.4f}")
+        if patience is not None and stale >= patience:
+            break
 
     if best[1] is not None:
         model.load_state_dict(best[1])
@@ -202,8 +224,11 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--alpha", type=float, default=0.7,
-                        help="weight on the listwise term (1-alpha on pointwise)")
-    parser.add_argument("--temperature", type=float, default=5.0)
+                        help="weight on the ranking term (1-alpha on pointwise)")
+    parser.add_argument("--temperature", type=float, default=5.0,
+                        help="Mbps scale controlling pairwise regret weights")
+    parser.add_argument("--patience", type=int, default=30,
+                        help="stop after this many epochs without validation improvement")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
@@ -225,7 +250,8 @@ def main():
 
     model = SetRanker(len(feats), dropout=args.dropout)
     model = train(model, tr, va, 3 if args.smoke_test else args.epochs, args.lr,
-                  args.weight_decay, args.alpha, args.temperature, args.seed)
+                  args.weight_decay, args.alpha, args.temperature, args.seed,
+                  patience=args.patience)
 
     pred = predict_rows(model, va, len(val_df))
     # scores are trained toward log1p(throughput); invert for reporting so

@@ -13,10 +13,13 @@ Experiments:
      expect: monotone decreasing.
   V3 interaction: throughput vs distance at several background loads.
      expect: V1's curve shifted down as load rises.
-  V4 channels: 2 APs co-channel vs on separate channels.
-     expect: separate channels >= co-channel (no cross-BSS contention).
+  V4 topology: fixed pair/triangle/grid geometry and channel plan.
+     expect: the documented 30 m layout and four-channel reuse pattern.
   V5 determinism: same seed twice => byte-identical label.
   V6 seed spread: same scenario, different seeds => variation, but not wild.
+     expect: throughput varies while physical station positions remain fixed.
+  V7 matched sets: every target-AP variant has the same observation.
+     expect: observation.csv and chanbusy.csv are byte-identical.
 
 Run:  python scripts/validate_sim.py --binary <path> [--out-dir <dir>]
 """
@@ -34,10 +37,9 @@ import tempfile
 from pathlib import Path
 
 BASE = {
-    "simStopTime": 14.0,
-    "candidateStartTime": 6.0,
-    "jitterStd": 0.0,
-    "candidateAngleDeg": 90.0,
+    "candidateX": 0.0,
+    "candidateY": 10.0,
+    "topologySeed": 2025,
 }
 
 
@@ -86,7 +88,7 @@ def main():
 
     # ---- V1: link quality vs distance, contention removed ----
     dists = [1, 5, 10, 15, 20, 25, 30, 35, 40, 50, 60]
-    jobs = [(f"v1_d{d}_s{s}", dict(nAPs=1, nSTAs=1, candidateDistance=d,
+    jobs = [(f"v1_d{d}_s{s}", dict(nAPs=1, nSTAs=1, candidateY=d,
                                   bgPerStaMbps=0.05, rngSeed=s))
             for d in dists for s in seeds]
     res = parallel(args.binary, tmp, jobs, args.workers)
@@ -99,7 +101,7 @@ def main():
 
     # ---- V2: throughput vs background load, distance fixed ----
     loads = [0.05, 2, 4, 6, 8, 10, 12]
-    jobs = [(f"v2_l{l}_s{s}", dict(nAPs=1, nSTAs=4, candidateDistance=10,
+    jobs = [(f"v2_l{l}_s{s}", dict(nAPs=1, nSTAs=4, candidateY=10,
                                   bgPerStaMbps=l, rngSeed=s))
             for l in loads for s in seeds]
     res = parallel(args.binary, tmp, jobs, args.workers)
@@ -114,7 +116,7 @@ def main():
     print("\nV3 distance x background load")
     d3 = [5, 15, 25, 35]
     l3 = [0.05, 4, 8]
-    jobs = [(f"v3_d{d}_l{l}_s{s}", dict(nAPs=1, nSTAs=4, candidateDistance=d,
+    jobs = [(f"v3_d{d}_l{l}_s{s}", dict(nAPs=1, nSTAs=4, candidateY=d,
                                        bgPerStaMbps=l, rngSeed=s))
             for d in d3 for l in l3 for s in seeds]
     res = parallel(args.binary, tmp, jobs, args.workers)
@@ -128,29 +130,45 @@ def main():
          check_monotone_decreasing([grid[d][0] for d in d3], tol=3.0)
     verdicts.append(("V3 both axes degrade throughput", ok, "see grid"))
 
-    # ---- V4: co-channel vs separate channels ----
-    jobs = []
-    for nch in (1, 2):
-        for s in seeds:
-            jobs.append((f"v4_c{nch}_s{s}", dict(nAPs=2, nSTAs=8, apSpacing=25,
-                                                candidateDistance=8, nChannels=nch,
-                                                bgPerStaMbps=6, rngSeed=s)))
-    res = parallel(args.binary, tmp, jobs, args.workers)
-    co = statistics.fmean(thr(res[f"v4_c1_s{s}"]) for s in seeds)
-    sep = statistics.fmean(thr(res[f"v4_c2_s{s}"]) for s in seeds)
-    print(f"\nV4 co-channel={co:.2f} Mbps   separate-channels={sep:.2f} Mbps")
-    verdicts.append(("V4 channel separation helps", sep > co, f"{co:.1f} -> {sep:.1f} Mbps"))
+    # ---- V4: fixed two-dimensional topology and channel plan ----
+    expected = {
+        2: ([(0.0, 0.0), (30.0, 0.0)], [36, 40]),
+        3: ([(0.0, 0.0), (30.0, 0.0), (15.0, 25.9808)], [36, 40, 44]),
+        4: ([(0.0, 0.0), (30.0, 0.0), (0.0, 30.0), (30.0, 30.0)],
+            [36, 40, 44, 48]),
+        6: ([(0.0, 0.0), (30.0, 0.0), (60.0, 0.0),
+             (0.0, 30.0), (30.0, 30.0), (60.0, 30.0)],
+            [36, 40, 44, 48, 36, 40]),
+        8: ([(0.0, 0.0), (30.0, 0.0), (60.0, 0.0), (90.0, 0.0),
+             (0.0, 30.0), (30.0, 30.0), (60.0, 30.0), (90.0, 30.0)],
+            [36, 40, 44, 48, 36, 40, 44, 48]),
+    }
+    v4_ok = True
+    for n_aps, (positions, channels) in expected.items():
+        meta = run(args.binary, tmp, f"v4_n{n_aps}", nAPs=n_aps, nSTAs=n_aps,
+                   rngSeed=41 + n_aps)
+        actual_positions = [(ap["position"]["x"], ap["position"]["y"])
+                            for ap in meta["aps"]]
+        actual_channels = [ap["channel"] for ap in meta["aps"]]
+        same_positions = all(abs(ax - ex) < 1e-3 and abs(ay - ey) < 1e-3
+                             for (ax, ay), (ex, ey) in zip(actual_positions, positions))
+        same = same_positions and actual_channels == channels
+        v4_ok &= same
+        print(f"\nV4 nAPs={n_aps}: {'expected layout' if same else 'MISMATCH'}")
+    verdicts.append(("V4 fixed pair/triangle/grid and channel plan", v4_ok,
+                     "2/3/4/6/8 AP layouts"))
 
     # ---- V5: determinism ----
-    a = run(args.binary, tmp, "v5_a", nAPs=2, nSTAs=6, candidateDistance=12, rngSeed=99)
-    b = run(args.binary, tmp, "v5_b", nAPs=2, nSTAs=6, candidateDistance=12, rngSeed=99)
+    a = run(args.binary, tmp, "v5_a", nAPs=3, nSTAs=9, candidateY=12, rngSeed=99)
+    b = run(args.binary, tmp, "v5_b", nAPs=3, nSTAs=9, candidateY=12, rngSeed=99)
     same = thr(a) == thr(b)
     print(f"\nV5 determinism: {thr(a):.6f} vs {thr(b):.6f} -> {'identical' if same else 'DIFFERENT'}")
     verdicts.append(("V5 same seed reproduces exactly", same, f"{thr(a):.4f}"))
 
     # ---- V6: seed spread ----
     many = [11 + 3 * i for i in range(8)]
-    jobs = [(f"v6_s{s}", dict(nAPs=2, nSTAs=6, candidateDistance=18, bgPerStaMbps=6, rngSeed=s))
+    jobs = [(f"v6_s{s}", dict(nAPs=3, nSTAs=9, candidateY=18,
+                              hotspotAPs="1", bgPerStaMbps=6, rngSeed=s))
             for s in many]
     res = parallel(args.binary, tmp, jobs, args.workers)
     vals = [thr(res[f"v6_s{s}"]) for s in many]
@@ -159,32 +177,42 @@ def main():
     print(f"\nV6 seed spread at fixed scenario: mean={mean:.2f} sd={sd:.2f} "
           f"cv={sd / mean if mean else float('nan'):.2f}")
     print(f"    values: {', '.join(f'{v:.1f}' for v in vals)}")
-    verdicts.append(("V6 seeds vary but not degenerately", sd > 0.01, f"sd={sd:.2f}"))
+    station_layouts = [res[f"v6_s{s}"]["background_stations"] for s in many]
+    same_topology = all(layout == station_layouts[0] for layout in station_layouts[1:])
+    verdicts.append(("V6 seeds vary on one fixed topology",
+                     sd > 0.01 and same_topology,
+                     f"sd={sd:.2f}, positions={'same' if same_topology else 'changed'}"))
 
     # ---- V7: matched-set observation identity ----
     # The choice-set framing depends on every variant of a group sharing one
     # pre-association observation. Verify it at the bytes rather than
-    # assuming it, on both a co-channel and a multi-channel deployment.
+    # assuming it, on both the triangle and a channel-reusing 3x2 grid.
     print("\nV7 matched-set observation identity")
     v7_ok = True
-    for nch in (1, 3):
+    for n_aps in (3, 6):
         digests = []
-        for t in range(3):
-            meta = run(args.binary, tmp, f"v7_c{nch}_t{t}", nAPs=3, nSTAs=9, apSpacing=30,
-                      targetAP=t, candidateAbsolute=1, candidateX=35, candidateY=12,
-                      nChannels=nch, bgPerStaMbps=4, rngSeed=4242)
-            obs = tmp / f"v7_c{nch}_t{t}" / "observation.csv"
-            if not obs.exists():
-                raise FileNotFoundError(f"{obs} missing; V7 cannot verify anything")
-            body = obs.read_bytes()
-            digests.append((hashlib.md5(body).hexdigest()[:10], len(body)))
+        for target in range(n_aps):
+            tag = f"v7_n{n_aps}_t{target}"
+            run(args.binary, tmp, tag, nAPs=n_aps, nSTAs=n_aps * 3,
+                targetAP=target, candidateX=25, candidateY=17,
+                hotspotAPs="1", bgPerStaMbps=4, topologySeed=777, rngSeed=4242)
+            observation = tmp / tag / "observation.csv"
+            channel_busy = tmp / tag / "chanbusy.csv"
+            if not observation.exists() or not channel_busy.exists():
+                raise FileNotFoundError(f"{tag} is missing an observation file")
+            obs_body = observation.read_bytes()
+            busy_body = channel_busy.read_bytes()
+            digests.append((hashlib.md5(obs_body).hexdigest()[:10], len(obs_body),
+                            hashlib.md5(busy_body).hexdigest()[:10], len(busy_body)))
         # guard against the check passing because nothing was compared
-        assert all(d[1] > 1000 for d in digests), "observation files suspiciously small"
+        assert all(d[1] > 1000 and d[3] > 100 for d in digests), \
+            "observation files suspiciously small"
         same = len(set(digests)) == 1
         v7_ok &= same
-        print(f"    nChannels={nch}: {'identical' if same else 'DIFFERENT'} across 3 variants "
+        print(f"    nAPs={n_aps}: {'identical' if same else 'DIFFERENT'} across variants "
               f"({digests[0]})")
-    verdicts.append(("V7 group variants share one observation", v7_ok, "byte-identical scans"))
+    verdicts.append(("V7 group variants share one observation", v7_ok,
+                     "frames and CCA byte-identical"))
 
     print("\n" + "=" * 68)
     for name, ok, detail in verdicts:

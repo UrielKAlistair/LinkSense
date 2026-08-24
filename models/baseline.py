@@ -4,8 +4,8 @@
 Each row is scored independently and the argmax within a group is the
 chosen AP. That is a pointwise ranking approach: simple, and a sensible
 default for a few hundred groups of tabular features, where boosting is
-hard to beat. models/ranker.py adds a listwise alternative that optimises
-the comparison directly.
+hard to beat. models/ranker.py adds a set-context alternative that optimises
+pairwise ordering directly.
 
 Run:  python -m models.baseline data/dataset.csv
 """
@@ -19,8 +19,8 @@ import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.inspection import permutation_importance
 
-from .data import (LABEL_COL, assert_no_leakage, feature_columns, impute_features,
-                   load_dataset, split_by_group, to_xy)
+from .data import (LABEL_COL, assert_no_leakage, feature_columns, group_sample_weights,
+                   impute_features, load_dataset, split_by_group, to_xy)
 from .evaluate import evaluate_all, oracle_ceiling
 
 
@@ -52,6 +52,7 @@ def main():
 
     X_tr, y_tr = to_xy(train, feats)
     X_va, y_va = to_xy(val, feats)
+    train_weights = group_sample_weights(train)
 
     print(f"dataset={args.dataset}  rows={len(df)}  features={len(feats)}")
     print(f"groups: train={train.group_id.nunique()} val={val.group_id.nunique()} "
@@ -64,7 +65,7 @@ def main():
     fitted = {}
     for name, model in build_models(args.seed).items():
         target = np.log1p(y_tr) if args.log_target else y_tr
-        model.fit(X_tr, target)
+        model.fit(X_tr, target, sample_weight=train_weights)
         p = model.predict(X_va)
         preds[name] = np.expm1(p) if args.log_target else p
         fitted[name] = model
@@ -75,7 +76,7 @@ def main():
                .set_index("model").loc[n, "mean_regret_mbps"])
     imp = permutation_importance(fitted[best], X_va,
                                  np.log1p(y_va) if args.log_target else y_va,
-                                 n_repeats=15, random_state=args.seed, n_jobs=-1)
+                                 n_repeats=15, random_state=args.seed, n_jobs=1)
     order = np.argsort(imp.importances_mean)[::-1][:12]
     print(f"\ntop permutation importances ({best}):")
     for i in order:

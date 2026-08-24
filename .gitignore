@@ -7,10 +7,5 @@ __pycache__/
 .venv/
 data/
 runs/
-report/*.aux
-report/*.log
-report/*.out
-report/*.toc
-report/*.fdb_latexmk
-report/*.fls
-report/*.synctex.gz
+results/
+report/
