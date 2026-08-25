@@ -87,13 +87,13 @@ do remain are stated next.
 
 \section{Experimental Scope and Assumptions}
 
-Simulator 1 isolates the relationship among path quality, background load,
+The simulator isolates the relationship among path quality, background load,
 and passive evidence. It does not attempt to reproduce every feature of a
 deployed WLAN. Table~\ref{tab:assumptions} states the principal assumptions so
 that conclusions can be interpreted within the intended scope.
 
 \begin{table}[!ht]
-\caption{Controlled assumptions of Simulator 1.}
+\caption{Controlled assumptions of the simulator.}
 \label{tab:assumptions}
 \centering
 \footnotesize
@@ -117,8 +117,8 @@ the simulation stops; failed association is assigned zero. \\
 \end{tabularx}
 \end{table}
 
-The choice set presented to the candidate station contains only APs discovered 
-during its passive scan. 
+The choice set presented to the candidate station contains only APs discovered
+during its passive scan.
 
 The environment is static and open, so it excludes mobility, walls, hardware
 diversity, and application demand that varies over time. The label is uplink
@@ -179,7 +179,7 @@ deployment shifting underneath it.
 Validation runs before any model is fitted, so that a good accuracy number
 cannot mask a defective data-generating process.
 
-Three basic checks ensure that the above outlined design is actualised 
+Three basic checks ensure that the above outlined design is actualised
 automatically: (i) Repeating a seed reproduces throughput exactly (any run can
 be regenerated), (ii) Changing only the radio seed varies the outcome while every
 physical position stays fixed, and (iii) The recorded frame and channel-busy
@@ -194,16 +194,24 @@ real network.
 
 \subsection{Recording and Projection}
 
-The candidate carries one receive-only scanner PHY per occupied channel, plus
-a separate PHY reserved for association. The scanner PHYs never transmit and
-never associate; the association PHY is parked on unused channel 149 until the
-decision time, so the AP the candidate will eventually join cannot alter what
-is heard, or consume random draws, while the observation is being collected.
-At $t=5.5$ s the scanner PHYs move to the parking channel as well.
+The simulator separates data collection from what a deployable client is
+assumed to observe. During simulation, receive-only scanner PHYs record
+activity on every occupied channel simultaneously. This produces a complete
+passive record that is identical across the matched target-AP replays. After
+simulation, that record is projected onto a single-radio scan schedule in
+order to train models under a realistic condition.
+
+Specifically, the candidate carries one receive-only scanner PHY per
+occupied channel, plus a separate PHY reserved for association. The scanner
+PHYs never transmit and never associate; the association PHY is parked on
+unused channel 149 until the decision time, so the AP the candidate will
+eventually join cannot alter what is heard, or consume random draws, while
+the observation is being collected. At $t=5.5$ s the scanner PHYs move to
+the parking channel as well.
 
 Watching every channel at once is not a claim that real clients have several
 radios. It is a recording device: it captures a superset of what any single
-radio could have heard, from which a realistic single-radio observation is cut
+radio could have heard, from which a single-radio scan projection is cut
 afterwards.
 
 Two traces are recorded. The monitor-sniffer trace holds every frame a scanner
@@ -212,8 +220,7 @@ retry flags, length, RSSI, noise, airtime, and PHY rate. The PHY-state trace
 gives the fraction of each 102.4 ms beacon interval in which carrier sense
 marked the channel busy. This clear-channel-assessment (CCA) measurement
 registers energy a frame-only view misses: interference, and transmissions too
-distant to decode. Real chipsets expose such a counter, though whether a driver
-surfaces it varies by platform.
+distant to decode. Some driver stacks expose an equivalent channel-busy counter, though availability varies by platform.
 
 The superset is then projected onto one passive radio. That radio rotates through the occupied channels in random order, dwelling 110 ms on each with
 0.15 ms to retune, and repeats the cycle for as much of the window as it
@@ -233,9 +240,9 @@ length, signal, airtime, and PHY rate. It is a time series, and we train a
 transformer on it directly.
 
 The raw observation is a long sequence, and what distinguishes one AP from
-another does not reside at frame granularity. Both problems that arise here 
-are resolved by aggregating, which is possible only for quantities 
-that can be averaged over a set of frames. 
+another does not reside at frame granularity. Both problems that arise here
+are resolved by aggregating, which is possible only for quantities
+that can be averaged over a set of frames.
 We define a list of hand crafted features for this purpose; they are enumerated in Appendix~\ref{app:features}.
 
 Aggregation is done per AP before the data is bucketed. Frames are attributed
@@ -288,55 +295,109 @@ topologies, a median of 4 options per decision. The best option in a set yields
 42.6\,Mbit/s on average against 22.0 for one chosen at random, and the best and
 worst differ by 35.5\,Mbit/s.
 
-To bound what passive observation can provide, we train seperate models on 
-the \emph{continuous} observation keeps the parallel-scanner superset in which
-every channel is watched throughout. No single radio can do this in reality. 
-The models of our chief interest are ones trained on the \emph{rotating}
-observation, the single-radio projection of Section~\ref{sec:obs}. 
+For each choice set, matched counterfactual replay provides the throughput
+obtained by associating with every candidate AP. The highest-throughput option
+therefore provides an oracle against which a selection algorithm can be
+evaluated.
+
+Two observation conditions are considered. The rotating condition contains only
+evidence retained by the single-radio scan projection and is the primary
+experimental condition. The continuous condition retains the parallel-scanner
+observation and measures the value of eliminating scan-induced coverage gaps.
 
 \begin{table}[!ht]
-\caption{Top-1 accuracy by model, objective, and observation.}
+\caption{Top-1 accuracy by model, objective, and observation. Mean and
+standard deviation over five held-out topology splits, except $\dagger$, over
+three.}
 \label{tab:results}
 \centering
 \footnotesize
-\begin{tabularx}{\columnwidth}{@{}Ylrrr@{}}
+\begin{tabularx}{\columnwidth}{@{}Ylrr@{}}
 \toprule
-\textbf{Model} & \textbf{Obj.} & \textbf{Rotating} & \textbf{Cont.} & \textbf{Gain} \\
+\textbf{Model} & \textbf{Obj.} & \textbf{Rotating} & \textbf{Continuous} \\
 \midrule
-Random choice             & ---  & 0.282 & 0.282 & $+$0.000 \\
-Least busy channel        & ---  & 0.442 & 0.446 & $+$0.003 \\
-Strongest RSSI            & ---  & 0.601 & 0.606 & $+$0.005 \\
-RSSI minus busy           & ---  & 0.815 & 0.812 & $-$0.003 \\
-\midrule
-Ridge, flattened sequence & reg. & 0.768 & 0.887 & $+$0.119 \\
-MLP, flattened sequence   & rank & \tbd  & \tbd  & \tbd \\
-MLP, summary statistics   & rank & \tbd  & \tbd  & \tbd \\
-GBM, summary statistics   & reg. & \tbd  & \tbd  & \tbd \\
-GBM, flattened sequence   & reg. & \tbd  & \tbd  & \tbd \\
-\midrule
-Transformer, binned       & reg. & 0.919 & 0.920 & $+$0.001 \\
-Transformer, binned       & rank & \textbf{0.931} & 0.929 & $-$0.002 \\
-Transformer, frame-level  & reg. & \tbd  & ---   & --- \\
-Transformer, frame-level  & rank & \tbd  & ---   & --- \\
+\multicolumn{4}{@{}l}{\textit{Heuristics}} \\
+Random choice & --- & 0.282\,$\pm$\,0.002 & 0.282\,$\pm$\,0.002 \\
+Least busy channel & --- & 0.442\,$\pm$\,0.072 & 0.446\,$\pm$\,0.066 \\
+Strongest RSSI & --- & 0.601\,$\pm$\,0.057 & 0.606\,$\pm$\,0.056 \\
+RSSI minus busy & --- & 0.815\,$\pm$\,0.052 & 0.812\,$\pm$\,0.050 \\
+\addlinespace
+\multicolumn{4}{@{}l}{\textit{Vector: 35 hand-built features}} \\
+Ridge & reg. & 0.881\,$\pm$\,0.045 & --- \\
+MLP, pointwise & rank & 0.897\,$\pm$\,0.024 & --- \\
+Set ranker & rank & 0.909\,$\pm$\,0.030 & --- \\
+Random forest & reg. & 0.925\,$\pm$\,0.019 & --- \\
+Gradient boosting & reg. & \textbf{0.934\,$\pm$\,0.020} & --- \\
+\addlinespace
+\multicolumn{4}{@{}l}{\textit{Binned sequence}} \\
+Ridge, flattened & reg. & 0.768\,$\pm$\,0.030 & 0.887\,$\pm$\,0.035 \\
+MLP, window means & rank & 0.767\,$\pm$\,0.039 & \tbd \\
+GBM, window means & reg. & 0.803\,$\pm$\,0.059 & \tbd \\
+MLP, summary stats & rank & 0.821\,$\pm$\,0.035 & \tbd \\
+GBM, summary stats & reg. & 0.842\,$\pm$\,0.029 & \tbd \\
+MLP, flattened & rank & 0.847\,$\pm$\,0.032 & \tbd \\
+GBM, flattened & reg. & 0.845\,$\pm$\,0.020 & \tbd \\
+Transformer & reg. & 0.873\,$\pm$\,0.026 & 0.894\,$\pm$\,0.037 \\
+Transformer & rank & 0.873\,$\pm$\,0.037 & 0.914\,$\pm$\,0.026 \\
+\addlinespace
+\multicolumn{4}{@{}l}{\textit{Frame trace}} \\
+Transformer$^{\dagger}$ & reg. & 0.888\,$\pm$\,0.039 & --- \\
+Transformer$^{\dagger}$ & rank & 0.897\,$\pm$\,0.028 & --- \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-Decision functions are grouped by the representation they consume. Heuristics
-read the observables directly: strongest RSSI, least busy channel, and RSSI
-minus channel-busy fraction. Gradient boosting, random forests, and ridge regression take the single-row vector. Transformers take the binned sequence
-and the frame trace.
+\subsection{Baselines}
 
-Comparing a transformer against models on the vector confounds architecture
-with representation, because the two are given different information. Three
-further encodings separate them, all derived from the binned sequence: its
-average over time, a set of summary statistics per measurement, and the
-sequence flattened with bin order preserved. A tabular model given the
-flattened sequence receives the same per-option measurements as the
-transformer. It does not receive the same information: the transformer's set
-stage attends across all options in a choice set, while a tabular model scores
-each row in isolation. The contrast ablation below supplies that comparison
-explicitly, which is what separates cross-option attention from sequence modeling.
+Three passive baselines are evaluated alongside random selection:
+
+\begin{itemize}
+\item \emph{Strongest RSSI} ranks options by mean beacon level.
+\item \emph{Least busy channel} ranks them by the clear-channel-assessment busy
+  fraction of the channel each occupies, so options sharing a channel are
+  indistinguishable to it.
+\item \emph{RSSI minus busy} maps RSSI from $-100$ to $-60$\,dBm onto the unit
+  interval and subtracts the busy fraction from it.
+\end{itemize}
+
+\subsection{Learned Models}
+
+Learned models are grouped by the representation they consume. Ridge
+regression, random forests, gradient boosting, a pointwise MLP and a set ranker
+take the single-row vector; transformers take the binned sequence and the frame
+trace.
+
+Each learned model is trained under two objectives. Regression predicts
+$\log(1+\text{throughput})$ in Mbit/s, so its outputs carry a scale. Ranking
+learns a distribution over the options in a choice set and optimizes the
+decision directly, at the cost of scores that carry no scale. Both are reported
+because they need not agree on which model wins.
+
+Every model sees the same splits, cut by topology and stratified by AP count:
+five, except the frame-level model, which was run on the first three and only
+on the rotating observation. The weight initialization is held fixed across
+splits, so the reported spread measures split variance alone. Metrics are top-1
+accuracy with a 0.5\,Mbit/s tie tolerance and mean regret against the oracle
+choice.
+
+\subsubsection{Tabular Models}
+
+Tabular models take the 35-feature vector and three encodings of the binned
+sequence: its average over time, a set of summary statistics per measurement,
+and the sequence flattened with bin order preserved. Gradient boosting and a
+pointwise MLP take all three encodings; ridge takes the flattened one only.
+
+On the vector, every model is selected per split by validation regret: ridge
+over regularization strength, gradient boosting over learning rate (0.03 to
+0.1), minimum leaf size (4 to 16) and 200 or 400 boosting iterations, the
+random forest over minimum leaf size and the feature fraction offered at each
+split with 400 trees throughout, and the two neural models over weight decay
+and score temperature. Both tree models additionally choose whether to fit a
+log-transformed target. Gradient boosting on the sequence encodings is tuned
+the same way with iterations fixed at 400; the MLPs there use one fixed
+setting.
+
+\subsubsection{Transformers}
 
 Both transformers use a model dimension of 48, four attention heads, and
 dropout 0.1, and hold roughly $10^5$ parameters. The binned model encodes each
@@ -347,105 +408,96 @@ over the raw sequence directly, since a trace runs to thousands of frames; four
 learned queries per option cross-attend into it instead, which is linear rather
 than quadratic in frame count. Both are trained with AdamW at $2\times10^{-3}$,
 weight decay $10^{-3}$, gradient clipping at unit norm, and early stopping on
-validation regret. Gradient boosting and random forests are tuned over depth,
-learning rate and tree count by validation regret on each split.
-
-Each learned model is trained under two objectives. Regression predicts
-$\log(1+\text{throughput})$ in Mbit/s, so its outputs carry a scale. Ranking
-learns a distribution over the options in a choice set and optimizes the
-decision directly, at the cost of scores that carry no scale. Both are reported
-because they need not agree on which model wins.
-
-Every model sees the same five splits, cut by topology and stratified by AP
-count. The weight initialization is held fixed across splits, so the
-reported spread measures split variance alone. Metrics are top-1 accuracy
-with a 0.5\,Mbit/s tie tolerance and mean regret against the oracle choice.
-
-Table~\ref{tab:results} reports top-1 accuracy as mean and standard deviation
-over the five splits. Rows are grouped by model family; differences across columns measure what
-widening the observation is worth.
-The frame-level model was run only on the rotating observation.
-
-
-Two ablations accompany the table. Supplying every tabular model with the mean
-of the other options and its own deviation from that mean hands it the
-cross-option comparison the set stage performs, isolating how much of any
-transformer margin is attributable to it. Shuffling the bins within each option,
-leaving bin position intact, removes temporal order while preserving everything
-else.
+validation regret.
 
 \section{Interpretation and Next Steps}
 \label{sec:next}
 
-A sequence model earns its parameters only if the ordering of the observation
-carries information its summary does not. Two conditions are necessary. The
-medium must vary within the observation window, and the label must depend on
-what that variation implies about the period after the decision, rather than on
-the mean the window already reports.
+The results establish that passive evidence beyond signal strength is useful
+for AP selection. They do not establish that temporal order is itself a source
+of that information. Gradient boosting on the feature vector reaches 0.934
+under the rotating observation, against 0.815 for RSSI minus busy and 0.601 for
+strongest RSSI. What remains open is whether sequence models benefit from
+observing how those measurements evolve, rather than from nonlinearity,
+missing-data handling, or comparison across candidates.
 
-Neither holds here. Within an option's own channel, after background traffic
-begins, the ratio of within-series to between-series standard deviation is 0.09
-for frame rate, 0.09 for channel-busy fraction, and 0.17 for the option's own
-activity. Variation between APs exceeds variation within an AP over time by an
-order of magnitude. An AP looks much the same at one second as at five. This is
-evidence that little is lost by averaging, not proof: stationarity does not imply
-independence across bins, and a small but monotone drift would produce the
-same ratio while remaining informative. The shuffle ablation is the direct
-test, permuting bins within an option while leaving bin position intact.
+The simulator gives temporal modeling little to exploit. After background
+traffic begins, the ratio of within-series to between-series standard deviation
+is 0.09 for frame rate, 0.09 for channel-busy fraction, and 0.17 for the
+option's own activity. Most measured variation lies between APs rather than
+within an AP over the window. An AP looks much the same at one second as at
+five.
 
-This conclusion does not rest on the intraclass correlation. That statistic is
-0.988, meaning the label is nearly determined once topology and target AP are
-fixed, but it describes the reproducibility of the label across radio seeds and
-implies nothing about which representation recovers it. A situation may be
-fully determined by where the client stands and still be legible only from how
-the medium evolves. Evidence about representation must come from the
-observation, which is why the stationarity measurement is the relevant
-quantity.
+This is evidence that averaging loses little, not a direct test of whether
+order is irrelevant. A stationary-looking sequence may still carry
+autocorrelation, drift, or short-lived events. Permuting the observed bins
+within each option, keeping the same values and the same positional structure,
+is that test: unchanged accuracy would show the model is not using order, and a
+fall would show order carries what the summaries do not. It has not been run.
 
-Table~\ref{tab:results} supports the same reading from a different direction.
-Widening the observation from one rotating radio to one per channel
-raises ridge regression on the flattened sequence by 0.119 while leaving the
-transformer unchanged. Widening the observation from one rotating radio to one per channel raises
-ridge by 0.119 and the transformer by 0.021 to 0.041. Every model on the binned
-sequence improves, and the gain is ordered inversely to capacity: the weakest
-model gains most. Ridge with continuous observation reaches 0.887, above the
-transformer's 0.873 with rotating observation, so channel coverage substitutes
-for model capacity rather than supplying information no model could otherwise
-reach. Under a rotating radio roughly three-quarters of an option's bins carry
-no frames from it, and a linear fit suffers more from that sparsity than
-attention does.
-Against a two-term heuristic that subtracts channel-busy fraction from RSSI,
-its margin is roughly eleven points.
+The intraclass correlation of 0.988 is not evidence for either representation.
+It shows that throughput is highly reproducible once topology and target AP are
+fixed across radio seeds, not whether that throughput is best inferred from a
+time average, an ordered sequence, or something else.
 
-The practical conclusion is that this environment cannot discriminate between
-architectures, because it does not contain the structure that would separate
-them. That is a property of the simulator, and the changes below follow from
-it.
+The rotating-versus-continuous comparison points instead to observation
+coverage. With continuous observation, ridge on the flattened sequence improves
+from 0.768 to 0.887, and the transformer from 0.873 to 0.894 under regression
+and to 0.914 under ranking. Under a rotating radio roughly three-quarters of an
+option's bins carry no frames from that AP, because the radio is listening
+elsewhere. Removing those gaps helps both models and helps ridge far more:
+ridge under continuous observation reaches 0.887, above the transformer's 0.873
+under rotating observation, so channel coverage substitutes for model capacity
+rather than supplying information no model could otherwise reach. Part of the
+transformer's margin under a rotating radio is therefore robustness to
+structured missingness rather than temporal order.
 
-\subsection{What Simulator 2 Must Change}
+The frame-level experiment points the same way. On the three splits both were
+evaluated on under the ranking objective, the frame-level transformer reaches
+0.897 against the binned transformer's 0.883, a gap smaller than the
+split-to-split spread of either. Keeping individual frames buys no clear
+improvement here. That is not a general licence to aggregate: it shows only
+that the extra detail carries little measurable benefit under the stationary
+traffic used here.
 
-The environment must become non-stationary on a timescale shorter than the
-observation window, and visibly so in a passive trace: load that arrives and
-departs, stations that join and leave, interference that appears part-way
-through. Equally important, the label must stop being an average over a long
-horizon. A twelve-second mean of a process that is already stationary is
-predicted best by the window mean; a near-horizon label, measured over the
-second or two immediately after the decision, is what makes a trend worth
-extrapolating.
+The practical conclusion is narrower than a comparison of architectures.
+The simulator supports the premise of the project: a client can infer useful
+information about AP quality from passive pre-association observation, and
+learned combinations of that evidence beat signal strength alone by a wide
+margin. What it does not isolate is the added value of temporal order, which is
+what the suggestions below are aimed at.
 
-Four smaller changes follow from the present work. Channel assignment by AP index over a fixed layout leaves co-channel separation
-with no variance and ties reuse to deployment size. This is a leakage path, not
-only a realism defect: the number of options in a choice set determines the AP
-count in 91.8\% of cases, and the AP count fixes the channel plan exactly, so a
-model can infer the reuse regime from the size of its input rather than from
-radio evidence. The guard of Section~\ref{sec:problem} does not cover this,
-since it checks only that the observation is independent of which AP is
-joined. Sampling the channel assignment would break the dependence. AP
-spacing of 30\,m pairs an obstructed-indoor path-loss exponent with an
-open-field geometry. The BSS Load element, which a passive client reads from a
-single beacon, is absent and is the strongest baseline this comparison lacks.
-And the restriction to complete silence, rather than to the pre-association
-period, could be relaxed to admit probe requests.
+
+\subsection{Suggested Extensions}
+
+Two changes bear on the question this work leaves open. The first is to make
+the medium non-stationary on a timescale shorter than the observation window,
+and visibly so in a passive trace: load that arrives and departs, stations that
+join and leave, interference that appears part-way through. The second is to
+shorten the label. A twelve-second mean of an already-stationary process is
+predicted best by the window mean, whereas a label measured over the second or
+two after the decision gives a trend something to extrapolate toward. Together
+they would make the value of temporal order identifiable rather than assumed.
+
+The observation itself could be made more representative. The 802.11 BSS Load
+element, which advertises a station count and channel utilisation and which a
+client reads from a single beacon, is absent here, and it is the strongest
+baseline a real passive client has. The window could also be defined by the
+pre-association period rather than by complete silence, admitting the probe
+requests most clients actually send.
+
+Two aspects of the scenario generator would repay attention. Channels are
+assigned by AP index over a fixed layout, so co-channel separation has no
+variance and reuse is tied to deployment size. The effect is a synthetic
+shortcut rather than leakage in the usual sense, since the number of discovered
+options is legitimately observable: option count determines AP count in 91.8\%
+of choice sets, and AP count fixes the channel plan exactly, so a model can read
+the reuse regime off the size of its input rather than off radio evidence. The
+guard of Section~\ref{sec:problem} checks only that the observation is
+independent of which AP is joined, so it does not catch this; sampling the
+channel assignment would. Separately, the 30\,m spacing pairs an
+obstructed-indoor path-loss exponent with an open-field geometry.
+
 
 \subsection{Ranking Versus Regression}
 
@@ -453,12 +505,16 @@ The two objectives are not equally testable outside a simulator, and the
 difference favors the one this work treats as secondary.
 
 Ranking asks which AP is best. Establishing ground truth for that answer
-requires joining each option under identical conditions, which is exactly what the matched replay of Section~\ref{sec:sim} provides and what no field
-measurement can. A ranking model's output is therefore not easily verifiable per
-decision in the field. This work reports both objectives because the simulator supports both. A
-successor aimed at deployment should treat throughput prediction as the primary
-target, and derive the choice from it, rather than optimizing the choice
-directly and inheriting a claim that cannot be checked.
+requires joining each option under identical conditions, which is exactly what 
+the matched replay of Section~\ref{sec:sim} provides and what no field
+measurement can. A ranking model's output is therefore not easily verifiable 
+per decision in the field. Regression on the other hand can be tested reliably 
+for accurate predictions of throughput.
+
+This work reports both objectives because the simulator supports both. Work
+aimed at deployment should treat throughput prediction as the primary target,
+and derive the choice from it, rather than optimizing the choice directly and
+inheriting a claim that cannot be checked.
 
 \begin{thebibliography}{00}
 
