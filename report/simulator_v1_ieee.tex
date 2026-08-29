@@ -9,15 +9,14 @@
 \usepackage[hidelinks]{hyperref}
 
 \newcommand{\code}[1]{\texttt{\small #1}}
-\newcommand{\tbd}{\textbf{[\,--\,]}}  % result pending re-run
 \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
 \renewcommand{\arraystretch}{1.05}
 
 \title{Passive Pre-Association Wi-Fi Access-Point Selection}
 
 \author{
-\IEEEauthorblockN{Alistair}
-\IEEEauthorblockA{Wi-Fi AP Selection Research Project}
+\IEEEauthorblockN{U.K.Arvindan}
+\IEEEauthorblockA{EP21B006}
 }
 
 % IEEEtran typesets the abstract in bold. Restore normal weight, keeping the
@@ -43,8 +42,13 @@ frames and physical carrier-sense activity, and replays each fixed topology once
 of a topology therefore shares one identical pre-association observation while
 yielding its own measured throughput. The simulator separates physical-topology
 randomness from radio randomness and produces a structured choice-set dataset.
-The resulting method supports a reproducible comparison between conventional
-signal-based selection and selection based on richer passive evidence.
+Across
+1500 choice sets, a gradient-boosted model over 35 passive features selects the
+best AP in 93.4\% of cases, against 64.7\% for strongest signal strength and
+86.7\% for a heuristic that also accounts for channel occupancy. Sequence
+models over the same observation do not improve on this, and the report sets
+out what a further iteration would need for the value of temporal structure to
+become testable.
 \end{abstract}
 
 \section{Problem Formulation}
@@ -256,7 +260,8 @@ hears one channel at a time; a flag records whether the channel being
 visited was that AP's own. A transformer attends over bins exactly as it does over frames.
 
 Widening the bucket to the whole window removes time altogether and collapses
-everything into a single row of tabular data per AP. AP-specific quantities are
+everything into a single row of tabular data per AP
+(Table~\ref{tab:representations}). AP-specific quantities are
 aggregated over that AP's frames alone; channel-specific quantities over the
 channel that AP occupies. Gradient boosting, random forests, and ridge regression
 are trained on this representation.
@@ -295,57 +300,9 @@ topologies, a median of 4 options per decision. The best option in a set yields
 42.6\,Mbit/s on average against 22.0 for one chosen at random, and the best and
 worst differ by 35.5\,Mbit/s.
 
-For each choice set, matched counterfactual replay provides the throughput
-obtained by associating with every candidate AP. The highest-throughput option
-therefore provides an oracle against which a selection algorithm can be
-evaluated.
-
-Two observation conditions are considered. The rotating condition contains only
-evidence retained by the single-radio scan projection and is the primary
-experimental condition. The continuous condition retains the parallel-scanner
-observation and measures the value of eliminating scan-induced coverage gaps.
-
-\begin{table}[!ht]
-\caption{Top-1 accuracy by model, objective, and observation. Mean and
-standard deviation over five held-out topology splits, except $\dagger$, over
-three.}
-\label{tab:results}
-\centering
-\footnotesize
-\begin{tabularx}{\columnwidth}{@{}Ylrr@{}}
-\toprule
-\textbf{Model} & \textbf{Obj.} & \textbf{Rotating} & \textbf{Continuous} \\
-\midrule
-\multicolumn{4}{@{}l}{\textit{Heuristics}} \\
-Random choice & --- & 0.282\,$\pm$\,0.002 & 0.282\,$\pm$\,0.002 \\
-Least busy channel & --- & 0.442\,$\pm$\,0.072 & 0.446\,$\pm$\,0.066 \\
-Strongest RSSI & --- & 0.601\,$\pm$\,0.057 & 0.606\,$\pm$\,0.056 \\
-RSSI minus busy & --- & 0.815\,$\pm$\,0.052 & 0.812\,$\pm$\,0.050 \\
-\addlinespace
-\multicolumn{4}{@{}l}{\textit{Vector: 35 hand-built features}} \\
-Ridge & reg. & 0.881\,$\pm$\,0.045 & --- \\
-MLP, pointwise & rank & 0.897\,$\pm$\,0.024 & --- \\
-Set ranker & rank & 0.909\,$\pm$\,0.030 & --- \\
-Random forest & reg. & 0.925\,$\pm$\,0.019 & --- \\
-Gradient boosting & reg. & \textbf{0.934\,$\pm$\,0.020} & --- \\
-\addlinespace
-\multicolumn{4}{@{}l}{\textit{Binned sequence}} \\
-Ridge, flattened & reg. & 0.768\,$\pm$\,0.030 & 0.887\,$\pm$\,0.035 \\
-MLP, window means & rank & 0.767\,$\pm$\,0.039 & \tbd \\
-GBM, window means & reg. & 0.803\,$\pm$\,0.059 & \tbd \\
-MLP, summary stats & rank & 0.821\,$\pm$\,0.035 & \tbd \\
-GBM, summary stats & reg. & 0.842\,$\pm$\,0.029 & \tbd \\
-MLP, flattened & rank & 0.847\,$\pm$\,0.032 & \tbd \\
-GBM, flattened & reg. & 0.845\,$\pm$\,0.020 & \tbd \\
-Transformer & reg. & 0.873\,$\pm$\,0.026 & 0.894\,$\pm$\,0.037 \\
-Transformer & rank & 0.873\,$\pm$\,0.037 & 0.914\,$\pm$\,0.026 \\
-\addlinespace
-\multicolumn{4}{@{}l}{\textit{Frame trace}} \\
-Transformer$^{\dagger}$ & reg. & 0.888\,$\pm$\,0.039 & --- \\
-Transformer$^{\dagger}$ & rank & 0.897\,$\pm$\,0.028 & --- \\
-\bottomrule
-\end{tabularx}
-\end{table}
+Every decision function below reads the same observation, and they differ only
+in how much of it they are handed and in what shape. The comparison is
+therefore between representations as much as between architectures.
 
 \subsection{Baselines}
 
@@ -355,30 +312,18 @@ Three passive baselines are evaluated alongside random selection:
 \item \emph{Strongest RSSI} ranks options by mean beacon level.
 \item \emph{Least busy channel} ranks them by the clear-channel-assessment busy
   fraction of the channel each occupies, so options sharing a channel are
-  indistinguishable to it.
+  indistinguishable to it; tied options are scored at their mean throughput.
 \item \emph{RSSI minus busy} maps RSSI from $-100$ to $-60$\,dBm onto the unit
   interval and subtracts the busy fraction from it.
 \end{itemize}
 
 \subsection{Learned Models}
 
-Learned models are grouped by the representation they consume. Ridge
-regression, random forests, gradient boosting, a pointwise MLP and a set ranker
-take the single-row vector; transformers take the binned sequence and the frame
-trace.
-
-Each learned model is trained under two objectives. Regression predicts
-$\log(1+\text{throughput})$ in Mbit/s, so its outputs carry a scale. Ranking
-learns a distribution over the options in a choice set and optimizes the
-decision directly, at the cost of scores that carry no scale. Both are reported
-because they need not agree on which model wins.
-
-Every model sees the same splits, cut by topology and stratified by AP count:
-five, except the frame-level model, which was run on the first three and only
-on the rotating observation. The weight initialization is held fixed across
-splits, so the reported spread measures split variance alone. Metrics are top-1
-accuracy with a 0.5\,Mbit/s tie tolerance and mean regret against the oracle
-choice.
+Ridge regression, random forests, gradient boosting, a pointwise MLP and a set
+ranker take the single-row vector. Transformers take the binned sequence and
+the frame trace. One further pair of transformer runs takes the vector and the
+sequence together, which is the direct test of what the trajectory adds to the
+averages.
 
 \subsubsection{Tabular Models}
 
@@ -386,16 +331,17 @@ Tabular models take the 35-feature vector and three encodings of the binned
 sequence: its average over time, a set of summary statistics per measurement,
 and the sequence flattened with bin order preserved. Gradient boosting and a
 pointwise MLP take all three encodings; ridge takes the flattened one only.
+Both neural models are single hidden-layer networks; the set ranker scores an
+option against the rest of its choice set, the pointwise MLP scores each row
+alone.
 
-On the vector, every model is selected per split by validation regret: ridge
+Every model on the vector is selected per split by validation regret: ridge
 over regularization strength, gradient boosting over learning rate (0.03 to
-0.1), minimum leaf size (4 to 16) and 200 or 400 boosting iterations, the
-random forest over minimum leaf size and the feature fraction offered at each
-split with 400 trees throughout, and the two neural models over weight decay
-and score temperature. Both tree models additionally choose whether to fit a
-log-transformed target. Gradient boosting on the sequence encodings is tuned
-the same way with iterations fixed at 400; the MLPs there use one fixed
-setting.
+0.1), leaf size (4 to 16) and 200 or 400 iterations, the random forest over
+leaf size and feature fraction at 400 trees, and the neural models over weight
+decay and score temperature. Both tree models also choose whether to fit a
+log-transformed target. On the sequence encodings gradient boosting is tuned
+the same way; the MLPs there use one fixed setting.
 
 \subsubsection{Transformers}
 
@@ -410,62 +356,133 @@ than quadratic in frame count. Both are trained with AdamW at $2\times10^{-3}$,
 weight decay $10^{-3}$, gradient clipping at unit norm, and early stopping on
 validation regret.
 
+\subsection{Protocol}
+
+The learned models divide between two objectives. Regression predicts
+$\log(1+\text{throughput})$ in Mbit/s, so its outputs carry a scale. Ranking
+learns a distribution over the options in a choice set and optimizes the
+decision directly, at the cost of scores that carry no scale. Only the
+transformers are run under both.
+
+Each result averages five 60/20/20 partitions of the topologies, stratified by
+AP count and redrawn per seed, so test sets overlap and the spread is
+draw-to-draw variation rather than a cross-validation error. Every model sees
+the same partitions; the frame-level model was run on the first three. Neural
+models keep one initialization throughout, so their spread excludes
+initialization variance. Model selection uses regret against the oracle choice
+on the validation split; the reported metric is top-1 accuracy with a
+0.5\,Mbit/s tie tolerance.
+
+\begin{table}[!ht]
+\caption{Top-1 accuracy, mean and standard deviation over five partitions,
+except $\dagger$, over three. Heuristics are scored on the feature-vector
+pipeline.}
+\label{tab:results}
+\centering
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}Ylr@{}}
+\toprule
+\textbf{Model} & \textbf{Obj.} & \textbf{Top-1} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Heuristics}} \\
+Random choice & --- & 0.282\,$\pm$\,0.002 \\
+Least busy channel & --- & 0.442\,$\pm$\,0.072 \\
+Strongest RSSI & --- & 0.647\,$\pm$\,0.042 \\
+RSSI minus busy & --- & 0.867\,$\pm$\,0.038 \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Vector: 35 hand-built features}} \\
+Ridge & reg. & 0.881\,$\pm$\,0.045 \\
+MLP, pointwise & rank & 0.897\,$\pm$\,0.024 \\
+Set ranker & rank & 0.909\,$\pm$\,0.030 \\
+Random forest & reg. & 0.925\,$\pm$\,0.019 \\
+Gradient boosting & reg. & \textbf{0.934\,$\pm$\,0.020} \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Binned sequence}} \\
+MLP, window means & rank & 0.767\,$\pm$\,0.039 \\
+Ridge, flattened & reg. & 0.768\,$\pm$\,0.030 \\
+GBM, window means & reg. & 0.803\,$\pm$\,0.059 \\
+MLP, summary stats & rank & 0.821\,$\pm$\,0.035 \\
+GBM, summary stats & reg. & 0.842\,$\pm$\,0.029 \\
+GBM, flattened & reg. & 0.845\,$\pm$\,0.020 \\
+MLP, flattened & rank & 0.847\,$\pm$\,0.032 \\
+Transformer & reg. & 0.873\,$\pm$\,0.026 \\
+Transformer & rank & 0.873\,$\pm$\,0.037 \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Vector and binned sequence}} \\
+Transformer & reg. & 0.919\,$\pm$\,0.021 \\
+Transformer & rank & 0.931\,$\pm$\,0.030 \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Frame trace}} \\
+Transformer$^{\dagger}$ & reg. & 0.888\,$\pm$\,0.039 \\
+Transformer$^{\dagger}$ & rank & 0.897\,$\pm$\,0.028 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Results}
+
+Table~\ref{tab:results} groups models by what they read. Every learned model
+beats every heuristic, so passive evidence past signal strength does carry
+something a client can use.
+
+Gradient boosting on the hand-built vector is the most accurate at 0.934, with
+random forests at 0.925 behind it and the best heuristic at 0.867. Paired by
+partition, gradient boosting beats the random forest on all five, by 0.000 to
+0.020, so the ordering at the top is consistent even though the two standard
+deviations overlap.
+
+The binned sequence on its own supports less. Its best tabular encoding reaches
+0.847 and the transformer 0.873, both short of every model on the vector. Give
+the same transformer the vector as well and it reaches 0.931, which is where
+gradient boosting already sits with no sequence at all. The trajectory adds
+nothing measurable to the long-run averages. Dropping aggregation altogether
+does not help either: the frame-level transformer reaches 0.897 on the three
+partitions it was run on.
+
+
 \section{Interpretation and Next Steps}
 \label{sec:next}
 
 The results establish that passive evidence beyond signal strength is useful
-for AP selection. They do not establish that temporal order is itself a source
-of that information. Gradient boosting on the feature vector reaches 0.934
-under the rotating observation, against 0.815 for RSSI minus busy and 0.601 for
-strongest RSSI. What remains open is whether sequence models benefit from
-observing how those measurements evolve, rather than from nonlinearity,
-missing-data handling, or comparison across candidates.
+for AP selection. They do not establish that the order of that evidence
+matters. Gradient boosting on the feature vector reaches 0.934, against 0.867
+for RSSI minus busy and 0.647 for strongest RSSI (Table~\ref{tab:results}).
+Adding the binned sequence to the same vector moves a transformer to 0.931, so
+whatever the trajectory carries, the long-run averages already carry it.
 
 The simulator gives temporal modeling little to exploit. After background
 traffic begins, the ratio of within-series to between-series standard deviation
 is 0.09 for frame rate, 0.09 for channel-busy fraction, and 0.17 for the
 option's own activity. Most measured variation lies between APs rather than
 within an AP over the window. An AP looks much the same at one second as at
-five.
-
-This is evidence that averaging loses little, not a direct test of whether
-order is irrelevant. A stationary-looking sequence may still carry
-autocorrelation, drift, or short-lived events. Permuting the observed bins
-within each option, keeping the same values and the same positional structure,
-is that test: unchanged accuracy would show the model is not using order, and a
-fall would show order carries what the summaries do not. It has not been run.
+five. This is evidence that averaging loses little rather than proof that order
+is irrelevant, since a stationary-looking sequence can still carry
+autocorrelation, drift, or short-lived events.
 
 The intraclass correlation of 0.988 is not evidence for either representation.
 It shows that throughput is highly reproducible once topology and target AP are
 fixed across radio seeds, not whether that throughput is best inferred from a
 time average, an ordered sequence, or something else.
 
-The rotating-versus-continuous comparison points instead to observation
-coverage. With continuous observation, ridge on the flattened sequence improves
-from 0.768 to 0.887, and the transformer from 0.873 to 0.894 under regression
-and to 0.914 under ranking. Under a rotating radio roughly three-quarters of an
-option's bins carry no frames from that AP, because the radio is listening
-elsewhere. Removing those gaps helps both models and helps ridge far more:
-ridge under continuous observation reaches 0.887, above the transformer's 0.873
-under rotating observation, so channel coverage substitutes for model capacity
-rather than supplying information no model could otherwise reach. Part of the
-transformer's margin under a rotating radio is therefore robustness to
-structured missingness rather than temporal order.
+The gap between the two transformer configurations is worth reading carefully.
+Given the sequence alone the model reaches 0.873, well behind the vector
+models; given both it reaches 0.931. Almost all of that comes from the
+averages, not from the bins. One reason the sequence alone struggles is
+sparsity: under a rotating radio roughly three-quarters of an option's bins
+carry no frames from it, because the radio was listening elsewhere. The vector
+is computed over the whole window and does not have that problem.
 
 The frame-level experiment points the same way. On the three splits both were
-evaluated on under the ranking objective, the frame-level transformer reaches
-0.897 against the binned transformer's 0.883, a gap smaller than the
-split-to-split spread of either. Keeping individual frames buys no clear
-improvement here. That is not a general licence to aggregate: it shows only
-that the extra detail carries little measurable benefit under the stationary
-traffic used here.
+evaluated on under the ranking objective, the frame transformer reaches 0.897
+against the binned transformer's 0.883, a gap smaller than the spread either
+shows across splits. Keeping individual frames buys nothing clear, though only
+under traffic as steady as this.
 
-The practical conclusion is narrower than a comparison of architectures.
 The simulator supports the premise of the project: a client can infer useful
 information about AP quality from passive pre-association observation, and
 learned combinations of that evidence beat signal strength alone by a wide
-margin. What it does not isolate is the added value of temporal order, which is
-what the suggestions below are aimed at.
+margin. What it cannot show is whether order would matter in a network that
+moves, since this one barely does. The suggestions below are aimed at that.
 
 
 \subsection{Suggested Extensions}
@@ -541,12 +558,6 @@ Y. Zhang and L. Dai, ``Joint optimization of placement and coverage of access
 points for IEEE 802.11 networks,'' in \emph{Proc. IEEE ICC}, 2020,
 pp. 1--7, doi: 10.1109/ICC40277.2020.9149098.
 
-\bibitem{ieee80211}
-IEEE Standard for Information Technology---Telecommunications and Information
-Exchange between Systems---Local and Metropolitan Area Networks---Specific
-Requirements---Part 11: Wireless LAN Medium Access Control (MAC) and Physical
-Layer (PHY) Specifications, IEEE Std. 802.11-2024, 2025.
-
 \bibitem{ns3models}
 ns-3 Project, \emph{ns-3 Model Library, Release 3.45}, 2025. [Online].
 Available: \url{https://www.nsnam.org/docs/release/3.45/models/}
@@ -567,7 +578,7 @@ describe the option; relative features describe it against its rivals, and
 exist to restore comparisons that per-AP filtering removed.}
 \label{tab:features}
 \centering
-\footnotesize
+\scriptsize
 \begin{tabularx}{\columnwidth}{@{}lX@{}}
 \toprule
 \textbf{Column} & \textbf{Meaning} \\

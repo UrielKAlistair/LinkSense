@@ -303,6 +303,32 @@ keeps each seed-realisation as its own choice set and records a shared
 `topology_id`; splitting code uses that id so repeated versions of the same
 physical layout do not leak across train and test.
 
+## Deferred: BSS Load
+
+Simulator 1 does not emit the 802.11 BSS Load element; only
+`sim/my-wifi-test2.cc` writes `bssload.csv`. **This is an open action item
+awaiting a decision, not a settled design choice.**
+
+BSS Load carries an AP's advertised station count and channel utilisation, and
+a client reads it from a single beacon without associating. It is the strongest
+signal a real passive client has today, so its absence weakens any claim about
+what passive inference can do. `feat_ap_n_clients` currently reconstructs a
+noisier version of it by counting distinct transmitters, which misses any
+station that is idle or download-only.
+
+Adding it needs a Simulator 1 change and a re-run; existing output cannot be
+filtered into it. Three constraints apply whenever that happens:
+
+- gate the value on actual beacon reception, since a timer-emitted value is
+  `gt_` data wearing a `feat_` name;
+- emit named per-bin columns, because nothing in the pipeline parses beacon
+  information elements;
+- evaluate it as a baseline before admitting it as a model input.
+
+Longer notes sit in the `WHAT IS NOT HERE` block of
+`scripts/dataset/build_dataset.py` and in `report/open_questions.md`. The
+report lists the same gap under the Simulator 2 changes.
+
 ## Two things to keep in mind
 
 **Only `feat_*` columns may be model inputs.** `gt_*` columns are simulator

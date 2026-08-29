@@ -238,11 +238,24 @@ def sweep_schedule(channels: list[int], window: float, cfg: ScanConfig,
                    rng: random.Random) -> tuple[list[int], float]:
     """Channel visited in each dwell slot, and where the first slot starts.
 
-    Visit order is randomised per group by default. With a fixed ascending
+    cfg.passes is the setting to understand here:
+
+      passes=1  one visit per channel. Four channels x 110 ms = 440 ms of a
+                5.5 s window, about one beacon per AP. This is the DEFAULT and
+                it is not what a real client does.
+      passes=0  fill the window: floor(window / dwell) slots, truncated to a
+                whole number of passes. For 5.5 s and four channels that is 12
+                passes, ~1.3 s per channel. This is the rotating radio.
+      passes=n  exactly n passes.
+
+    Visit order is randomised per group by default. Under a fixed ascending
     order the AP on the lowest channel would always be measured first, and
-    since the simulator assigns channels round-robin by AP index that would
-    tie "how stale my load estimate is" to the AP's index - an artefact no
-    real deployment has.
+    since the simulator assigns channels round-robin by AP index, that would
+    tie "how stale my load estimate is" to the AP's index - an artefact no real
+    deployment has.
+
+    align="end" places the sweep so it FINISHES at the end of the observation
+    window, which is the least stale view a client could hold at decision time.
     """
     order = list(channels)
     if cfg.order == "random":
@@ -421,7 +434,17 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
 def cca_busy_by_channel(events: list[dict], channels: list[int], window: float,
                         cfg: ScanConfig, obs_s: dict[int, float],
                         slots: list[int] | None = None, t0: float = 0.0) -> dict[int, float]:
-    """Return CCA-busy fraction per channel under the chosen observation model."""
+    """Return CCA-busy fraction per channel under the chosen observation model.
+
+    This is the PHY's carrier-sense state, not decoded frames: the medium was
+    unavailable, whether or not anything could be read off it. That makes it a
+    better occupancy signal than counting frames, and it is the one signal in
+    the dataset with no equivalent in the raw frame trace.
+
+    Without a sweep every channel was watched for the whole window. With one,
+    only the scheduled dwells count, and the denominator is time actually spent
+    listening to that channel.
+    """
     busy_s = {ch: 0.0 for ch in channels}
     if not events:
         return {ch: 0.0 for ch in channels}
@@ -539,8 +562,19 @@ def channel_features(rows: list[dict], window: float,
             "feat_ap_rssi_min": min(beacon_rssi) if beacon_rssi else None,
             "feat_ap_rssi_last": beacon_rssi[-1] if beacon_rssi else None,
             "feat_ap_beacons": len(beacons),
+            # A gap needs two beacons. When only one was caught these are None,
+            # and models/data.py fills them with 0.0 - a value outside the real
+            # range, indistinguishable from a genuinely tiny gap. The indicator
+            # lets a model tell an imputed value from a measured one.
+            #
+            # Note also what this quantity means under a rotating sweep: it is
+            # the interval between beacons the radio DECODED, which is set by
+            # how often the sweep revisits the channel (~0.55 s observed), not
+            # by the AP's 0.1024 s beacon period. It mixes a property of the AP
+            # with a property of the scan schedule.
             "feat_ap_beacon_gap_mean": _mean(gaps),
             "feat_ap_beacon_gap_std": _std(gaps),
+            "feat_ap_beacon_gap_known": float(len(gaps) > 0),
             "feat_ap_frames": len(frames),
             "feat_ap_frames_per_s": len(frames) / window if window else 0.0,
             "feat_ap_bytes_per_s": sum(f["len"] for f in frames) / window if window else 0.0,
@@ -634,6 +668,12 @@ def build_group_rows(group_id: str, variants: list[tuple[int, Path, dict]],
               file=sys.stderr)
         return []
 
+    # Denominator note: this sums over every BSSID heard, which includes APs
+    # that never got a beacon through and so are not options here. That is
+    # deliberate - their traffic still occupies the medium the candidate will
+    # contend for - but it means feat_rel_airtime_share does NOT sum to 1
+    # across a group's options, which the name invites you to assume.
+    #
     # Share-of-airtime is compared ACROSS channels, so it uses the
     # window-normalised fraction rather than raw microseconds: under a sweep
     # two channels need not have been watched for equally long.
@@ -655,7 +695,14 @@ def build_group_rows(group_id: str, variants: list[tuple[int, Path, dict]],
 
         rel = {
             "feat_rel_n_options": len(heard),
-            "feat_rel_rssi_rank": sorted(heard.values(), reverse=True).index(mine),
+            # Competition rank: how many options are STRICTLY stronger. This is
+            # equivalent to the sorted(...).index(mine) it replaces - index()
+            # returns the first match, which for a tied value is exactly the
+            # count of strictly greater ones - but it says so directly instead
+            # of relying on a property of list.index(). Ties are common enough
+            # to care about the semantics: 2.9% of groups have one, since RSSI
+            # is quantised to whole dBm.
+            "feat_rel_rssi_rank": sum(1 for v in heard.values() if v > mine),
             "feat_rel_is_strongest": int(mine == max(heard.values())),
             "feat_rel_rssi_margin_best_other": (
                 mine - best_other if best_other is not None else None),
@@ -677,6 +724,7 @@ def build_group_rows(group_id: str, variants: list[tuple[int, Path, dict]],
             "meta_window_s": window,  # constant across runs; not a feature
             # what this option's channel was actually watched for, and under
             # which realism settings - provenance, not model input
+            "meta_scan_sweep": int(cfg.sweep),
             "meta_scan_mode": cfg.mode if cfg.sweep else "parallel",
             "meta_scan_seconds": obs_s[chan_of[target_ap]],
             "meta_scan_dwell_ms": cfg.dwell if cfg.sweep else None,
@@ -732,6 +780,19 @@ def _seed_key(run_dir: Path) -> str:
 
 
 def process_group(item) -> list[dict]:
+    """Build every row for one physical topology.
+
+    A topology expands into several seed realisations, and each realisation is
+    one choice set. The two integrity checks here matter more than they look:
+
+      * the seed realisations found on disk must match the manifest exactly,
+        so a half-finished sweep cannot quietly produce a smaller dataset;
+      * every realisation must contain one run per configured AP. A partially
+        failed group would hand a ranking task a truncated option set, which
+        silently redefines "the best AP" - the label would then be the best of
+        whatever happened to finish, not the best available. That is a wrong
+        answer rather than a missing one, so it fails the build.
+    """
     topology_id, run_dirs, cfg, manifest_entry = item
     scenario = manifest_entry.get("scenario", {})
     by_seed: dict[str, list[tuple[int, Path, dict]]] = defaultdict(list)
