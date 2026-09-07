@@ -58,7 +58,7 @@ Throughput depends on channel contention, competing stations, transmission
 rates, retries, and the airtime consumed by neighboring basic service sets.
 Received signal strength reflects such effects poorly if at all. Those effects do,
 however, leave traces a client can hear without transmitting: the frames
-themselves, and the time the medium spends busy. This work asks whether such traces are enough:
+themselves, and the time the medium spends busy. This project asks whether such traces are enough:
 \emph{can a client choose the AP that will provide the greatest throughput
 using only what its radio can passively observe before association?}
 
@@ -76,18 +76,23 @@ $y_i$ is the throughput obtained after joining $a_i$, the desired decision is
     a^* = \underset{a_i\in\mathcal{A}}{\operatorname{arg\,max}}\; y_i,
 \end{equation}
 
-using a decision function whose inputs are derived only from $O$. In a live
-network only one $y_i$ is ever measurable: the station joins a single AP and
-observes that AP's throughput, while the values of $y_j$ for every AP it did
-not join are counterfactual. The simulator recovers all $N$ values by replaying
-the same scenario once per target AP, changing only the AP the candidate joins.
-Every choice set therefore carries its true $a^*$.
+using a decision function whose inputs are derived only from $O$. 
 
-The replay is sound only if $O$ is identical across all $N$ runs of a scenario.
-If any part of the observation varied with the AP eventually joined, a decision
-function could reach the right answer through a simulation artifact rather than
-through the network. This is checked rather than assumed. The assumptions that
-do remain are stated next.
+We can tackle this problem either by creating a model that solely ranks the available choices 
+to determine $a^*$, or by simply predicting the value of $y_i$ for each $a_i$.
+
+We attempt both methods to learn of their efficacy in this project 
+as both are possible with a simulated environment. In a live network however, only one 
+$y_i$ is ever measurable: the station joins a single AP and observes that AP's throughput, while the values of $y_j$ for every AP it did
+not join are counterfactual. The simulator recovers all $N$ values by replaying
+the same scenario once per target AP, changing only the AP the candidate joins therefore 
+granting every choice set in the generated data the true value of $a^*$.
+
+One key assumption must be carefully verified in the simulated data: $O$ must be 
+identical across all $N$ runs of a given scenario. 
+If any part of the observation varied with the AP eventually joined, a decision function could reach the right answer 
+through a simulation artifact rather than through the network. 
+The other underlying assumptions about the simulated environment are stated next.
 
 \section{Experimental Scope and Assumptions}
 
@@ -132,31 +137,38 @@ latency.
 \section{Simulator Design}
 \label{sec:sim}
 
-The simulator is built on ns-3.45 and its Wi-Fi models \cite{ns3models}. APs
-sit 30 m apart in a fixed layout: two form a pair, three an equilateral
-triangle, and four, six, and eight fill $2\times2$, $3\times2$, and $4\times2$
-grids. Channels 36, 40, 44, and 48 are assigned in AP-index order and reused
-once a deployment exceeds four APs. Because the layout is fixed as well, co-channel
-separation takes a single value per deployment size --- 30 m at eight APs, 42 m
-at six, and no reuse at or below four --- which ties channel reuse to AP count.
-Section~\ref{sec:next} returns to this.
+The simulator is built on ns-3.45 and its Wi-Fi models \cite{ns3models}.
 
-Each scenario draws 2, 3, 4, 6, or 8 APs and 2, 3, or 4 background stations
-per AP. A quarter of scenarios spread those stations uniformly. The
-rest place one or more hotspot APs, with fewer hotspots more likely and the
-count capped at $\lceil N_{\mathrm{AP}}/3\rceil$. Around those hotspots 70\% of
+\subsection{Count, Topology and Channel occupancy of APs} 
+Each scenario first draws 2, 3, 4, 6, or 8 APs.
+APs sit 30 m apart in a fixed layout. Two form a line, three an equilateral triangle, and four, six, and eight fill $2\times2$, $3\times2$, and $4\times2$
+grids respectively. Each AP is assigned a channel uniformly at random from 
+channels 36, 40, 44, and 48. 
+
+
+\subsection{Count, Topology of background STAs} 
+
+2, 3, or 4 background stations are drawn multinomially for each AP. A quarter 
+of scenarios spread the stations uniformly. The rest place one or 
+more hotspot APs around which stations are clustered. 
+Such mixing of uniform and deliberately clustered regimes follows common
+practice in WLAN studies \cite{wong2018daga,zhang2020placement}.
+
+We draw the number of hotspots at random with fewer hotspots being more likely and the count capped 
+at $\lceil N_{\mathrm{AP}}/3\rceil$. Around those hotspots 70\% of
 background stations fall in 10 m discs, and the remainder cover the
-footprint. Mixing uniform and deliberately clustered regimes follows common
-practice in WLAN studies \cite{wong2018daga,zhang2020placement}, and matters
+footprint uniformly. , and matters
 here because under uniform load every AP is about equally busy and the choice
-collapses back to signal strength. Each station
-associates with its nearest AP, and every background station in a scenario
-offers the same load, drawn uniformly at random from 1.0, 2.5, 4.0, and
-6.0 Mbit/s.
-Candidate positions are drawn to keep the decision non-trivial: 70\% near a
-boundary between neighboring APs, 30\% at 4--16 m from a single AP. These are
-sampling policies rather than radio parameters, and they are recorded with the
-dataset because they set its difficulty.
+collapses back to signal strength. 
+
+Each station associates with its nearest AP, and every background station in a scenario
+offers the same load, drawn uniformly at random from 1.0, 2.5, 4.0, and 6.0 Mbit/s.
+
+The position where the candidate station is palced is drawn such that 
+the decision is often non-trivial: 70\% lands near a boundary between 
+neighboring APs, and 30\% at 4--16 m from a single AP. These are sampling policies 
+rather than radio parameters, and they are recorded with the dataset 
+because they set its difficulty.
 
 Background traffic starts at $t=1$ s. Passive recording runs until $t=5.5$ s,
 covering 4.5 s of loaded traffic; the candidate associates at $t=6$ s and the
@@ -176,22 +188,10 @@ changes. A \code{topologySeed} controls background-station placement and an
 independent \code{rngSeed} controls fading, contention, and rate adaptation,
 with five radio seeds generated per topology. Separating the two streams is
 what allows stochastic radio behavior to be repeated without the physical
-deployment shifting underneath it.
+deployment shifting underneath it. This provides insight as to how much of 
+the true answer is dependent purely on the topological configuration of stations 
+and APs and how much depends on the random time evolution of the medium. 
 
-\subsection{Validation}
-
-Validation runs before any model is fitted, so that a good accuracy number
-cannot mask a defective data-generating process.
-
-Three basic checks ensure that the above outlined design is actualised
-automatically: (i) Repeating a seed reproduces throughput exactly (any run can
-be regenerated), (ii) Changing only the radio seed varies the outcome while every
-physical position stays fixed, and (iii) The recorded frame and channel-busy
-traces are byte-identical across all target-AP replays of a matched scenario
-(this enforces the constant $O$ required in Section~\ref{sec:problem}).
-
-These establish internal consistency, not that the simulator behaves like a
-real network.
 
 \section{Observation and Dataset Construction}
 \label{sec:obs}
@@ -205,7 +205,7 @@ passive record that is identical across the matched target-AP replays. After
 simulation, that record is projected onto a single-radio scan schedule in
 order to train models under a realistic condition.
 
-Specifically, the candidate carries one receive-only scanner PHY per
+Specifically, the candidate STA carries one receive-only scanner PHY per
 occupied channel, plus a separate PHY reserved for association. The scanner
 PHYs never transmit and never associate; the association PHY is parked on
 unused channel 149 until the decision time, so the AP the candidate will
@@ -224,30 +224,39 @@ retry flags, length, RSSI, noise, airtime, and PHY rate. The PHY-state trace
 gives the fraction of each 102.4 ms beacon interval in which carrier sense
 marked the channel busy. This clear-channel-assessment (CCA) measurement
 registers energy a frame-only view misses: interference, and transmissions too
-distant to decode. Some driver stacks expose an equivalent channel-busy counter, though availability varies by platform.
+distant to decode. 
+Some driver stacks expose an equivalent channel-busy counter, 
+though availability varies by platform.
 
-The superset is then projected onto one passive radio. That radio rotates through the occupied channels in random order, dwelling 110 ms on each with
-0.15 ms to retune, and repeats the cycle for as much of the window as it
-fits, so every channel is revisited many times before the decision. Frames
-and CCA intervals falling outside a dwell are discarded. A 110 ms dwell
-spans just over one 102.4~ms beacon interval, so each visit yields about one
-beacon from every AP on that channel. RSSI is then perturbed by uniform
-error within $\pm3$ dB and quantized to 1 dB. Both steps run after ns-3 from
-a recorded scan seed, so scan policy and measurement noise can be varied
-without repeating a simulation.
+The superset is then projected onto one passive radio. 
+That radio rotates through the occupied channels in random order, 
+dwelling 110 ms on each with 0.15 ms to retune, and repeats the cycle 
+for as much of the window as it fits, so every channel is revisited many 
+times before the decision. Frames and CCA intervals falling outside a 
+dwell are discarded. A 110 ms dwell spans just over one 102.4~ms beacon 
+interval, so each visit yields about one beacon from every AP on that channel. 
+RSSI is then perturbed by uniform error within $\pm3$ dB and quantized to 1 dB. 
+Both steps run after ns-3 from a recorded scan seed, so scan policy and 
+measurement noise can be varied without repeating a simulation.
+
+The recorded frame and channel-busy traces are verified to be byte-identical 
+across all target-AP replays of a matched scenario to enforce the constant 
+$O$ required in Section~\ref{sec:problem}).
 
 \subsection{From Trace to Training Data}
 
-The natural representation is the trace itself: every decoded frame in order,
+In order to train models of particular architectures, we must design appropriate 
+representations of the raw captured data. The first representation we use 
+is simply the raw trace itself: every decoded frame in order,
 carrying its arrival time, channel, BSSID and transmitter, class, flags,
 length, signal, airtime, and PHY rate. It is a time series, and we train a
 transformer on it directly.
 
 The raw observation is a long sequence, and what distinguishes one AP from
 another does not reside at frame granularity. Both problems that arise here
-are resolved by aggregating, which is possible only for quantities
-that can be averaged over a set of frames.
-We define a list of hand crafted features for this purpose; they are enumerated in Appendix~\ref{app:features}.
+are resolved by binning the time axis and aggregating quantities; As this is possible 
+only for features that can be averaged over a set of frames, we define a list of 
+hand crafted features. These are enumerated in Appendix~\ref{app:features}.
 
 Aggregation is done per AP before the data is bucketed. Frames are attributed
 to an AP by BSSID. Time is bucketed by channel visit: one bin per dwell, so
@@ -287,7 +296,10 @@ since it aggregates over one AP alone: the row records how busy an AP is, not wh
 than its neighbors. A set of relative features is therefore engineered and
 appended, restoring for the tabular models the comparison that per-AP
 aggregation removed. A sequence or set model needs no such repair, because its
-set stage attends across options directly.
+set stage attends across options directly. The cost of leaving the repair out
+is visible in Table~\ref{tab:results}: the same binned measurements averaged
+over the window, with no relative features, support 0.803 against 0.934 for the
+engineered vector, though the two differ in more than the comparison.
 
 The five radio-seed realizations of a topology are near-duplicates, so
 train/test splits are cut by topology: letting two of them fall on opposite
@@ -300,9 +312,9 @@ topologies, a median of 4 options per decision. The best option in a set yields
 42.6\,Mbit/s on average against 22.0 for one chosen at random, and the best and
 worst differ by 35.5\,Mbit/s.
 
-Every decision function below reads the same observation, and they differ only
-in how much of it they are handed and in what shape. The comparison is
-therefore between representations as much as between architectures.
+Every decision function below reads the same observation and differs only in
+how much of it it is handed. The comparison is between representations as much
+as architectures.
 
 \subsection{Baselines}
 
@@ -319,21 +331,27 @@ Three passive baselines are evaluated alongside random selection:
 
 \subsection{Learned Models}
 
-Ridge regression, random forests, gradient boosting, a pointwise MLP and a set
-ranker take the single-row vector. Transformers take the binned sequence and
-the frame trace. One further pair of transformer runs takes the vector and the
-sequence together, which is the direct test of what the trajectory adds to the
-averages.
+Each model reads one representation, and the groups in
+Table~\ref{tab:results} say which. Ridge regression, random forests, gradient
+boosting, a pointwise MLP and a set ranker read the single-row vector. A
+separate set of tabular models reads the binned sequence instead. One
+transformer reads the binned sequence and another reads the frame trace; a
+third pair reads the vector and the binned sequence together, which is what
+measures the trajectory against the averages.
 
 \subsubsection{Tabular Models}
 
-Tabular models take the 35-feature vector and three encodings of the binned
-sequence: its average over time, a set of summary statistics per measurement,
-and the sequence flattened with bin order preserved. Gradient boosting and a
-pointwise MLP take all three encodings; ridge takes the flattened one only.
-Both neural models are single hidden-layer networks; the set ranker scores an
-option against the rest of its choice set, the pointwise MLP scores each row
-alone.
+On the vector a tabular model reads one row of 35 numbers per option. The
+binned sequence is not tabular, so it is reduced three ways before such a model
+can read it: averaged over time, summarised by six statistics per measurement
+(mean, spread, extremes, last value and least-squares slope), or handed over
+whole with bin order carried by column position. Table~\ref{tab:results} names
+these three \emph{averaged over time}, \emph{bin statistics} and \emph{all
+bins}. Gradient boosting and a pointwise MLP are
+fitted to each of the three, ridge to the flattened one only, every fit a
+separate model on a separate input. Both neural models are single hidden-layer
+networks; the set ranker scores an option against the rest of its choice set,
+the pointwise MLP scores each row alone.
 
 Every model on the vector is selected per split by validation regret: ridge
 over regularization strength, gradient boosting over learning rate (0.03 to
@@ -375,8 +393,8 @@ on the validation split; the reported metric is top-1 accuracy with a
 
 \begin{table}[!ht]
 \caption{Top-1 accuracy, mean and standard deviation over five partitions,
-except $\dagger$, over three. Heuristics are scored on the feature-vector
-pipeline.}
+except $\dagger$, over three. Groups descend the aggregation ladder of
+Section~\ref{sec:obs}. Heuristics are scored on the feature-vector pipeline.}
 \label{tab:results}
 \centering
 \footnotesize
@@ -390,6 +408,23 @@ Least busy channel & --- & 0.442\,$\pm$\,0.072 \\
 Strongest RSSI & --- & 0.647\,$\pm$\,0.042 \\
 RSSI minus busy & --- & 0.867\,$\pm$\,0.038 \\
 \addlinespace
+\multicolumn{3}{@{}l}{\textit{Frame trace}} \\
+Transformer$^{\dagger}$ & reg. & 0.888\,$\pm$\,0.039 \\
+Transformer$^{\dagger}$ & rank & 0.897\,$\pm$\,0.028 \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Binned sequence}} \\
+Ridge, all bins & reg. & 0.768\,$\pm$\,0.030 \\
+MLP, bin statistics & rank & 0.821\,$\pm$\,0.035 \\
+GBM, bin statistics & reg. & 0.842\,$\pm$\,0.029 \\
+GBM, all bins & reg. & 0.845\,$\pm$\,0.020 \\
+MLP, all bins & rank & 0.847\,$\pm$\,0.032 \\
+Transformer & reg. & 0.873\,$\pm$\,0.026 \\
+Transformer & rank & 0.873\,$\pm$\,0.037 \\
+\addlinespace
+\multicolumn{3}{@{}l}{\textit{Binned sequence, averaged over time}} \\
+MLP & rank & 0.767\,$\pm$\,0.039 \\
+GBM & reg. & 0.803\,$\pm$\,0.059 \\
+\addlinespace
 \multicolumn{3}{@{}l}{\textit{Vector: 35 hand-built features}} \\
 Ridge & reg. & 0.881\,$\pm$\,0.045 \\
 MLP, pointwise & rank & 0.897\,$\pm$\,0.024 \\
@@ -397,47 +432,37 @@ Set ranker & rank & 0.909\,$\pm$\,0.030 \\
 Random forest & reg. & 0.925\,$\pm$\,0.019 \\
 Gradient boosting & reg. & \textbf{0.934\,$\pm$\,0.020} \\
 \addlinespace
-\multicolumn{3}{@{}l}{\textit{Binned sequence}} \\
-MLP, window means & rank & 0.767\,$\pm$\,0.039 \\
-Ridge, flattened & reg. & 0.768\,$\pm$\,0.030 \\
-GBM, window means & reg. & 0.803\,$\pm$\,0.059 \\
-MLP, summary stats & rank & 0.821\,$\pm$\,0.035 \\
-GBM, summary stats & reg. & 0.842\,$\pm$\,0.029 \\
-GBM, flattened & reg. & 0.845\,$\pm$\,0.020 \\
-MLP, flattened & rank & 0.847\,$\pm$\,0.032 \\
-Transformer & reg. & 0.873\,$\pm$\,0.026 \\
-Transformer & rank & 0.873\,$\pm$\,0.037 \\
-\addlinespace
 \multicolumn{3}{@{}l}{\textit{Vector and binned sequence}} \\
 Transformer & reg. & 0.919\,$\pm$\,0.021 \\
 Transformer & rank & 0.931\,$\pm$\,0.030 \\
-\addlinespace
-\multicolumn{3}{@{}l}{\textit{Frame trace}} \\
-Transformer$^{\dagger}$ & reg. & 0.888\,$\pm$\,0.039 \\
-Transformer$^{\dagger}$ & rank & 0.897\,$\pm$\,0.028 \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \subsection{Results}
 
-Table~\ref{tab:results} groups models by what they read. Every learned model
-beats every heuristic, so passive evidence past signal strength does carry
-something a client can use.
+Every learned model beats every heuristic, so passive evidence past signal
+strength does carry something a client can use. Table~\ref{tab:results} then
+reads down the ladder.
 
-Gradient boosting on the hand-built vector is the most accurate at 0.934, with
-random forests at 0.925 behind it and the best heuristic at 0.867. Paired by
-partition, gradient boosting beats the random forest on all five, by 0.000 to
-0.020, so the ordering at the top is consistent even though the two standard
-deviations overlap.
+Aggregation is not what limits these models. The frame trace, aggregated not at
+all, supports 0.897; the binned sequence supports 0.873 under a transformer and
+0.847 under the best tabular encoding; averaging those same bins to one row per
+option gives 0.803. Collapsing time costs 0.042 for gradient boosting and 0.080
+for the pointwise MLP, the one comparison here where a single variable moves
+with the model held fixed.
 
-The binned sequence on its own supports less. Its best tabular encoding reaches
-0.847 and the transformer 0.873, both short of every model on the vector. Give
-the same transformer the vector as well and it reaches 0.931, which is where
-gradient boosting already sits with no sequence at all. The trajectory adds
-nothing measurable to the long-run averages. Dropping aggregation altogether
-does not help either: the frame-level transformer reaches 0.897 on the three
-partitions it was run on.
+The engineered vector reverses the ordering. It is also one row per option, yet
+gradient boosting reads 0.934 from it, ahead of random forests at 0.925 and of
+every model given the sequence. Paired by partition, gradient boosting beats the
+random forest on all five, by 0.000 to 0.020, so the ordering at the top holds
+even though the two standard deviations overlap. What separates 0.803 from 0.934
+is not how much of the observation survives but which quantities were computed
+from it.
+
+Giving a transformer the vector and the sequence together settles the remaining
+question. It reaches 0.931, where gradient boosting already sits with no
+sequence at all, so the trajectory adds nothing measurable to the averages.
 
 
 \section{Interpretation and Next Steps}
@@ -445,10 +470,8 @@ partitions it was run on.
 
 The results establish that passive evidence beyond signal strength is useful
 for AP selection. They do not establish that the order of that evidence
-matters. Gradient boosting on the feature vector reaches 0.934, against 0.867
-for RSSI minus busy and 0.647 for strongest RSSI (Table~\ref{tab:results}).
-Adding the binned sequence to the same vector moves a transformer to 0.931, so
-whatever the trajectory carries, the long-run averages already carry it.
+matters, since a transformer given the vector and the sequence together lands
+where gradient boosting on the vector alone already sits.
 
 The simulator gives temporal modeling little to exploit. After background
 traffic begins, the ratio of within-series to between-series standard deviation
@@ -464,13 +487,11 @@ It shows that throughput is highly reproducible once topology and target AP are
 fixed across radio seeds, not whether that throughput is best inferred from a
 time average, an ordered sequence, or something else.
 
-The gap between the two transformer configurations is worth reading carefully.
-Given the sequence alone the model reaches 0.873, well behind the vector
-models; given both it reaches 0.931. Almost all of that comes from the
-averages, not from the bins. One reason the sequence alone struggles is
-sparsity: under a rotating radio roughly three-quarters of an option's bins
-carry no frames from it, because the radio was listening elsewhere. The vector
-is computed over the whole window and does not have that problem.
+One reason the sequence alone struggles is sparsity. Under a rotating radio
+roughly three-quarters of an option's bins carry no frames from it, because the
+radio was listening elsewhere. The vector is computed over the whole window and
+does not have that problem, which is a difference in coverage rather than in
+what either representation says about time.
 
 The frame-level experiment points the same way. On the three splits both were
 evaluated on under the ranking objective, the frame transformer reaches 0.897
@@ -578,22 +599,19 @@ describe the option; relative features describe it against its rivals, and
 exist to restore comparisons that per-AP filtering removed.}
 \label{tab:features}
 \centering
-\scriptsize
+\footnotesize
 \begin{tabularx}{\columnwidth}{@{}lX@{}}
 \toprule
 \textbf{Column} & \textbf{Meaning} \\
 \midrule
 \multicolumn{2}{@{}l}{\textbf{AP-level}} \\
-\code{ap\_rssi\_mean} & Mean beacon RSSI (dBm) \\
-\code{ap\_rssi\_std} & Spread of beacon RSSI \\
-\code{ap\_rssi\_max} & Strongest beacon seen \\
-\code{ap\_rssi\_min} & Weakest beacon seen \\
-\code{ap\_rssi\_last} & Most recent beacon RSSI \\
+\code{ap\_rssi\_\{mean,std,max,min,last\}} & Beacon RSSI in dBm: mean, spread,
+extremes, and most recent \\
 \code{ap\_beacons} & Beacons decoded \\
-\code{ap\_beacon\_gap\_mean} & Mean interval between decoded beacons; set by scan revisit, not beacon period \\
-\code{ap\_beacon\_gap\_std} & Spread of that interval \\
-\code{ap\_frames} & Frames attributed to this BSS \\
-\code{ap\_frames\_per\_s} & The same, per second listening \\
+\code{ap\_beacon\_gap\_\{mean,std\}} & Interval between decoded beacons, mean and
+spread; set by scan revisit, not beacon period \\
+\code{ap\_frames\{,\_per\_s\}} & Frames attributed to this BSS, total and per
+second listening \\
 \code{ap\_bytes\_per\_s} & Bytes per second attributed to this BSS \\
 \code{ap\_airtime\_frac} & Fraction of listening time this BSS occupied \\
 \code{ap\_n\_clients} & Distinct transmitters other than the AP \\
@@ -606,13 +624,11 @@ exist to restore comparisons that per-AP filtering removed.}
 \code{chan\_cca\_busy\_frac} & Channel occupancy from PHY carrier sense; counts energy never decoded \\
 \code{chan\_frames\_per\_s} & All frames per second on this channel \\
 \code{chan\_bytes\_per\_s} & All bytes per second \\
-\code{chan\_data\_frac} & Share of frames that are data \\
-\code{chan\_mgmt\_frac} & Share that are management \\
-\code{chan\_ctrl\_frac} & Share that are control \\
+\code{chan\_\{data,mgmt,ctrl\}\_frac} & Share of frames that are data,
+management, control \\
 \code{chan\_retry\_frac} & Share marked retry \\
 \code{chan\_mean\_data\_rate} & Mean PHY rate of data frames \\
-\code{chan\_n\_bssids} & Distinct BSSIDs heard \\
-\code{chan\_n\_tas} & Distinct transmitters heard \\
+\code{chan\_n\_\{bssids,tas\}} & Distinct BSSIDs and transmitters heard \\
 \code{chan\_mean\_rssi} & Mean RSSI over all frames \\
 \addlinespace
 \multicolumn{2}{@{}l}{\textbf{Relative}} \\
