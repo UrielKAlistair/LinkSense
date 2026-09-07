@@ -8,6 +8,16 @@
 \usepackage{url}
 \usepackage[hidelinks]{hyperref}
 
+% IEEEtran leaves a lot of air above a subsection heading. Tighten it while
+% keeping the class's lettered numbering and italic style. The following
+% paragraph keeps the full text width -- it is not indented like a list item.
+\makeatletter
+\renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
+  {0.9ex \@plus 0.3ex \@minus 0.2ex}%
+  {0.4ex \@plus 0.2ex}%
+  {\normalfont\normalsize\itshape}}
+\makeatother
+
 \newcommand{\code}[1]{\texttt{\small #1}}
 \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
 \renewcommand{\arraystretch}{1.05}
@@ -92,131 +102,150 @@ One key assumption must be carefully verified in the simulated data: $O$ must be
 identical across all $N$ runs of a given scenario. 
 If any part of the observation varied with the AP eventually joined, a decision function could reach the right answer 
 through a simulation artifact rather than through the network. 
-The other underlying assumptions about the simulated environment are stated next.
 
-\section{Experimental Scope and Assumptions}
-
-The simulator isolates the relationship among path quality, background load,
-and passive evidence. It does not attempt to reproduce every feature of a
-deployed WLAN. Table~\ref{tab:assumptions} states the principal assumptions so
-that conclusions can be interpreted within the intended scope.
-
-\begin{table}[!ht]
-\caption{Controlled assumptions of the simulator.}
-\label{tab:assumptions}
-\centering
-\footnotesize
-\begin{tabularx}{\columnwidth}{@{}p{0.27\columnwidth}Y@{}}
-\toprule
-\textbf{Aspect} & \textbf{Current assumption} \\
-\midrule
-Deployment & Static, single-floor, no walls; one stationary candidate and
-stationary background stations. \\
-Radios & Homogeneous IEEE 802.11n devices at 5 GHz with 20 MHz channels and
-Minstrel-HT rate control \cite{ns3models}. \\
-Propagation & Yans Wi-Fi channel; log-distance loss (exponent 3.0, 46.6777 dB
-reference loss at 1 m) followed by Nakagami fading. \\
-Traffic & Uplink UDP; constant background offered rates and a saturated
-candidate. Wired backhaul is not a bottleneck. \\
-Observation & Passive and client-side; no probe request, association, or
-network-provided load report during feature collection. \\
-Target & Mean candidate uplink throughput from successful association until
-the simulation stops; failed association is assigned zero. \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-The choice set presented to the candidate station contains only APs discovered
-during its passive scan.
-
-The environment is static and open, so it excludes mobility, walls, hardware
-diversity, and application demand that varies over time. The label is uplink
-UDP throughput, so it says little about TCP goodput, downlink performance, or
-latency.
-
-\section{Simulator Design}
+\section{Simulator Design and Assumptions}
 \label{sec:sim}
 
-The simulator is built on ns-3.45 and its Wi-Fi models \cite{ns3models}.
+The simulator is built on ns-3.45 and its Wi-Fi models \cite{ns3models}. The
+choice set presented to the candidate station contains only APs discovered
+during its passive scan.
 
-\subsection{Count, Topology and Channel occupancy of APs} 
-Each scenario first draws 2, 3, 4, 6, or 8 APs.
-APs sit 30 m apart in a fixed layout. Two form a line, three an equilateral triangle, and four, six, and eight fill $2\times2$, $3\times2$, and $4\times2$
-grids respectively. Each AP is assigned a channel uniformly at random from 
-channels 36, 40, 44, and 48. 
+\subsection{Simulation Environment}
 
+The deployment is static and single-floor with no walls, the environment TGax
+assumes for its indoor small-BSS scenario \cite{tgax2016scenarios}. 
+All stations are immobile and remain at their seeded positions. 
+Radios are homogeneous IEEE 802.11n devices at 5 GHz on 20 MHz channels 
+with Minstrel-HT rate control \cite{ns3models}. 
 
-\subsection{Count, Topology of background STAs} 
+Every radio is an ns-3 \code{SpectrumWifiPhy} attached to one shared
+\code{MultiModelSpectrumChannel}, on which a log-distance loss (exponent 3.0,
+with 46.6777 dB of reference loss at 1 m) is followed by Nakagami fading.
 
-2, 3, or 4 background stations are drawn multinomially for each AP. A quarter 
-of scenarios spread the stations uniformly. The rest place one or 
-more hotspot APs around which stations are clustered. 
-Such mixing of uniform and deliberately clustered regimes follows common
-practice in WLAN studies \cite{wong2018daga,zhang2020placement}.
+\code{SpectrumWifiPhy} is chosen over the simpler \code{YansWifiPhy} as the Yans model 
+simulates exactly zero cross channel interference by treating each channel as 
+an isolated layer. If \code{YansWifiPhy} is used, the channel occupancy given by CCA 
+measurements becomes a really powerful signal for models in a way that does not reflect reality.
+\code{SpectrumWifiPhy}, on the other hand, represents a transmission as a power spectral density 
+shaped by the 802.11 transmit mask, so a neighbor one channel away deposits real power in a
+receiver's band and registers in its carrier sense. 
 
-We draw the number of hotspots at random with fewer hotspots being more likely and the count capped 
-at $\lceil N_{\mathrm{AP}}/3\rceil$. Around those hotspots 70\% of
-background stations fall in 10 m discs, and the remainder cover the
-footprint uniformly. , and matters
-here because under uniform load every AP is about equally busy and the choice
-collapses back to signal strength. 
+\subsection{Count, Topology and Channel occupancy of APs}
 
-Each station associates with its nearest AP, and every background station in a scenario
-offers the same load, drawn uniformly at random from 1.0, 2.5, 4.0, and 6.0 Mbit/s.
+Each scenario first draws 2, 3, 4, 6, or 8 APs. They sit on a triangular
+lattice 20 m apart: TGax recommends ``$\sim$10--20 m inter AP
+distance'' for its dense indoor scenarios \cite{tgax2016scenarios}. 
+Two APs form a pair, three an equilateral triangle, and the
+four, six, and eight AP cases fill two rows of two, three, and four with
+alternate rows offset by half a spacing, so the nearest-neighbor distance
+does not change as options are added. 
 
-The position where the candidate station is palced is drawn such that 
-the decision is often non-trivial: 70\% lands near a boundary between 
-neighboring APs, and 30\% at 4--16 m from a single AP. These are sampling policies 
-rather than radio parameters, and they are recorded with the dataset 
-because they set its difficulty.
+Finally, each AP draws a channel uniformly at random from channels 
+36, 40, 44, and 48. Random assignment biases the data toward more in-channel 
+contention and interference which could potentially make the problem harder than if 
+we plan out the channels to be minimally interfering. However, TGax sets precedent
+for random assignment across four channels in its enterprise scenario, and across 
+the non-overlapping set in its residential one
+\cite{tgax2016scenarios}, so this is the strategy adopted.
 
-Background traffic starts at $t=1$ s. Passive recording runs until $t=5.5$ s,
-covering 4.5 s of loaded traffic; the candidate associates at $t=6$ s and the
-run ends at $t=18$ s. The 0.5 s gap between recording and association is a
-guard: ns-3 performs target-dependent polling just before a join, and without
-the gap that polling would land inside the observation window. After joining,
-the candidate offers 100 Mbit/s in 1250-byte packets, which keeps it backlogged
-so that measured throughput reflects the service the network gives it rather
-than the limits of its own traffic generator.
+\subsection{Count, Topology of background STAs}
+
+2, 3, or 4 background stations are drawn independently for each AP and the
+draws are summed, amounting to a multinomial distribution. 
+
+A quarter of scenarios spread the stations uniformly. 
+The rest declare one or more APs as "hotspots" around which stations are clustered. 
+Such mixing of uniform and deliberately clustered regimes follows common practice in WLAN studies
+\cite{wong2018daga,zhang2020placement}, and is of particular import here because under uniform
+load every AP is about equally busy and the problem we examine collapses heavily to signal
+strength.
+
+We draw the number of hotspots at random with fewer hotspots being more likely
+and the count capped at $\lceil N_{\mathrm{AP}}/3\rceil$. The area around a hotspot AP,
+a 10 m disc around it, is assigned a probability density 4 times that of non-hotspot 
+areas. Each station's position is drawn from this distribution. 
+
+\subsection{Association and Load of background STAs}
+
+Each station associates with an AP based on how high the received power from it is. 
+The received power value computed with the channel loss used in the simulator,
+is perturbed with Gaussian noise of 5 dB standard deviation (as in \cite{tgax2016scenarios}). 
+This is done so that stations do not form unrealistic Voronoi partitions. 
+
+Every station then draws its own offered load, independently, from a log-normal
+distribution with median 2.25 Mbit/s and shape 0.9, capped at 25 Mbit/s, for a
+mean of 3.37 Mbit/s. Traffic volumes are log-normal rather than Gaussian
+\cite{lognormal2020}, and the right skew is what puts most stations on a light
+load and a few on a heavy one without needing a mixture. The quartiles span the
+mix an AP actually carries, from voice and browsing up through
+high-definition video.
+
+\subsection{Placement of candidate STA}
+
+The position where the candidate station is placed is drawn such that the
+decision is often non-trivial: 70\% lands near a boundary between neighboring
+APs, and 30\% at 4--16 m from a single AP. 
+
+\subsection{Data Capture}
+
+Background traffic starts at $t=0.5$ s. Each station's arrivals are Poisson at
+its own data rate, and its first packet is delayed by a phase drawn uniformly
+over one mean interval. Without that phase, stations sharing an AP and a rate
+would transmit in lockstep for the whole run. The non-full-buffer models in the
+TGax set randomize phase for the same reason \cite{tgax2016scenarios}.
+
+Passive recording runs from $t=2$ s to $t=7.5$ s, covering 5.5 s of loaded
+traffic. It starts 1.5 s after the traffic because Minstrel-HT needs about that
+long to converge, and until it does every scenario carries the same opening
+burst of retransmissions. This burst is a property of when the run started, not
+of the deployment being observed.
+
+The candidate associates at $t=8$ s, 0.5 s after recording ends. The gap is a
+guard: ns-3 performs target-dependent polling shortly before a join, and
+without it the scanners would capture that exchange. The recorded features
+would then depend on which AP is being evaluated, leaking the label into the
+observation.
+
+After joining, the candidate offers 100 Mbit/s in 1250-byte packets until the
+run ends at $t=20$ s. That rate keeps it backlogged, so its measured throughput
+reflects the service the network gives it rather than the limit of its own
+traffic generator.
 
 \subsection{Matched Counterfactual Replays}
 
 For each sampled topology and radio seed, the experiment runs once per target
 AP. AP and station positions, background traffic, the candidate's position, and
-every pre-association device stay fixed; only the AP selected at $t=6$ s
-changes. A \code{topologySeed} controls background-station placement and an
-independent \code{rngSeed} controls fading, contention, and rate adaptation,
-with five radio seeds generated per topology. Separating the two streams is
-what allows stochastic radio behavior to be repeated without the physical
-deployment shifting underneath it. This provides insight as to how much of 
-the true answer is dependent purely on the topological configuration of stations 
-and APs and how much depends on the random time evolution of the medium. 
+every pre-association device stay fixed; only the AP selected at $t=8$ s
+changes. A \code{topologySeed} fixes the deployment: station placement, channel
+selection, and the load offered by each station. 
 
+An independent \code{rngSeed} controls everything that varies between one occasion and
+another --- fading, contention, rate adaptation, and the arrival times of the
+background packets themselves. Three radio seeds are generated per topology. 
+
+A station's demand is a property of the deployment; when its packets happen to
+leave is not, so only the data rate belongs to the first seed.
+Separating the two streams is what allows stochastic radio behavior to be
+repeated without the physical deployment shifting underneath it. This provides
+insight as to how much of the true answer is dependent purely on the
+topological configuration of stations and APs and how much depends on the
+random time evolution of the medium.
 
 \section{Observation and Dataset Construction}
 \label{sec:obs}
 
 \subsection{Recording and Projection}
 
-The simulator separates data collection from what a deployable client is
-assumed to observe. During simulation, receive-only scanner PHYs record
-activity on every occupied channel simultaneously. This produces a complete
-passive record that is identical across the matched target-AP replays. After
-simulation, that record is projected onto a single-radio scan schedule in
-order to train models under a realistic condition.
+A deployed client scans across all channels that host APs in a rotating fashion.
+The simulation records more than any deployed client can be expected to observe
+by recording activity on every occupied channel simultaneously. We then project 
+this complete record down to what a single scan would see.
 
 Specifically, the candidate STA carries one receive-only scanner PHY per
 occupied channel, plus a separate PHY reserved for association. The scanner
 PHYs never transmit and never associate; the association PHY is parked on
-unused channel 149 until the decision time, so the AP the candidate will
-eventually join cannot alter what is heard, or consume random draws, while
-the observation is being collected. At $t=5.5$ s the scanner PHYs move to
+unused channel 149 until the decision time. At $t=7.5$ s the scanner PHYs move to
 the parking channel as well.
-
-Watching every channel at once is not a claim that real clients have several
-radios. It is a recording device: it captures a superset of what any single
-radio could have heard, from which a single-radio scan projection is cut
-afterwards.
 
 Two traces are recorded. The monitor-sniffer trace holds every frame a scanner
 decodes, with time, frequency, BSSID, transmitter, frame category, beacon and
@@ -228,8 +257,8 @@ distant to decode.
 Some driver stacks expose an equivalent channel-busy counter, 
 though availability varies by platform.
 
-The superset is then projected onto one passive radio. 
-That radio rotates through the occupied channels in random order, 
+The projection onto one passive radio is done as follows: 
+One radio is assumed to rotate through the occupied channels in random order, 
 dwelling 110 ms on each with 0.15 ms to retune, and repeats the cycle 
 for as much of the window as it fits, so every channel is revisited many 
 times before the decision. Frames and CCA intervals falling outside a 
@@ -578,6 +607,21 @@ pp. 252--260, doi: 10.1109/INFOCOM.2018.8486284.
 Y. Zhang and L. Dai, ``Joint optimization of placement and coverage of access
 points for IEEE 802.11 networks,'' in \emph{Proc. IEEE ICC}, 2020,
 pp. 1--7, doi: 10.1109/ICC40277.2020.9149098.
+
+\bibitem{tgax2016scenarios}
+IEEE 802.11 Task Group ax, ``TGax simulation scenarios,'' IEEE
+802.11-14/0980r16, 2016. [Online]. Available:
+\url{https://mentor.ieee.org/802.11/dcn/14/11-14-0980-16-00ax-simulation-scenarios.docx}
+
+\bibitem{3gpp36814}
+3GPP, ``Evolved Universal Terrestrial Radio Access (E-UTRA); Further
+advancements for E-UTRA physical layer aspects,'' TR 36.814 V9.0.0, Mar. 2010.
+
+% TODO(Arvindan): fill in the author list for this one before submission.
+\bibitem{lognormal2020}
+``Internet traffic volumes are not Gaussian --- they are log-normal: An
+18-year longitudinal study with implications for modelling and prediction,''
+arXiv:2007.10150, 2020.
 
 \bibitem{ns3models}
 ns-3 Project, \emph{ns-3 Model Library, Release 3.45}, 2025. [Online].
