@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
-"""Generate the AP-selection dataset as matched sets ("choice sets").
+"""Generate the AP-selection dataset as matched choice sets.
 
-The question this project asks is not "what throughput will this link give"
-in isolation, but "given several APs I can hear, which should I join". So
-the unit of data is a *group*: one scenario, held fixed, run once per
-candidate AP.
+The unit of data is a group: one physical scenario, run once per candidate AP.
+Everything within a group is held fixed - AP and station placement, background
+load, the candidate's position, the ns-3 seed - and only --targetAP changes, so
+differences between runs of a group isolate the choice itself.
 
-Within a seed-realisation group everything is identical - AP and STA
-placement, background load, the candidate's absolute position, and the RNG
-seed - and only targetAP changes. The script can also repeat each topology
-under several ns-3 seeds; those become separate choice sets with a shared
-topology_id so training/evaluation splits can keep the physical topology
-from leaking across train and test.
+Runs are named in a three-level hierarchy:
 
-Two consequences worth stating explicitly:
+    g00007            topology: AP count, station count, candidate position,
+                      hotspot APs, and the topologySeed that places stations
+    g00007__s02       seed realisation: one ns-3 seed, driving fading,
+                      contention and rate control
+    g00007__s02__ap1  run: one target AP
 
-  * The candidate observes every channel through dedicated scanner radios
-    (one per channel, listening but never associating), so its view does
-    not depend on which AP it later joins. Its association radio parks on
-    an unused channel until join time for the same reason.
+Seed realisations of a topology are near-duplicates of each other, so splits
+must group by topology_id rather than by group_id.
 
-  * The candidate is placed in ABSOLUTE coordinates, not at an offset from
-    its target. An offset would move the candidate whenever targetAP
-    changed, which would compare different physical situations rather than
-    different choices.
+The candidate is placed in absolute coordinates, so it does not move between
+runs of a group. It hears every channel through dedicated scanner radios and
+parks its association radio on an unused channel until join time, so its
+observation is identical across the group and only the ap0 run records it.
 
-Randomness has two deliberately separate jobs. This script's RNG chooses the
-physical scenario, including one topologySeed that fixes every background-STA
-position. Each topology then receives several independent ns-3 rngSeed values
-for fading, contention, and rate control; every target-AP variant within one
-seed-realisation still shares that same ns-3 seed.
+This script chooses scenarios; the simulator builds them. What crosses the
+boundary is counts and seeds, never a station coordinate.
 """
 
 from __future__ import annotations
@@ -45,25 +39,27 @@ import time
 from pathlib import Path
 
 
-AP_SPACING_M = 30.0
+# Top of the "~10-20 m inter-AP distance" TGax gives for dense indoor scenarios.
+# Must match kApSpacingM: candidate placement below is relative to a lattice this
+# script recomputes rather than receives.
+AP_SPACING_M = 20.0
 DEFAULT_MAX_OUTPUT_GB = 10.0
 
 
 def ap_positions(n_aps: int) -> list[tuple[float, float]]:
-    """The fixed triangle/compact-grid rule implemented by the simulator."""
-    if n_aps == 3:
-        return [(0.0, 0.0),
-                (AP_SPACING_M, 0.0),
-                (AP_SPACING_M / 2.0, AP_SPACING_M * math.sqrt(3.0) / 2.0)]
+    """Recompute the lattice the simulator builds, to place the candidate on it.
 
+    Duplicates BuildApPositions in my-wifi-test.cc. Nothing enforces that the two
+    stay in step; if they diverge the boundary stratum below silently places
+    candidates on edges that do not exist.
+    """
     columns = n_aps // 2 if 4 <= n_aps <= 8 and n_aps % 2 == 0 else math.ceil(math.sqrt(n_aps))
+    row_pitch = AP_SPACING_M * math.sqrt(3.0) / 2.0
     positions = []
     for index in range(n_aps):
         row, column = divmod(index, columns)
-        count_in_row = min(columns, n_aps - row * columns)
-        row_offset = (columns - count_in_row) * AP_SPACING_M / 2.0
-        positions.append((row_offset + column * AP_SPACING_M,
-                          row * AP_SPACING_M))
+        row_offset = (row % 2) * AP_SPACING_M / 2.0
+        positions.append((row_offset + column * AP_SPACING_M, row * row_pitch))
     return positions
 
 
@@ -83,14 +79,20 @@ def sample_scenario(rng: random.Random) -> dict:
     """One physical scenario, before any AP choice is made."""
     n_aps = rng.choice([2, 3, 4, 6, 8])
     positions = ap_positions(n_aps)
-    n_stas = n_aps * rng.choice([2, 3, 4])
+    # Concurrently active stations an ordinary AP carries. At the 20-30%
+    # concurrency enterprise design assumes, 3-5 active corresponds to 10-25
+    # associated clients. Drawn once per AP so the total is a sum of independent
+    # draws rather than a multiple of n_aps.
+    base_counts = [rng.choice([3, 4, 5]) for _ in range(n_aps)]
 
-    # Most candidates sit near an edge shared by neighbouring AP cells. Signal
-    # strength is then competitive enough that the load difference can matter.
-    # The remaining cases sit near one AP and preserve straightforward
-    # strongest-signal examples in the dataset.
+    # Most candidates sit near a cell edge, where the two APs are close enough
+    # in signal strength that load can decide between them. The rest sit near one
+    # AP and keep straightforward strongest-signal cases in the dataset.
     candidate_stratum = "boundary" if rng.random() < 0.70 else "ap_near"
     if candidate_stratum == "boundary":
+        # A point along a lattice edge, displaced perpendicular to it. The +-4 m
+        # displacement is small enough that the edge's own two APs stay the
+        # nearest pair even when it points at a third.
         left, right = rng.choice(neighbouring_pairs(positions))
         ax, ay = positions[left]
         bx, by = positions[right]
@@ -102,23 +104,30 @@ def sample_scenario(rng: random.Random) -> dict:
         candidate_x = edge_x - offset * (by - ay) / length
         candidate_y = edge_y + offset * (bx - ax) / length
     else:
+        # 3-9 m out, under half the spacing, so the anchor really is the nearest
+        # AP. Spans a 22.6 dB advantage over the next-nearest down to 2.6 dB.
         anchor_x, anchor_y = positions[rng.randrange(n_aps)]
-        distance = rng.uniform(4.0, 16.0)
+        distance = rng.uniform(0.15, 0.45) * AP_SPACING_M
         angle = rng.uniform(0.0, 2.0 * math.pi)
         candidate_x = anchor_x + distance * math.cos(angle)
         candidate_y = anchor_y + distance * math.sin(angle)
 
-    # A quarter of deployments are spatially uniform. The remainder contain
-    # one or more crowded regions, with fewer hotspots more likely than the
-    # maximum. The cap grows with the deployment but never exceeds three:
-    # 1 for 2/3 APs, 2 for 4/6 APs, and 3 for 8 APs.
-    max_hotspots = min(3, math.ceil(n_aps / 3))
+    # A quarter of deployments are spatially uniform; the rest have one or more
+    # crowded regions, fewer being likelier than more. The cap is ceil(n_aps/3):
+    # 1 for 2-3 APs, 2 for 4-6, 3 for 8.
+    max_hotspots = math.ceil(n_aps / 3)
     active_weights = list(range(max_hotspots, 0, -1))
     hotspot_count = rng.choices(
         range(max_hotspots + 1),
         weights=[sum(active_weights) / 3] + active_weights,
     )[0]
     hotspot_aps = sorted(rng.sample(range(n_aps), hotspot_count))
+
+    # Hotspots redistribute stations, they do not add them, so the total is the
+    # plain sum. This fixes only how many stations exist: the simulator places
+    # them from topologySeed as an inhomogeneous process, denser inside the
+    # hotspot discs, and the association draw decides which AP serves each one.
+    n_stas = sum(base_counts)
 
     return {
         "nAPs": n_aps,
@@ -127,7 +136,6 @@ def sample_scenario(rng: random.Random) -> dict:
         "candidateY": round(candidate_y, 3),
         "candidateStratum": candidate_stratum,
         "hotspotAPs": ",".join(map(str, hotspot_aps)) if hotspot_aps else "none",
-        "bgPerStaMbps": rng.choice([1.0, 2.5, 4.0, 6.0]),
         "topologySeed": rng.randrange(1, 2**31 - 1),
     }
 
@@ -171,7 +179,6 @@ def variant_complete(out_dir: Path, tag: str, scenario: dict,
             params["topology_seed"] == scenario["topologySeed"] and
             params["n_aps"] == scenario["nAPs"] and
             params["n_stas"] == scenario["nSTAs"] and
-            math.isclose(params["bg_per_sta_mbps"], scenario["bgPerStaMbps"]) and
             params["hotspot_aps"] == expected_hotspots and
             math.isclose(stored["candidate_position"]["x"], scenario["candidateX"],
                          abs_tol=1e-6) and
@@ -209,7 +216,7 @@ def main():
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--n-groups", type=int, default=200,
                         help="topologies; each expands to seeds-per-topology x nAPs runs")
-    parser.add_argument("--seeds-per-topology", type=int, default=5,
+    parser.add_argument("--seeds-per-topology", type=int, default=3,
                         help="independent ns-3 seeds per physical topology")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--sweep-seed", type=int, default=1234)
@@ -261,9 +268,8 @@ def main():
     print(f"writing to {args.out_dir}")
 
     max_bytes = int(args.max_output_gb * 1_000_000_000)
-    # Leave generous headroom for the workers already in flight when a size
-    # check crosses the threshold. The pilot's largest concurrent batch is
-    # orders of magnitude smaller than this five-percent reserve.
+    # Stop scheduling below the ceiling so workers already in flight when the
+    # check trips still have room to finish.
     stop_bytes = int(max_bytes * 0.95)
     initial_bytes = directory_size(args.out_dir)
     if initial_bytes >= stop_bytes:
@@ -304,8 +310,8 @@ def main():
         print(f"storage guard stopped scheduling near {args.max_output_gb:g} GB; "
               f"cancelled={n_cancelled}")
     print(f"done in {(time.time() - start) / 60:.1f}m: ok={n_ok} fail={n_fail}")
-    # A cap-triggered partial sweep is resumable, but it is not a completed
-    # dataset and must not look successful to a calling pipeline.
+    # A cap-triggered partial sweep resumes cleanly but is not a finished
+    # dataset, so it must not report success to a calling pipeline.
     return 1 if n_fail or stopped_for_size else 0
 
 

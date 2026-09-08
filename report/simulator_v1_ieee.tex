@@ -150,8 +150,10 @@ the non-overlapping set in its residential one
 
 \subsection{Count, Topology of background STAs}
 
-2, 3, or 4 background stations are drawn independently for each AP and the
-draws are summed, amounting to a multinomial distribution. 
+A base count of 3, 4, or 5 is drawn independently for each AP and the draws
+are summed. That sum is the deployment's station total, not an allocation: how
+many stations an AP ends up serving follows from where they are placed and
+which AP they associate with, not from its own draw. 
 
 A quarter of scenarios spread the stations uniformly. 
 The rest declare one or more APs as "hotspots" around which stations are clustered. 
@@ -167,10 +169,14 @@ areas. Each station's position is drawn from this distribution.
 
 \subsection{Association and Load of background STAs}
 
-Each station associates with an AP based on how high the received power from it is. 
-The received power value computed with the channel loss used in the simulator,
-is perturbed with Gaussian noise of 5 dB standard deviation (as in \cite{tgax2016scenarios}). 
-This is done so that stations do not form unrealistic Voronoi partitions. 
+Each station associates with the AP whose received power is highest. That
+power comes from the log-distance term alone, perturbed by an independent
+Gaussian of 5 dB standard deviation drawn once per station--AP pair. Without
+the perturbation stations form exact Voronoi partitions, which no real
+deployment does; 5 dB is the indoor shadowing deviation TGax specifies
+\cite{tgax2016scenarios}. The perturbation is confined to this decision. The
+simulated channel carries no shadowing term of its own, so it stands in for the
+wall and obstruction variation a no-walls environment omits. 
 
 Every station then draws its own offered load, independently, from a log-normal
 distribution with median 2.25 Mbit/s and shape 0.9, capped at 25 Mbit/s, for a
@@ -184,7 +190,7 @@ high-definition video.
 
 The position where the candidate station is placed is drawn such that the
 decision is often non-trivial: 70\% lands near a boundary between neighboring
-APs, and 30\% at 4--16 m from a single AP. 
+APs, and 30\% at 3--9 m from a single AP. 
 
 \subsection{Data Capture}
 
@@ -231,6 +237,27 @@ insight as to how much of the true answer is dependent purely on the
 topological configuration of stations and APs and how much depends on the
 random time evolution of the medium.
 
+\begin{table}[!ht]
+\caption{Every quantity drawn from \code{topologySeed}, once per scenario.}
+\label{tab:params}
+\centering
+\begin{tabularx}{\columnwidth}{@{}lY@{}}
+\toprule
+Quantity & Distribution \\
+\midrule
+AP count & uniform on $\{2,3,4,6,8\}$ \\
+AP channel & uniform on $\{36,40,44,48\}$, iid per AP \\
+Station count & sum over APs of uniform on $\{3,4,5\}$ \\
+Spatial regime & uniform with prob.\ $1/4$, else hotspots \\
+Hotspot count & $1\ldots\lceil N_{\mathrm{AP}}/3\rceil$, fewer more likely \\
+Hotspot field & $4\times$ station density inside a 10 m disc \\
+Station load & log-normal, median 2.25 Mbit/s, shape 0.9, cap 25 \\
+Association & strongest received power $+\;\mathcal{N}(0,5^2)$ dB \\
+Candidate position & boundary with prob.\ $0.7$, else 3--9 m from one AP \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
 \section{Observation and Dataset Construction}
 \label{sec:obs}
 
@@ -253,7 +280,9 @@ retry flags, length, RSSI, noise, airtime, and PHY rate. The PHY-state trace
 gives the fraction of each 102.4 ms beacon interval in which carrier sense
 marked the channel busy. This clear-channel-assessment (CCA) measurement
 registers energy a frame-only view misses: interference, and transmissions too
-distant to decode. 
+distant to decode. Both thresholds are left at the ns-3 defaults: $-62$ dBm of
+received energy from any source, or $-82$ dBm from a signal whose preamble the
+PHY recognizes. 
 Some driver stacks expose an equivalent channel-busy counter, 
 though availability varies by platform.
 
