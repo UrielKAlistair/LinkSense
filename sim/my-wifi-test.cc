@@ -27,6 +27,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ns3;
@@ -72,8 +73,7 @@ constexpr double kHotspotDensity = 4.0;
 // Half the AP spacing, so the rim of the disc is equidistant from the
 // neighbouring AP. Stations seeded near the rim therefore associate away from
 // the intended hotspot a good fraction of the time, which caps how far a
-// hotspot can concentrate. An earlier spacing/3 kept every seeded station on
-// the intended AP, which is exactly the concentration we want to bleed off.
+// hotspot can concentrate.
 constexpr double kHotspotRadiusM = kApSpacingM / 2.0;
 constexpr double kBusyBucketS = 0.1024;
 constexpr double kPathLossExponent = 3.0;
@@ -105,6 +105,11 @@ struct RunConfig
     uint32_t targetAp{0};
     double candidateX{15.0};
     double candidateY{8.66};
+    // Empty uses candidateX/candidateY as given. "boundary" or "ap_near" instead
+    // draw the position from candidateSeed, so one topology can be sampled at
+    // several places with everything else held fixed.
+    std::string candidateStratum;
+    uint32_t candidateSeed{0};
     std::string hotspotApsText{"none"};
     std::vector<uint32_t> hotspotAps;
     double backgroundMbpsPerSta{0.0};   // >0 pins every station to one rate
@@ -180,6 +185,14 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("targetAP", "index of the AP the candidate joins", config.targetAp);
     cmd.AddValue("candidateX", "candidate x coordinate in metres", config.candidateX);
     cmd.AddValue("candidateY", "candidate y coordinate in metres", config.candidateY);
+    cmd.AddValue("candidateStratum",
+                 "empty to use candidateX/candidateY as given; 'boundary' to draw a "
+                 "point on a lattice edge; 'ap_near' to draw one close to one AP",
+                 config.candidateStratum);
+    cmd.AddValue("candidateSeed",
+                 "seeds the candidate position and its shadowing links; required "
+                 "when candidateStratum is set",
+                 config.candidateSeed);
     cmd.AddValue("hotspotAPs",
                  "comma-separated APs around which background stations gather; 'none' disables",
                  config.hotspotApsText);
@@ -239,6 +252,12 @@ ParseRunConfig(int argc, char* argv[])
     NS_ABORT_MSG_IF(config.backgroundMbpsPerSta < 0.0,
                     "bgPerStaMbps must be zero (draw per station) or positive");
     NS_ABORT_MSG_IF(config.topologySeed == 0, "topologySeed must be positive");
+    NS_ABORT_MSG_IF(!config.candidateStratum.empty() &&
+                        config.candidateStratum != "boundary" &&
+                        config.candidateStratum != "ap_near",
+                    "candidateStratum must be empty, 'boundary' or 'ap_near'");
+    NS_ABORT_MSG_IF(!config.candidateStratum.empty() && config.candidateSeed == 0,
+                    "candidateSeed must be positive when candidateStratum is set");
     config.hotspotAps = ParseHotspotAps(config.hotspotApsText, config.nAps);
 
     if (config.rngSeed == 0)
@@ -269,10 +288,8 @@ BuildApPositions(uint32_t nAps)
 {
     // Triangular (hexagonal) lattice: every AP sits at the centre of one
     // hexagonal cell, adjacent centres are exactly kApSpacingM apart, and
-    // alternate rows are offset by half a spacing. For nAps = 3 this is the
-    // equilateral triangle the previous special case built by hand. The
-    // square grid it replaces contained diagonals at 1.414x and 2.236x the
-    // spacing, which made choice difficulty vary with AP count.
+    // alternate rows are offset by half a spacing. Every neighbour is therefore
+    // one spacing away, so choice difficulty does not vary with AP count.
     uint32_t columns = nAps >= 4 && nAps <= 8 && nAps % 2 == 0
                            ? nAps / 2
                            : static_cast<uint32_t>(
@@ -332,11 +349,75 @@ ChooseServingAp(double x, double y, const std::vector<Vector>& apPositions,
     return best;
 }
 
+// Unordered AP pairs one spacing apart: the edges of the triangular lattice.
+std::vector<std::pair<uint32_t, uint32_t>>
+NeighbouringApPairs(const std::vector<Vector>& positions)
+{
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    for (uint32_t left = 0; left < positions.size(); ++left)
+    {
+        for (uint32_t right = left + 1; right < positions.size(); ++right)
+        {
+            double dx = positions[right].x - positions[left].x;
+            double dy = positions[right].y - positions[left].y;
+            if (std::hypot(dx, dy) <= kApSpacingM * 1.01)
+            {
+                pairs.emplace_back(left, right);
+            }
+        }
+    }
+    return pairs;
+}
+
+// Where the candidate stands, given a stratum and its own seed. Resolving this
+// here rather than in the sweep script keeps one implementation of the lattice.
+Vector
+DrawCandidatePosition(const std::vector<Vector>& aps,
+                      const std::string& stratum,
+                      uint32_t candidateSeed)
+{
+    std::mt19937 rng(candidateSeed);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+
+    if (stratum == "boundary")
+    {
+        // A point along a lattice edge, displaced perpendicular to it. The
+        // displacement stays under a fifth of the spacing, so the edge's own two
+        // APs remain the nearest pair even when it points at a third.
+        auto pairs = NeighbouringApPairs(aps);
+        NS_ABORT_MSG_IF(pairs.empty(),
+                        "boundary stratum needs at least one neighbouring AP pair");
+        std::uniform_int_distribution<std::size_t> pick(0, pairs.size() - 1);
+        auto pair = pairs[pick(rng)];
+        const Vector& a = aps[pair.first];
+        const Vector& b = aps[pair.second];
+        double fraction = 0.35 + 0.30 * unit(rng);
+        double edgeX = a.x + fraction * (b.x - a.x);
+        double edgeY = a.y + fraction * (b.y - a.y);
+        double length = std::hypot(b.x - a.x, b.y - a.y);
+        double offset = (2.0 * unit(rng) - 1.0) * 0.20 * kApSpacingM;
+        return Vector(edgeX - offset * (b.y - a.y) / length,
+                      edgeY + offset * (b.x - a.x) / length,
+                      0.0);
+    }
+
+    // ap_near: 0.15-0.45 spacings out, so the anchor really is the nearest AP.
+    std::uniform_int_distribution<std::size_t> anchorPick(0, aps.size() - 1);
+    const Vector& anchor = aps[anchorPick(rng)];
+    double distance = (0.15 + 0.30 * unit(rng)) * kApSpacingM;
+    double angle = 2.0 * kPi * unit(rng);
+    return Vector(anchor.x + distance * std::cos(angle),
+                  anchor.y + distance * std::sin(angle),
+                  0.0);
+}
+
 // ---------------------------------------------------------------------------
-// The topology seed controls physical placement and is separate from the
-// ns-3 seed used for fading, contention, and rate-control randomness. Thus,
-// three PHY/MAC seeds for one topology really do preserve AP positions,
-// background-station positions, loads, and the candidate's location.
+// Three seeds, three jobs. topologySeed fixes the world: AP lattice, channel
+// assignment, station positions and loads, associations, and the shadowing
+// among them. candidateSeed fixes the observer: where the candidate stands and
+// its own shadowing links. The ns-3 rngSeed drives fading, contention and rate
+// control. Holding topologySeed while varying candidateSeed samples one
+// deployment at several places, with the background bit-identical throughout.
 //
 // Placement is one inhomogeneous point process either way. Without hotspots it
 // is uniform over the AP footprint plus a border. With hotspots the density is
@@ -350,7 +431,11 @@ BuildTopology(const RunConfig& config)
 {
     Topology topology;
     topology.apPositions = BuildApPositions(config.nAps);
-    topology.candidatePosition = Vector(config.candidateX, config.candidateY, 0.0);
+    topology.candidatePosition =
+        config.candidateStratum.empty()
+            ? Vector(config.candidateX, config.candidateY, 0.0)
+            : DrawCandidatePosition(topology.apPositions, config.candidateStratum,
+                                    config.candidateSeed);
 
     double minX = topology.apPositions[0].x;
     double maxX = topology.apPositions[0].x;
@@ -377,20 +462,33 @@ BuildTopology(const RunConfig& config)
     // main(): APs, background stations, candidate. Fixed for the run, so a
     // window of beacons cannot average it away the way it averages Nakagami.
     const uint32_t nNodes = config.nAps + config.nStas + 1;
+    const uint32_t candidateIndex = nNodes - 1;
     std::mt19937 shadowRng(config.topologySeed * 2654435761u + 4u);
+    // The candidate's links come off candidateSeed, so moving it redraws its own
+    // shadowing without perturbing a single background pair.
+    std::mt19937 candidateShadowRng(
+        (config.candidateSeed ? config.candidateSeed : config.topologySeed) *
+            2654435761u +
+        7u);
     std::normal_distribution<double> shadowDraw(
         0.0, std::max(0.0, config.linkShadowingDb));
     topology.shadowingDb.assign(nNodes, std::vector<double>(nNodes, 0.0));
     if (config.linkShadowingDb > 0.0)
     {
-        for (uint32_t i = 0; i < nNodes; ++i)
+        for (uint32_t i = 0; i < candidateIndex; ++i)
         {
-            for (uint32_t j = i + 1; j < nNodes; ++j)
+            for (uint32_t j = i + 1; j < candidateIndex; ++j)
             {
                 double draw = shadowDraw(shadowRng);
                 topology.shadowingDb[i][j] = draw;
                 topology.shadowingDb[j][i] = draw;
             }
+        }
+        for (uint32_t i = 0; i < candidateIndex; ++i)
+        {
+            double draw = shadowDraw(candidateShadowRng);
+            topology.shadowingDb[i][candidateIndex] = draw;
+            topology.shadowingDb[candidateIndex][i] = draw;
         }
     }
     std::uniform_real_distribution<double> uniformX(minX - border, maxX + border);
@@ -910,10 +1008,9 @@ main(int argc, char* argv[])
                            occupiedChannels.end());
     uint32_t nOccupiedChannels = static_cast<uint32_t>(occupiedChannels.size());
 
-    // Offered load is drawn per station, so an AP's load is no longer its
-    // station count times a scenario-wide constant. Two APs with equal station
-    // counts can now differ in load, which is what stops a transmitter count
-    // from standing in for the measurement.
+    // Offered load is drawn per station, so two APs with equal station counts
+    // can differ in load. That is what stops a transmitter count from standing
+    // in for the measurement.
     std::vector<double> staOfferedMbps(config.nStas, config.backgroundMbpsPerSta);
     if (config.backgroundMbpsPerSta <= 0.0)
     {
@@ -932,11 +1029,10 @@ main(int argc, char* argv[])
     }
 
     // One traffic stream per background station. Each station's mean rate is a
-    // property of the deployment and hangs off topologySeed above; when its
-    // packets actually leave is not, so the arrival realisation is drawn from
-    // both seeds. A radio seed therefore means the same deployment observed on a
-    // different occasion, rather than the identical packet sequence replayed
-    // with different fading. Both seeds are fixed within a matched target-AP
+    // property of the deployment and hangs off topologySeed; when its packets
+    // actually leave is not, so the arrival realisation is drawn from both
+    // seeds. A radio seed therefore means the same deployment observed on a
+    // different occasion. Both seeds are fixed within a matched target-AP
     // replay, so the observation stays byte-identical across it.
     const uint32_t trafficBase =
         (config.topologySeed * 2654435761u) ^ (config.rngSeed * 2246822519u);
@@ -1275,6 +1371,8 @@ main(int argc, char* argv[])
              << ",\n";
     metadata << "    \"n_channels\": " << nOccupiedChannels << "\n";
     metadata << "  },\n";
+    metadata << "  \"candidate_seed\": " << config.candidateSeed << ",\n";
+    metadata << "  \"candidate_stratum\": \"" << config.candidateStratum << "\",\n";
     metadata << "  \"candidate_position\": {\"x\": " << topology.candidatePosition.x
              << ", \"y\": " << topology.candidatePosition.y << "},\n";
     metadata << "  \"aps\": [\n";
