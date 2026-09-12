@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """Build the raw-frame corpus: every decoded frame as its own token.
 
-The binned corpora aggregate the scan into fixed time slices and hand the model
-summary statistics over each slice. That is a hand-built representation, and
-after the 2026-08-24 review it is also a lossy one: a bin that saw no frame has
-no signal reading, and whatever is written in its place propagates into every
-aggregate taken afterwards.
+The binned corpora cut the scan into fixed slices and hand the model summary
+statistics over each one. That is a hand-built representation and a lossy one:
+a bin that saw no frame has no signal reading, and whatever is written in its
+place propagates into every aggregate taken afterwards.
 
-This corpus removes the aggregation step. A group's observation is the list of
-frames the sweeping radio actually decoded, in time order, each with the fields
-a real capture carries: arrival time, signal, noise, duration, length, rate,
-type, retry and beacon flags. No binning, no summary statistics, no imputation -
-a frame that was not received is simply not a token.
+This corpus drops the aggregation step. A scan's observation is the list of
+frames the sweeping radio decoded, in time order, each carrying what a real
+capture carries: arrival time, signal, noise, duration, length, rate, type,
+retry and beacon flags. No binning, no summary statistics, no imputation - a
+frame that was not received is simply not a token.
 
-Identity is encoded RELATIONALLY, never absolutely. A model given raw BSSIDs
-would learn the MAC ordering the simulator happens to assign. Instead each
-option carries a per-frame relation code saying whether that frame was on the
-option's channel, came from its BSS, and was transmitted by the AP itself. The
-same frame therefore looks different to different options, which is what makes
-one shared trace answer a per-option question.
+Identity is encoded RELATIONALLY, never absolutely. Given raw BSSIDs a model
+would learn the MAC ordering the simulator happens to assign, so instead each
+option carries a per-frame relation code: was this frame on the option's
+channel, from its BSS, sent by the AP itself. The same frame therefore looks
+different to different options, which is what lets one shared trace answer a
+per-option question.
 
 Run:
-  python scripts/build_frame_corpus.py data/development_runs data/extension_runs \
-      data/combined_rotating.csv --out data/combined_frames.npz --max-frames 2048
+  python scripts/dataset/build_frame_corpus.py data/runs data/dataset.csv \
+      --out data/frames.npz
 """
 
 from __future__ import annotations
@@ -38,10 +37,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from models.data import feature_columns, impute_features, load_dataset  # noqa: E402
-from scripts.dataset.build_continuous_temporal import reference_dir  # noqa: E402
-from scripts.dataset.build_dataset import (TYPE_CTRL, TYPE_DATA, TYPE_MGMT,  # noqa: E402
-                                   ScanConfig, _rng, apply_rssi_realism,
-                                   read_observation, single_radio_sweep)
+from models.frames import REL_FROM_AP, REL_ON_CHANNEL, REL_SAME_BSS  # noqa: E402
+from scripts.dataset.build_dataset import (SCAN_CHANNELS, TYPE_CTRL,  # noqa: E402
+                                   TYPE_DATA, TYPE_MGMT, ScanConfig, _rng,
+                                   apply_rssi_realism, read_observation,
+                                   reference_dir, single_radio_sweep)
 
 FRAME_FEATURES = (
     "time_fraction",       # when in the window the frame ended
@@ -58,11 +58,8 @@ FRAME_FEATURES = (
     "gap_since_previous",  # seconds since the previous decoded frame
 )
 
-# Relation of a frame to one option, as a 3-bit code.
-REL_ON_CHANNEL = 1
-REL_SAME_BSS = 2
-REL_FROM_AP = 4
-N_RELATIONS = 8
+# The relation bits live in models/frames.py, next to the embedding that
+# consumes them, and are imported above.
 
 
 def frame_rows(rows: list[dict], window: float) -> np.ndarray:
@@ -112,9 +109,10 @@ def main() -> int:
     parser.add_argument("runs_dir", type=Path, nargs="+")
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--out", type=Path, default=Path("data/frames.npz"))
-    parser.add_argument("--max-frames", type=int, default=2048,
-                        help="cap per group; the MOST RECENT frames are kept, because "
-                             "a scan cache is what the client decides from")
+    parser.add_argument("--max-frames", type=int, default=16384,
+                        help="cap per scan. A scan over the cap is thinned uniformly "
+                             "across the window rather than truncated, so the span it "
+                             "covers does not depend on how busy the medium was")
     args = parser.parse_args()
 
     frame = impute_features(load_dataset(args.dataset))
@@ -140,13 +138,13 @@ def main() -> int:
 
     static_features = feature_columns(frame)
     built = []
-    total = frame["group_id"].nunique()
+    total = frame["scan_id"].nunique()
     truncated = 0
-    for number, (group_id, group) in enumerate(frame.groupby("group_id", sort=True), 1):
-        group = group.sort_values("ap_index")
-        topology_id = str(group["topology_id"].iloc[0])
-        seed_key = group_id.rsplit("__", 1)[-1] if "__s" in group_id else "s00"
-        ref = reference_dir(args.runs_dir, topology_id, seed_key)
+    for number, (scan_id, rows_of_scan) in enumerate(frame.groupby("scan_id", sort=True), 1):
+        rows_of_scan = rows_of_scan.sort_values("ap_index")
+        topology_id = str(rows_of_scan["topology_id"].iloc[0])
+        scan_key = scan_id.split("__", 1)[1]
+        ref = reference_dir(args.runs_dir, topology_id, scan_key)
         meta = json.loads((ref / "metadata.json").read_text())
         window = float(meta["params"]["feature_window_end"])
 
@@ -154,49 +152,51 @@ def main() -> int:
                                           "mac": ap["mac"].lower(),
                                           "channel": int(ap["channel"])}
                        for ap in meta["aps"]}
-        chan_of = {i: ap["channel"] for i, ap in ap_by_index.items()}
-        freq_of_chan = {ch: 5000 + 5 * ch for ch in set(chan_of.values())}
+        freq_of_chan = {ch: 5000 + 5 * ch for ch in SCAN_CHANNELS}
 
         rows = read_observation(ref / "observation.csv")
-        apply_rssi_realism(rows, cfg, _rng(cfg, group_id, "rssi"))
+        apply_rssi_realism(rows, cfg, _rng(cfg, scan_id, "rssi"))
         rows, _, _, _, _ = single_radio_sweep(
-            rows, freq_of_chan, window, cfg, _rng(cfg, group_id, "sweep"))
+            rows, freq_of_chan, window, cfg, _rng(cfg, scan_id, "sweep"))
 
-        option_indices = group["ap_index"].astype(int).to_numpy()
+        option_indices = rows_of_scan["ap_index"].astype(int).to_numpy()
         option_meta = [ap_by_index[i] for i in option_indices]
 
         ordered = sorted(rows, key=lambda r: r["t"])
         if len(ordered) > args.max_frames:
-            ordered = ordered[-args.max_frames:]
+            # Thin uniformly and keep the order, so the retained span still
+            # covers the whole window rather than just its busy start.
+            keep = np.linspace(0, len(ordered) - 1, args.max_frames).round().astype(int)
+            ordered = [ordered[i] for i in np.unique(keep)]
             truncated += 1
         built.append({
-            "group_id": group_id, "topology_id": topology_id,
-            "n_aps": int(group["gt_n_aps"].iloc[0]),
-            "n_hotspots": int(group["gt_n_hotspots"].iloc[0]),
-            "candidate_stratum": str(group["gt_candidate_stratum"].iloc[0]),
+            "scan_id": scan_id, "topology_id": topology_id,
+            "n_aps": int(rows_of_scan["gt_n_aps"].iloc[0]),
+            "n_hotspots": int(rows_of_scan["gt_n_hotspots"].iloc[0]),
+            "candidate_stratum": str(rows_of_scan["gt_candidate_stratum"].iloc[0]),
             "frames": frame_rows(ordered, window),
             "relations": relation_codes(ordered, option_meta),
-            "static": group[static_features].to_numpy(dtype=np.float32),
+            "static": rows_of_scan[static_features].to_numpy(dtype=np.float32),
             "option_indices": option_indices,
-            "labels": group["label_throughput_mbps"].to_numpy(dtype=np.float32),
+            "labels": rows_of_scan["label_throughput_mbps"].to_numpy(dtype=np.float32),
         })
         if number % 100 == 0 or number == total:
-            print(f"[{number}/{total}] groups, {len(ordered)} frames in the last one")
+            print(f"[{number}/{total}] scans, {len(ordered)} frames in the last one")
 
     max_options = max(len(i["option_indices"]) for i in built)
     max_frames = max(i["frames"].shape[0] for i in built)
-    n_groups = len(built)
+    n_scans = len(built)
     counts = np.array([i["frames"].shape[0] for i in built])
-    print(f"frames per group: min={counts.min()} median={int(np.median(counts))} "
-          f"max={counts.max()}; {truncated} groups truncated at {args.max_frames}")
+    print(f"frames per scan: min={counts.min()} median={int(np.median(counts))} "
+          f"max={counts.max()}; {truncated} scans truncated at {args.max_frames}")
 
-    frames = np.zeros((n_groups, max_frames, len(FRAME_FEATURES)), np.float32)
-    relations = np.zeros((n_groups, max_options, max_frames), np.uint8)
-    frame_mask = np.zeros((n_groups, max_frames), bool)
-    static = np.zeros((n_groups, max_options, len(static_features)), np.float32)
-    labels = np.zeros((n_groups, max_options), np.float32)
-    option_indices = np.full((n_groups, max_options), -1, np.int16)
-    option_mask = np.zeros((n_groups, max_options), bool)
+    frames = np.zeros((n_scans, max_frames, len(FRAME_FEATURES)), np.float32)
+    relations = np.zeros((n_scans, max_options, max_frames), np.uint8)
+    frame_mask = np.zeros((n_scans, max_frames), bool)
+    static = np.zeros((n_scans, max_options, len(static_features)), np.float32)
+    labels = np.zeros((n_scans, max_options), np.float32)
+    option_indices = np.full((n_scans, max_options), -1, np.int16)
+    option_mask = np.zeros((n_scans, max_options), bool)
 
     for i, item in enumerate(built):
         n_f = item["frames"].shape[0]
@@ -215,7 +215,7 @@ def main() -> int:
         frames=frames, relations=relations, frame_mask=frame_mask,
         static=static, labels=labels, option_indices=option_indices,
         option_mask=option_mask,
-        group_ids=np.array([i["group_id"] for i in built]),
+        scan_ids=np.array([i["scan_id"] for i in built]),
         topology_ids=np.array([i["topology_id"] for i in built]),
         configured_n_aps=np.array([i["n_aps"] for i in built], dtype=np.int16),
         n_hotspots=np.array([i["n_hotspots"] for i in built], dtype=np.int16),
@@ -223,7 +223,7 @@ def main() -> int:
         frame_features=np.array(FRAME_FEATURES),
         static_features=np.array(static_features),
         scan_description=np.array(cfg.describe()))
-    print(f"wrote {n_groups} groups x {max_frames} frames x {len(FRAME_FEATURES)} "
+    print(f"wrote {n_scans} scans x {max_frames} frames x {len(FRAME_FEATURES)} "
           f"features to {args.out}")
     return 0
 

@@ -9,18 +9,21 @@ import numpy as np
 import pandas as pd
 import torch
 
-from models.data import group_sample_weights, split_by_group
-from models.evaluate import (baseline_predictions, random_selection_metrics,
-                             selection_metrics)
-from models.ranker import SetRanker, pointwise_loss, ranking_loss
-from models.temporal import TemporalSetTransformer, load_temporal_checkpoint
-from scripts.simulate.run_sweep import variant_complete
+from models.data import (scan_sample_weights, split_by_topology,
+                         split_rows_by_topology)
+from models.evaluate import (baseline_predictions, fit_rssi_busy_k,
+                             random_selection_metrics, selection_metrics)
+from models.frames import FrameCorpus
+from models.ranker import SetRanker, pack_scans, pointwise_loss, ranking_loss
+from models.temporal import (TemporalCorpus, TemporalSetTransformer,
+                             load_temporal_checkpoint)
+from scripts.simulate.run_sweep import Run, already_done
 from scripts.dataset.combine_datasets import combine_csv, combine_npz
 from scripts.train.learning_curve import subset_topologies
-from scripts.train.train_eval import _select, stratified_report
+from scripts.train.train_eval import choose_by_validation_regret, stratified_report
 
 
-class GroupSplitTests(unittest.TestCase):
+class ScanSplitTests(unittest.TestCase):
     def test_repeated_seeds_of_topology_never_cross_splits(self):
         rows = []
         for topology in range(20):
@@ -28,12 +31,12 @@ class GroupSplitTests(unittest.TestCase):
                 for ap in range(2):
                     rows.append({
                         "topology_id": f"g{topology:02d}",
-                        "group_id": f"g{topology:02d}__s{seed:02d}",
+                        "scan_id": f"g{topology:02d}__s{seed:02d}",
                         "ap_index": ap,
                         "label_throughput_mbps": float(ap),
                     })
         frame = pd.DataFrame(rows)
-        train, val, test = split_by_group(frame, seed=7)
+        train, val, test = split_by_topology(frame, seed=7)
         topology_sets = [set(part.topology_id) for part in (train, val, test)]
         self.assertTrue(topology_sets[0].isdisjoint(topology_sets[1]))
         self.assertTrue(topology_sets[0].isdisjoint(topology_sets[2]))
@@ -42,19 +45,19 @@ class GroupSplitTests(unittest.TestCase):
     def test_too_few_topologies_fails_clearly(self):
         frame = pd.DataFrame({
             "topology_id": ["a", "a", "b", "b"],
-            "group_id": ["a", "a", "b", "b"],
+            "scan_id": ["a", "a", "b", "b"],
             "ap_index": [0, 1, 0, 1],
             "label_throughput_mbps": [1.0, 0.0, 1.0, 0.0],
         })
         with self.assertRaisesRegex(ValueError, "at least 5 independent"):
-            split_by_group(frame)
+            split_by_topology(frame)
 
     def test_sample_weights_give_each_choice_set_equal_mass(self):
         frame = pd.DataFrame({
-            "group_id": ["a", "a", "b", "b", "b", "b"],
+            "scan_id": ["a", "a", "b", "b", "b", "b"],
         })
-        frame["weight"] = group_sample_weights(frame)
-        totals = frame.groupby("group_id").weight.sum()
+        frame["weight"] = scan_sample_weights(frame)
+        totals = frame.groupby("scan_id").weight.sum()
         self.assertAlmostEqual(float(totals["a"]), float(totals["b"]))
         self.assertAlmostEqual(float(frame.weight.mean()), 1.0)
 
@@ -66,12 +69,12 @@ class GroupSplitTests(unittest.TestCase):
                 for ap in range(2):
                     rows.append({
                         "topology_id": topology_id,
-                        "group_id": topology_id,
+                        "scan_id": topology_id,
                         "ap_index": ap,
                         "gt_n_aps": n_aps,
                         "label_throughput_mbps": float(ap),
                     })
-        train, val, test = split_by_group(pd.DataFrame(rows), seed=4)
+        train, val, test = split_by_topology(pd.DataFrame(rows), seed=4)
         for part in (train, val, test):
             self.assertEqual(set(part.gt_n_aps), {2, 3, 4, 6, 8})
 
@@ -83,7 +86,7 @@ class GroupSplitTests(unittest.TestCase):
                 for seed in range(3):
                     rows.append({
                         "topology_id": topology_id,
-                        "group_id": f"{topology_id}_s{seed}",
+                        "scan_id": f"{topology_id}_s{seed}",
                         "gt_n_aps": n_aps,
                     })
         frame = pd.DataFrame(rows)
@@ -95,7 +98,7 @@ class GroupSplitTests(unittest.TestCase):
 
 class DatasetCombinationTests(unittest.TestCase):
     def test_csv_combination_rejects_duplicate_topologies(self):
-        columns = ["topology_id", "group_id", "ap_index", "run_id",
+        columns = ["topology_id", "scan_id", "ap_index", "run_id",
                    "label_throughput_mbps"]
         first = pd.DataFrame([["a", "a_s0", 0, "a0", 1.0]], columns=columns)
         second = pd.DataFrame([["b", "b_s0", 0, "b0", 2.0]], columns=columns)
@@ -121,7 +124,7 @@ class DatasetCombinationTests(unittest.TestCase):
                 "option_indices": np.arange(options, dtype=np.int16)[None],
                 "option_mask": np.ones((1, options), bool),
                 "time_mask": np.ones((1, steps), bool),
-                "group_ids": np.array([f"{prefix}_s0"]),
+                "scan_ids": np.array([f"{prefix}_s0"]),
                 "topology_ids": np.array([prefix]),
                 "configured_n_aps": np.array([options], np.int16),
                 "n_hotspots": np.array([0], np.int16),
@@ -148,41 +151,44 @@ class DatasetCombinationTests(unittest.TestCase):
 
 class SweepResumeTests(unittest.TestCase):
     def test_resume_requires_matching_scenario_and_complete_shared_trace(self):
-        scenario = {
+        topology = {
             "nAPs": 2,
             "nSTAs": 4,
-            "candidateX": 12.5,
-            "candidateY": 3.0,
-            "candidateStratum": "boundary",
             "hotspotAPs": "1",
-            "bgPerStaMbps": 2.5,
             "topologySeed": 19,
         }
+        candidate = {"candidateStratum": "boundary", "candidateSeed": 77}
         metadata = {
             "rng_seed": 23,
             "params": {
                 "topology_seed": 19,
                 "n_aps": 2,
                 "n_stas": 4,
-                "bg_per_sta_mbps": 2.5,
+                "bg_mean_per_sta_mbps": 2.5,
                 "hotspot_aps": [1],
             },
+            "candidate_seed": 77,
+            "candidate_stratum": "boundary",
             "candidate_position": {"x": 12.5, "y": 3.0},
             "candidate": {"target_ap": 0},
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            run = root / "g00000__s00__ap0"
+            run = root / "t00000__c00__ap0"
             run.mkdir()
             (run / "metadata.json").write_text(json.dumps(metadata))
             (run / "observation.csv").write_text("x" * 1001)
             (run / "chanbusy.csv").write_text("x" * 101)
-            self.assertTrue(variant_complete(root, run.name, scenario, 0, 23))
-            self.assertFalse(variant_complete(root, run.name, scenario, 0, 24))
-            changed = dict(scenario, candidateX=99.0)
-            self.assertFalse(variant_complete(root, run.name, changed, 0, 23))
+            job = Run(run.name, topology, candidate, 0, 23)
+            self.assertTrue(already_done(root, job))
+            self.assertFalse(already_done(root, job._replace(rng_seed=24)))
+            # a different candidate seed is a different position, not a resume
+            self.assertFalse(already_done(root, job._replace(
+                candidate=dict(candidate, candidateSeed=99))))
+            self.assertFalse(already_done(root, job._replace(
+                candidate=dict(candidate, candidateStratum="ap_near"))))
             (run / "chanbusy.csv").write_text("short")
-            self.assertFalse(variant_complete(root, run.name, scenario, 0, 23))
+            self.assertFalse(already_done(root, job))
 
 
 class RankingLossTests(unittest.TestCase):
@@ -237,18 +243,18 @@ class EvaluationTests(unittest.TestCase):
     def test_validation_selection_uses_equal_topology_weight(self):
         frame = pd.DataFrame({
             "topology_id": ["a", "a", "a", "a", "b", "b"],
-            "group_id": ["a0", "a0", "a1", "a1", "b0", "b0"],
+            "scan_id": ["a0", "a0", "a1", "a1", "b0", "b0"],
             "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0, 14.0, 0.0],
         })
         topology_fair = np.array([0, 1, 0, 1, 1, 0])
         group_fair = np.array([1, 0, 1, 0, 0, 1])
-        _, selected = _select(
+        _, selected = choose_by_validation_regret(
             [("topology_fair", topology_fair), ("group_fair", group_fair)], frame)
         self.assertEqual(selected, "topology_fair")
 
     def test_equal_scores_use_order_invariant_expected_tie_break(self):
         frame = pd.DataFrame({
-            "group_id": ["g", "g"],
+            "scan_id": ["g", "g"],
             "label_throughput_mbps": [10.0, 0.0],
         })
         metrics = selection_metrics(frame, np.array([1.0, 1.0]))
@@ -260,7 +266,7 @@ class EvaluationTests(unittest.TestCase):
     def test_topology_regret_does_not_overweight_extra_seed_groups(self):
         frame = pd.DataFrame({
             "topology_id": ["a", "a", "a", "a", "b", "b"],
-            "group_id": ["a0", "a0", "a1", "a1", "b0", "b0"],
+            "scan_id": ["a0", "a0", "a1", "a1", "b0", "b0"],
             "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0, 10.0, 0.0],
         })
         metrics = selection_metrics(frame, np.array([0, 1, 0, 1, 1, 0]))
@@ -270,14 +276,14 @@ class EvaluationTests(unittest.TestCase):
 
     def test_busy_baselines_prefer_cca_over_decoded_airtime(self):
         frame = pd.DataFrame({
-            "group_id": ["g", "g"],
+            "scan_id": ["g", "g"],
             "ap_index": [0, 1],
             "label_throughput_mbps": [1.0, 2.0],
             "feat_ap_rssi_mean": [-60.0, -60.0],
             "feat_chan_busy_frac": [0.1, 0.9],
             "feat_chan_cca_busy_frac": [0.8, 0.2],
         })
-        predictions = baseline_predictions(frame)
+        predictions = baseline_predictions(frame, fit_frame=frame)
         self.assertGreater(predictions["least_busy_channel"][1],
                            predictions["least_busy_channel"][0])
         self.assertGreater(predictions["rssi_minus_busy"][1],
@@ -285,7 +291,7 @@ class EvaluationTests(unittest.TestCase):
 
     def test_nonfinite_predictions_are_rejected(self):
         frame = pd.DataFrame({
-            "group_id": ["a", "a"],
+            "scan_id": ["a", "a"],
             "label_throughput_mbps": [1.0, 0.0],
         })
         with self.assertRaisesRegex(ValueError, "NaN or infinite"):
@@ -293,7 +299,7 @@ class EvaluationTests(unittest.TestCase):
 
     def test_random_metrics_are_exact_and_row_order_invariant(self):
         frame = pd.DataFrame({
-            "group_id": ["a", "a", "b", "b", "b"],
+            "scan_id": ["a", "a", "b", "b", "b"],
             "ap_index": [0, 1, 0, 1, 2],
             "label_throughput_mbps": [10.0, 0.0, 9.0, 6.0, 0.0],
         })
@@ -302,23 +308,23 @@ class EvaluationTests(unittest.TestCase):
         shuffled = frame.sample(frac=1.0, random_state=2)
         self.assertEqual(metrics, random_selection_metrics(shuffled))
 
-        original = dict(zip(zip(frame.group_id, frame.ap_index),
-                            baseline_predictions(frame)["random"]))
-        reordered = dict(zip(zip(shuffled.group_id, shuffled.ap_index),
-                             baseline_predictions(shuffled)["random"]))
+        original = dict(zip(zip(frame.scan_id, frame.ap_index),
+                            baseline_predictions(frame, frame)["random"]))
+        reordered = dict(zip(zip(shuffled.scan_id, shuffled.ap_index),
+                             baseline_predictions(shuffled, shuffled)["random"]))
         self.assertEqual(original, reordered)
 
-    def test_pooled_strata_keep_repeated_split_groups_separate(self):
+    def test_pooled_strata_keep_repeated_split_scans_separate(self):
         frame = pd.DataFrame({
             "split_seed": [0, 0, 1, 1],
-            "group_id": ["g", "g", "g", "g"],
+            "scan_id": ["g", "g", "g", "g"],
             "stratum": ["x", "x", "x", "x"],
             "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0],
             "pred_model": [1.0, 0.0, 0.0, 1.0],
             "pred_strongest_rssi": [1.0, 0.0, 1.0, 0.0],
         })
         report = stratified_report(frame, ["model"])
-        self.assertEqual(int(report.loc[0, "groups"]), 2)
+        self.assertEqual(int(report.loc[0, "scans"]), 2)
         self.assertAlmostEqual(float(report.loc[0, "model"]), 5.0)
 
 
@@ -396,6 +402,145 @@ class TemporalTransformerTests(unittest.TestCase):
                                  changed_static)
         np.testing.assert_allclose(
             altered[0, :3].numpy(), original[0, :3].numpy(), rtol=1e-5, atol=1e-6)
+
+
+class CorpusSplitTests(unittest.TestCase):
+    """The array corpora split by the same rule as the flat dataframe."""
+
+    @staticmethod
+    def _ids(n_topologies=10, seeds_per_topology=3):
+        topology_ids = np.array([f"t{t:02d}"
+                                 for t in range(n_topologies)
+                                 for _ in range(seeds_per_topology)])
+        # two AP counts, each with enough topologies to stratify
+        configured = np.array([2 if t < n_topologies // 2 else 4
+                               for t in range(n_topologies)
+                               for _ in range(seeds_per_topology)])
+        return topology_ids, configured
+
+    def test_every_group_lands_in_exactly_one_part(self):
+        topology_ids, configured = self._ids()
+        parts = split_rows_by_topology(topology_ids, configured, seed=1)
+        covered = np.concatenate(parts)
+        self.assertEqual(sorted(covered.tolist()), list(range(len(topology_ids))))
+
+    def test_repeated_seeds_of_a_topology_never_cross_parts(self):
+        topology_ids, configured = self._ids()
+        for seed in range(4):
+            parts = split_rows_by_topology(topology_ids, configured, seed=seed)
+            seen = [set(topology_ids[part]) for part in parts]
+            self.assertTrue(seen[0].isdisjoint(seen[1]))
+            self.assertTrue(seen[0].isdisjoint(seen[2]))
+            self.assertTrue(seen[1].isdisjoint(seen[2]))
+
+    def test_too_few_topologies_fails_clearly(self):
+        topology_ids = np.array(["a", "b", "c"])
+        with self.assertRaisesRegex(ValueError, "at least 5 independent"):
+            split_rows_by_topology(topology_ids, None)
+
+    def _temporal_corpus(self):
+        topology_ids, configured = self._ids()
+        n = len(topology_ids)
+        return TemporalCorpus(
+            temporal=np.zeros((n, 2, 3, 4), np.float32),
+            static=np.zeros((n, 2, 1), np.float32),
+            labels=np.zeros((n, 2), np.float32),
+            option_indices=np.zeros((n, 2), np.int16),
+            option_mask=np.ones((n, 2), bool),
+            time_mask=np.ones((n, 3), bool),
+            scan_ids=np.array([f"g{i}" for i in range(n)]),
+            topology_ids=topology_ids, configured_n_aps=configured,
+            n_hotspots=np.zeros(n, np.int16),
+            candidate_strata=np.array(["boundary"] * n),
+            temporal_features=["a", "b", "c", "d"], static_features=["s"])
+
+    def _frame_corpus(self):
+        topology_ids, configured = self._ids()
+        n = len(topology_ids)
+        return FrameCorpus(
+            frames=np.zeros((n, 5, 2), np.float32),
+            relations=np.zeros((n, 2, 5), np.uint8),
+            frame_mask=np.ones((n, 5), bool),
+            static=np.zeros((n, 2, 1), np.float32),
+            labels=np.zeros((n, 2), np.float32),
+            option_indices=np.zeros((n, 2), np.int16),
+            option_mask=np.ones((n, 2), bool),
+            scan_ids=np.array([f"g{i}" for i in range(n)]),
+            topology_ids=topology_ids, configured_n_aps=configured,
+            n_hotspots=np.zeros(n, np.int16),
+            candidate_strata=np.array(["boundary"] * n),
+            frame_features=["a", "b"], static_features=["s"])
+
+    def test_binned_and_frame_corpora_split_identically(self):
+        temporal, frames = self._temporal_corpus(), self._frame_corpus()
+        for seed in range(3):
+            for from_temporal, from_frames in zip(temporal.split(seed=seed),
+                                                  frames.split(seed=seed)):
+                np.testing.assert_array_equal(from_temporal, from_frames)
+
+    def test_corpus_split_keeps_both_ap_counts_in_every_part(self):
+        corpus = self._temporal_corpus()
+        for part in corpus.split(seed=2):
+            self.assertEqual(set(corpus.configured_n_aps[part].tolist()), {2, 4})
+
+
+class SpearmanTests(unittest.TestCase):
+    def test_a_model_that_orders_nothing_scores_zero_rather_than_being_excluded(self):
+        frame = pd.DataFrame({
+            "scan_id": ["a", "a", "b", "b"],
+            "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0],
+        })
+        # perfect on set "a", completely undecided on set "b"
+        metrics = selection_metrics(frame, np.array([1.0, 0.0, 5.0, 5.0]))
+        self.assertAlmostEqual(metrics["mean_spearman"], 0.5)
+
+    def test_a_choice_set_with_nothing_to_order_is_left_out_of_the_average(self):
+        frame = pd.DataFrame({
+            "scan_id": ["a", "a", "b", "b"],
+            "label_throughput_mbps": [10.0, 0.0, 7.0, 7.0],
+        })
+        # set "b" has identical labels, so there is no ordering to get right
+        metrics = selection_metrics(frame, np.array([1.0, 0.0, 1.0, 0.0]))
+        self.assertAlmostEqual(metrics["mean_spearman"], 1.0)
+
+
+class BusyHeuristicFitTests(unittest.TestCase):
+    @staticmethod
+    def _frame():
+        # signal is identical everywhere, so only occupancy can decide
+        return pd.DataFrame({
+            "scan_id": ["a", "a", "b", "b"],
+            "ap_index": [0, 1, 0, 1],
+            "label_throughput_mbps": [1.0, 9.0, 8.0, 2.0],
+            "feat_ap_rssi_mean": [-60.0, -60.0, -60.0, -60.0],
+            "feat_chan_cca_busy_frac": [0.9, 0.1, 0.1, 0.9],
+        })
+
+    def test_fitted_k_beats_ignoring_occupancy(self):
+        frame = self._frame()
+        k = fit_rssi_busy_k(frame, "feat_chan_cca_busy_frac")
+        self.assertGreater(k, 0.0)
+        scores = frame.feat_ap_rssi_mean - k * frame.feat_chan_cca_busy_frac
+        self.assertAlmostEqual(
+            selection_metrics(frame, scores.to_numpy())["mean_regret_mbps"], 0.0)
+
+    def test_an_unusable_fit_frame_raises_instead_of_defaulting(self):
+        with self.assertRaisesRegex(ValueError, "empty frame"):
+            fit_rssi_busy_k(self._frame().iloc[:0], "feat_chan_cca_busy_frac")
+        with self.assertRaisesRegex(ValueError, "missing"):
+            fit_rssi_busy_k(self._frame().drop(columns=["feat_ap_rssi_mean"]),
+                            "feat_chan_cca_busy_frac")
+
+
+class MakeGroupsTests(unittest.TestCase):
+    def test_a_frame_that_was_not_reindexed_is_refused(self):
+        frame = pd.DataFrame({
+            "scan_id": ["a", "a"],
+            "label_throughput_mbps": [1.0, 2.0],
+            "feat_x": [0.0, 1.0],
+        }, index=[7, 8])
+        with self.assertRaisesRegex(ValueError, "indexed 0..n-1"):
+            pack_scans(frame, ["feat_x"])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,29 @@
-"""Temporal and cross-option transformer for passive Wi-Fi scans."""
+"""A transformer over a passive scan that has been cut into time bins.
+
+Before a client joins a network it can only listen. Sweeping its radio across
+the channels for a few seconds, it hears beacons and data frames from the
+access points in range. The corpus in this module is that listening period
+chopped into equal time bins, with one row of measurements per bin per access
+point the client could join: how strong that AP sounded in this bin, how much
+of the bin its channel was occupied, whether it was heard at all. The job is
+to score the options so the one that would actually deliver the most
+throughput comes top.
+
+The model reads that in two stages, which is the whole idea:
+
+  time     each option's own sequence of bins is summarised independently by
+           a transformer over the time axis, ending in one vector per option.
+           Padding bins are masked, so a short scan is not read as a quiet one.
+  options  those per-option vectors then attend to each other, with no
+           position encoding, so the score an option receives depends on which
+           rivals it is up against but not on the order they arrive in.
+
+The second stage is what a model scoring each option in isolation cannot do:
+express that an AP is only lightly loaded *compared with the others here*.
+
+Splitting a corpus is delegated to data.split_rows_by_topology, so an array
+corpus and the flat CSV are split by exactly the same rule.
+"""
 
 from __future__ import annotations
 
@@ -9,18 +34,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .data import partition_groups
+from .data import split_rows_by_topology
+
+TEMPORAL_SCHEMA_VERSION = 2
 
 
 @dataclass
 class TemporalCorpus:
+    """One binned scan per row, with the options it was choosing between.
+
+    Leading axes are (scan, option, time step, feature); option_mask says
+    which option slots are real APs rather than padding, and time_mask says
+    which time steps are real bins.
+    """
+
     temporal: np.ndarray
     static: np.ndarray
     labels: np.ndarray
     option_indices: np.ndarray
     option_mask: np.ndarray
     time_mask: np.ndarray
-    group_ids: np.ndarray
+    scan_ids: np.ndarray
     topology_ids: np.ndarray
     configured_n_aps: np.ndarray
     n_hotspots: np.ndarray
@@ -31,12 +65,16 @@ class TemporalCorpus:
     @classmethod
     def load(cls, path: Path) -> "TemporalCorpus":
         with np.load(path, allow_pickle=False) as data:
-            if int(data["schema_version"]) != 2:
-                raise ValueError("unsupported temporal dataset schema")
+            if int(data["schema_version"]) != TEMPORAL_SCHEMA_VERSION:
+                raise ValueError(
+                    f"temporal corpus at {path} is schema version "
+                    f"{int(data['schema_version'])}, expected "
+                    f"{TEMPORAL_SCHEMA_VERSION}; rebuild it with "
+                    "scripts/dataset/build_temporal_dataset.py")
             return cls(
                 temporal=data["temporal"], static=data["static"], labels=data["labels"],
                 option_indices=data["option_indices"], option_mask=data["option_mask"],
-                time_mask=data["time_mask"], group_ids=data["group_ids"],
+                time_mask=data["time_mask"], scan_ids=data["scan_ids"],
                 topology_ids=data["topology_ids"],
                 configured_n_aps=data["configured_n_aps"],
                 n_hotspots=data["n_hotspots"],
@@ -47,22 +85,24 @@ class TemporalCorpus:
 
     def split(self, seed: int = 0, val_frac: float = 0.2,
               test_frac: float = 0.2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Split whole physical topologies, keeping their five seeds together."""
-        topologies = np.unique(self.topology_ids)
-        if len(topologies) < 5:
-            raise ValueError("at least 5 independent topologies are required for splitting")
-        topology_strata = np.array([
-            self.configured_n_aps[np.flatnonzero(self.topology_ids == topology)[0]]
-            for topology in topologies
-        ])
-        selected = tuple(set(part) for part in partition_groups(
-            topologies, topology_strata, val_frac, test_frac, seed))
-        return tuple(np.flatnonzero(np.isin(self.topology_ids, list(names)))
-                     for names in selected)
+        """Group positions for train, val and test, split by whole topology.
+
+        Every repeated seed of a deployment stays on one side of the split.
+        Balanced across the number of APs a deployment was configured with, so
+        no part is short of the large or the small deployments.
+        """
+        return split_rows_by_topology(self.topology_ids, self.configured_n_aps,
+                                      val_frac, test_frac, seed)
 
 
 class MaskedStandardizer:
-    """Feature scaling fitted only on valid training tokens and options."""
+    """Feature scaling whose mean and variance ignore padded slots.
+
+    Fitted on training data only. `mask` selects the entries of `values` that
+    are real observations; including padding would drag every statistic toward
+    whatever the padding happens to hold. Features with no spread are left
+    alone rather than divided by nearly zero.
+    """
 
     def __init__(self, values: np.ndarray, mask: np.ndarray):
         valid = values[mask]
@@ -82,6 +122,7 @@ class TemporalSetTransformer(nn.Module):
                  heads: int = 4, temporal_layers: int = 2, set_layers: int = 2,
                  dropout: float = 0.1):
         super().__init__()
+        self.max_steps = max_steps
         self.n_static_features = n_static_features
         self.input = nn.Linear(n_temporal_features, model_dim)
         self.cls = nn.Parameter(torch.zeros(1, 1, model_dim))
@@ -112,12 +153,21 @@ class TemporalSetTransformer(nn.Module):
                 time_mask: torch.Tensor,
                 static: torch.Tensor | None = None) -> torch.Tensor:
         batch, options, steps, _ = temporal.shape
+        if steps > self.max_steps:
+            raise ValueError(
+                f"input has {steps} time steps but this model was built with "
+                f"max_steps={self.max_steps}; it has no position encoding for "
+                "the extra steps")
         tokens = self.input(temporal).reshape(batch * options, steps, -1)
         cls = self.cls.expand(batch * options, -1, -1)
         tokens = torch.cat([cls, tokens], dim=1) + self.position[:, :steps + 1]
 
+        # Every option of a scan shares one time mask, because they were all
+        # heard during the same scan.
         temporal_padding = ~time_mask[:, None, :].expand(batch, options, steps)
         temporal_padding = temporal_padding.reshape(batch * options, steps)
+        # The prepended CLS token is never padding; it is what carries the
+        # summary of the sequence out of this stage.
         temporal_padding = torch.cat([
             torch.zeros((batch * options, 1), dtype=torch.bool, device=temporal.device),
             temporal_padding,
@@ -135,7 +185,14 @@ class TemporalSetTransformer(nn.Module):
 
 def load_temporal_checkpoint(path: Path, map_location: str | torch.device = "cpu"
                              ) -> tuple[TemporalSetTransformer, dict]:
-    """Safely reconstruct a temporal model and return its inference metadata."""
+    """Rebuild a trained model from a file written by scripts/train/train_temporal.py.
+
+    The checkpoint's "model" entry holds the constructor arguments, so this is
+    the only place that knows how to turn a saved .pt back into a working
+    model; without it the saved runs can only be reopened by working out those
+    arguments by hand. Loaded with weights_only so opening a checkpoint cannot
+    execute code from it.
+    """
     checkpoint = torch.load(path, map_location=map_location, weights_only=True)
     model = TemporalSetTransformer(**checkpoint["model"])
     model.load_state_dict(checkpoint["state_dict"])

@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
-"""Build the full-observation temporal corpus: every channel, every bin.
+"""Build the all-channel temporal corpus: no dwell restriction.
 
-build_temporal_dataset.py models a real single-radio client, which can only
-listen to one channel at a time. That carves each AP's history down to a
-single 110 ms dwell - about one beacon - so a sequence model has almost
-nothing to read. This script removes that restriction and keeps the whole
-parallel-scanner superset the simulator recorded: each option gets a
-*continuous* series on its own channel across the entire pre-association
-window.
+build_temporal_dataset.py models a real single-radio client, which can listen
+to one channel at a time. That leaves each option about 110 ms of its own
+channel per pass, so a sequence model has little to read. This script keeps
+the whole parallel-scanner superset the simulator recorded: every option gets
+a continuous series on its own channel across the entire window.
 
-This is deliberately optimistic about hardware. A commodity station cannot
-observe four channels at once. The point is to establish an upper bound: if a
-sequence model cannot beat aggregate features even with continuous
-observation, then scan dwell was never the limitation and the trajectory
-genuinely carries nothing. If it can, the deficit is a scan-policy artifact
-and the roaming setting (where the serving channel *is* observed
-continuously) becomes the right venue.
+That hardware does not exist - a commodity station cannot watch four channels
+at once - and the point is not realism but attribution. If a sequence model
+cannot beat aggregate features even here, the scan dwell was never the
+limitation and the trajectory genuinely carries nothing. If it can, the
+deficit is an artifact of scan policy.
 
-RSSI degradation is still applied - that is measurement realism, not scan
-policy, and removing it would confound the comparison.
+RSSI degradation is still applied. That is measurement realism rather than
+scan policy, and removing it would confound the comparison.
 
 Run:
-  python scripts/build_continuous_temporal.py data/combined_runs \
-      data/combined_dataset.csv --out data/combined_continuous.npz --bin-ms 100
+  python scripts/dataset/build_continuous_temporal.py data/runs \
+      data/dataset.csv --out data/continuous.npz --bin-ms 100
 """
 
 from __future__ import annotations
@@ -39,34 +35,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from models.data import feature_columns, impute_features, load_dataset  # noqa: E402
 from scripts.dataset.build_dataset import (ScanConfig, _rng, apply_rssi_realism,  # noqa: E402
-                                   read_chanbusy, read_observation)
+                                   read_chanbusy, read_observation,
+                                   reference_dir)
 from scripts.dataset.build_temporal_dataset import (AGE_OFFSET, LEVEL_OFFSETS,  # noqa: E402
                                             NOISE_FLOOR_DBM, OBSERVED_OFFSET,
                                             SUMMARY_NAMES, SUMMARY_WIDTH,
                                             _fill_levels, _frame_summary,
                                             _overlap)
 
-
-def reference_dir(runs_dirs: list[Path], topology_id: str, seed_key: str) -> Path:
-    """Locate a run directory across one or more sweep output roots.
-
-    combined_dataset.csv is stitched from several sweeps (development "g*"
-    topologies, extension "x*"), so the runs for one dataset can live under
-    different roots. Prefixes are disjoint per sweep, so the first match is
-    unambiguous.
-    """
-    prefix = f"{topology_id}__{seed_key}__"
-    for runs_dir in runs_dirs:
-        exact = runs_dir / f"{prefix}ap0"
-        if (exact / "observation.csv").exists():
-            return exact
-        refs = [d for d in runs_dir.iterdir()
-                if d.is_dir() and d.name.startswith(prefix)
-                and (d / "observation.csv").exists()]
-        if refs:
-            return sorted(refs)[0]
-    raise FileNotFoundError(
-        f"no observation for {topology_id}/{seed_key} under {[str(d) for d in runs_dirs]}")
 
 PREFIX_FEATURES = ("time_fraction", "own_cca_busy_fraction")
 
@@ -83,7 +59,7 @@ TEMPORAL_FEATURES = (
 BLOCK_STARTS = tuple(len(PREFIX_FEATURES) + i * SUMMARY_WIDTH for i in range(3))
 
 
-def continuous_group(rows: list[dict], busy: list[dict], option_meta: list[dict],
+def continuous_sequence(rows: list[dict], busy: list[dict], option_meta: list[dict],
                      t_start: float, t_end: float, bin_ms: float
                      ) -> tuple[np.ndarray, np.ndarray]:
     """(N options, T bins, F features) over the whole window, all channels live."""
@@ -111,8 +87,8 @@ def continuous_group(rows: list[dict], busy: list[dict], option_meta: list[dict]
         if event["channel"] in busy_by_channel:
             busy_by_channel[event["channel"]].append(event)
 
-    # Channel-level quantities are shared by every option on that channel, so
-    # compute them once per (channel, step) rather than once per option.
+    # Shared by every option on a channel, so computed once per (channel, step)
+    # rather than once per option.
     channel_summary: dict[int, list[list[float]]] = {}
     channel_cca: dict[int, list[float]] = {}
     for ch in channels:
@@ -144,9 +120,9 @@ def continuous_group(rows: list[dict], busy: list[dict], option_meta: list[dict]
         own = channel_summary[ap["channel"]]
         cca = channel_cca[ap["channel"]]
         for step in range(n_steps):
-            # index 0 of a summary is log1p(frame count); the ratio below is a
-            # share of log-counts, which is bounded and monotone in the real
-            # share, and avoids dividing by an empty all-channel bin.
+            # index 0 of a summary is log1p(frame count), so this is a share of
+            # log-counts: bounded, monotone in the real share, and safe against
+            # an empty all-channel bin.
             ratio = own[step][0] / all_summary[step][0] if all_summary[step][0] > 0 else 0.0
             out[option_index, step] = (
                 [(step + 0.5) / n_steps, cca[step]]
@@ -177,8 +153,8 @@ def main() -> int:
     value = {c: frame[c].dropna().unique()[0] for c in (
         "meta_rssi_noise_db", "meta_rssi_noise_model", "meta_rssi_bias_db",
         "meta_rssi_quant_db", "meta_scan_seed")}
-    # Only the RSSI-realism half of ScanConfig is used here; sweep=False means
-    # no dwell schedule is applied and every channel stays observable.
+    # Only the RSSI-realism half of ScanConfig applies: sweep=False means no
+    # dwell schedule, so every channel stays observable throughout.
     cfg = ScanConfig(
         sweep=False, mode="passive",
         rssi_noise_db=float(value["meta_rssi_noise_db"]),
@@ -189,12 +165,12 @@ def main() -> int:
 
     static_features = feature_columns(frame)
     built = []
-    total = frame["group_id"].nunique()
-    for number, (group_id, group) in enumerate(frame.groupby("group_id", sort=True), 1):
-        group = group.sort_values("ap_index")
-        topology_id = str(group["topology_id"].iloc[0])
-        seed_key = group_id.rsplit("__", 1)[-1] if "__s" in group_id else "s00"
-        ref_dir = reference_dir(args.runs_dir, topology_id, seed_key)
+    total = frame["scan_id"].nunique()
+    for number, (scan_id, rows_of_scan) in enumerate(frame.groupby("scan_id", sort=True), 1):
+        rows_of_scan = rows_of_scan.sort_values("ap_index")
+        topology_id = str(rows_of_scan["topology_id"].iloc[0])
+        scan_key = scan_id.split("__", 1)[1]
+        ref_dir = reference_dir(args.runs_dir, topology_id, scan_key)
         meta = json.loads((ref_dir / "metadata.json").read_text())
         window_end = float(meta["params"]["feature_window_end"])
 
@@ -203,38 +179,38 @@ def main() -> int:
             "channel": int(ap["channel"])} for ap in meta["aps"]}
 
         rows = read_observation(ref_dir / "observation.csv")
-        apply_rssi_realism(rows, cfg, _rng(cfg, group_id, "rssi"))
+        apply_rssi_realism(rows, cfg, _rng(cfg, scan_id, "rssi"))
 
-        option_indices = group["ap_index"].astype(int).to_numpy()
+        option_indices = rows_of_scan["ap_index"].astype(int).to_numpy()
         option_meta = [ap_by_index[index] for index in option_indices]
-        sequence, time_mask = continuous_group(
+        sequence, time_mask = continuous_sequence(
             rows, read_chanbusy(ref_dir / "chanbusy.csv"), option_meta,
             args.start_s, window_end, args.bin_ms)
 
         built.append({
-            "group_id": group_id, "topology_id": topology_id,
-            "n_aps": int(group["gt_n_aps"].iloc[0]),
-            "n_hotspots": int(group["gt_n_hotspots"].iloc[0]),
-            "candidate_stratum": str(group["gt_candidate_stratum"].iloc[0]),
+            "scan_id": scan_id, "topology_id": topology_id,
+            "n_aps": int(rows_of_scan["gt_n_aps"].iloc[0]),
+            "n_hotspots": int(rows_of_scan["gt_n_hotspots"].iloc[0]),
+            "candidate_stratum": str(rows_of_scan["gt_candidate_stratum"].iloc[0]),
             "sequence": sequence, "time_mask": time_mask,
-            "static": group[static_features].to_numpy(dtype=np.float32),
+            "static": rows_of_scan[static_features].to_numpy(dtype=np.float32),
             "option_indices": option_indices,
-            "labels": group["label_throughput_mbps"].to_numpy(dtype=np.float32),
+            "labels": rows_of_scan["label_throughput_mbps"].to_numpy(dtype=np.float32),
         })
         if number % 100 == 0 or number == total:
-            print(f"[{number}/{total}] continuous groups")
+            print(f"[{number}/{total}] continuous scans")
 
     max_options = max(len(i["option_indices"]) for i in built)
     max_steps = max(i["sequence"].shape[1] for i in built)
-    n_groups = len(built)
+    n_scans = len(built)
 
-    temporal = np.zeros((n_groups, max_options, max_steps, len(TEMPORAL_FEATURES)),
+    temporal = np.zeros((n_scans, max_options, max_steps, len(TEMPORAL_FEATURES)),
                         dtype=np.float32)
-    static = np.zeros((n_groups, max_options, len(static_features)), dtype=np.float32)
-    labels = np.zeros((n_groups, max_options), dtype=np.float32)
-    option_indices = np.full((n_groups, max_options), -1, dtype=np.int16)
-    option_mask = np.zeros((n_groups, max_options), dtype=bool)
-    time_mask = np.zeros((n_groups, max_steps), dtype=bool)
+    static = np.zeros((n_scans, max_options, len(static_features)), dtype=np.float32)
+    labels = np.zeros((n_scans, max_options), dtype=np.float32)
+    option_indices = np.full((n_scans, max_options), -1, dtype=np.int16)
+    option_mask = np.zeros((n_scans, max_options), dtype=bool)
+    time_mask = np.zeros((n_scans, max_steps), dtype=bool)
     for i, item in enumerate(built):
         n_options, n_steps = item["sequence"].shape[:2]
         temporal[i, :n_options, :n_steps] = item["sequence"]
@@ -249,7 +225,7 @@ def main() -> int:
         args.out, schema_version=np.array(2, dtype=np.int16),
         temporal=temporal, static=static, labels=labels,
         option_indices=option_indices, option_mask=option_mask, time_mask=time_mask,
-        group_ids=np.array([i["group_id"] for i in built]),
+        scan_ids=np.array([i["scan_id"] for i in built]),
         topology_ids=np.array([i["topology_id"] for i in built]),
         configured_n_aps=np.array([i["n_aps"] for i in built], dtype=np.int16),
         n_hotspots=np.array([i["n_hotspots"] for i in built], dtype=np.int16),
@@ -260,7 +236,7 @@ def main() -> int:
         scan_description=np.array(
             f"continuous all-channel observation, {args.start_s}-window_end s, "
             f"{args.bin_ms} ms bins; RSSI realism applied, no dwell restriction"))
-    print(f"wrote {n_groups} groups, {int(option_mask.sum())} options, "
+    print(f"wrote {n_scans} scans, {int(option_mask.sum())} options, "
           f"{max_steps} steps x {len(TEMPORAL_FEATURES)} features to {args.out}")
     return 0
 

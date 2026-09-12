@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
-"""Train the raw-frame transformer and compare it against the binned pipeline.
+"""Can a model read the raw frame trace and pick a better access point?
 
-Experiment A of the 2026-08-24 pair. The model receives the frame trace with no
-binning and no hand-built summary statistics: whether a learned encoder can
-recover what the feat_* columns supply is the question, and giving it those
-columns as well would answer a different one. --with-static exists only to
-measure that difference deliberately.
+Every other model in this project is handed a tidied-up view of what the client
+heard: either summary statistics, or measurements already bucketed into fixed
+time slices. This one is handed the frame list itself - one token per decoded
+802.11 frame, in the order the radio saw them - and has to work out for itself
+what is worth counting.
+
+The unit of data is a scan: one client standing in one place, the trace
+it recorded before it joined anything, and, for every access point it heard,
+the throughput it would have got had it joined that one.
+
+Two objectives are trained on the same architecture. The regression model
+predicts log1p of each option's throughput, so its scores read back as Mbps.
+The ranking model predicts a distribution over the options, weighted so that
+options close to the best count as near-ties; it orders the set without
+claiming its scores mean anything in Mbps. Both are reported against the
+heuristics a real client could run instead.
+
+By default the model sees only the trace. --with-static additionally hands it
+the hand-built feature vector, which turns the question from "can it learn a
+representation" into "does the trace add anything to the one we built by hand";
+the results file records which of the two was asked.
+
+Splits are by topology, never by scan: repeated observations of one
+deployment are near-copies, so letting them straddle a split inflates every
+number reported here.
 
 Run:
-  python scripts/train_frames.py data/combined_frames.npz \
-      --out-dir results/frames_rotating --repeats 5
+  .venv/bin/python3 scripts/train/train_frames.py data/v3_frames.npz \
+      --out-dir results_v3/frames --repeats 5
 """
 
 from __future__ import annotations
@@ -26,12 +46,22 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from models.data import MISSING_RSSI_SENTINEL  # noqa: E402
 from models.evaluate import (baseline_predictions, regression_metrics,  # noqa: E402
                              random_selection_metrics, selection_metrics)
-from models.frames import FrameCorpus, FrameSetTransformer, FrameStandardizer  # noqa: E402
+from models.frames import (REL_ON_CHANNEL, REL_SAME_BSS, FrameCorpus,  # noqa: E402
+                           FrameSetTransformer, FrameStandardizer)
+from models.temporal import MaskedStandardizer  # noqa: E402
 
 
+# Weight initialisation, held apart from the split seed so that the spread
+# across repeats measures the split alone; reuse a split seed here and the two
+# sources of variation can no longer be told apart.
 INIT_SEED = 9013
+
+# Mbps scale over which two options count as near-ties in the ranking target.
+# Fixed, not tuned: nothing in this script searches over it.
+RANK_TEMPERATURE = 5.0
 
 
 def observables(corpus: FrameCorpus) -> dict[str, np.ndarray]:
@@ -44,12 +74,13 @@ def observables(corpus: FrameCorpus) -> dict[str, np.ndarray]:
     names = corpus.frame_features
     rssi_i, dur_i, time_i = (names.index("rssi_dbm"), names.index("duration_log1p"),
                              names.index("time_fraction"))
-    n_groups, n_options = corpus.option_mask.shape
-    rssi = np.full((n_groups, n_options), -100.0, dtype=np.float64)
-    busy = np.zeros((n_groups, n_options), dtype=np.float64)
+    n_scans, n_options = corpus.option_mask.shape
+    # An option whose BSS sent nothing decodable keeps the out-of-range level
+    # the feature table uses for a missing reading, not a plausible one.
+    rssi = np.full((n_scans, n_options), MISSING_RSSI_SENTINEL, dtype=np.float64)
+    busy = np.zeros((n_scans, n_options), dtype=np.float64)
 
-    from models.frames import N_RELATIONS  # noqa: F401
-    for g in range(n_groups):
+    for g in range(n_scans):
         valid = corpus.frame_mask[g]
         if not valid.any():
             continue
@@ -60,10 +91,10 @@ def observables(corpus: FrameCorpus) -> dict[str, np.ndarray]:
         for o in range(n_options):
             if not corpus.option_mask[g, o]:
                 continue
-            from_bss = (rel[o] & 2) > 0
+            from_bss = (rel[o] & REL_SAME_BSS) > 0
             if from_bss.any():
                 rssi[g, o] = raw[from_bss, rssi_i].mean()
-            on_channel = (rel[o] & 1) > 0
+            on_channel = (rel[o] & REL_ON_CHANNEL) > 0
             if on_channel.any():
                 busy[g, o] = duration_us[on_channel].sum() / (span * 1e6)
     return {"feat_ap_rssi_mean": rssi, "feat_chan_cca_busy_frac": busy}
@@ -75,7 +106,7 @@ def flat_frame(corpus: FrameCorpus, indices: np.ndarray,
     for g in indices:
         for o in np.flatnonzero(corpus.option_mask[g]):
             row = {
-                "group_id": str(corpus.group_ids[g]),
+                "scan_id": str(corpus.scan_ids[g]),
                 "topology_id": str(corpus.topology_ids[g]),
                 "ap_index": int(corpus.option_indices[g, o]),
                 "label_throughput_mbps": float(corpus.labels[g, o]),
@@ -182,7 +213,7 @@ def train_one(corpus, frames, static, train_idx, val_idx, objective, seed,
                    "val_loss": best_key[1], "init_seed": seed}
 
 
-def main() -> int:
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path)
     parser.add_argument("--out-dir", type=Path, default=Path("results/frames"))
@@ -190,15 +221,18 @@ def main() -> int:
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--rank-temperature", type=float, default=5.0)
     parser.add_argument("--with-static", action="store_true",
-                        help="also give the model the hand-built feat_* vector; off by "
-                             "default because the point is whether the trace alone suffices")
-    args = parser.parse_args()
+                        help="also give the model the hand-built feat_* vector; the "
+                             "results file records this in its uses_static column")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     corpus = FrameCorpus.load(args.corpus)
-    print(f"groups={len(corpus.group_ids)} frames={corpus.frames.shape[1]} "
+    print(f"scans={len(corpus.scan_ids)} frames={corpus.frames.shape[1]} "
           f"features={corpus.frames.shape[-1]} options={int(corpus.option_mask.sum())}")
     derived = observables(corpus)
 
@@ -209,25 +243,26 @@ def main() -> int:
               f"test={len(test_idx)} ---", flush=True)
         val_frame = flat_frame(corpus, val_idx, derived)
         test_frame = flat_frame(corpus, test_idx, derived)
+        # k for the RSSI-minus-busy heuristic is fitted on TRAIN topologies only
+        train_frame = flat_frame(corpus, train_idx, derived)
 
         scaler = FrameStandardizer(corpus.frames[train_idx], corpus.frame_mask[train_idx])
         frames = scaler(corpus.frames) * corpus.frame_mask[:, :, None]
         if args.with_static:
-            valid = corpus.static[train_idx][corpus.option_mask[train_idx]]
-            mean, std = valid.mean(0), valid.std(0)
-            std[std < 1e-6] = 1.0
-            static = ((corpus.static - mean) / std).astype(np.float32)
+            static_scaler = MaskedStandardizer(
+                corpus.static[train_idx], corpus.option_mask[train_idx])
+            static = static_scaler(corpus.static)
         else:
+            # A zero-width static block: the model gets no hand-built features,
+            # and every call below still passes a correctly shaped array.
             static = np.zeros(corpus.static.shape[:2] + (0,), dtype=np.float32)
 
         predictions = {}
         for objective in ("regression", "ranking"):
             model, info = train_one(
                 corpus, frames, static, train_idx, val_idx, objective,
-                # fixed, and deliberately not derived from `repeat`: the split
-                # seed and the init seed must not be the same number
                 INIT_SEED, args.epochs, args.patience,
-                args.rank_temperature, args.batch_size, val_frame)
+                RANK_TEMPERATURE, args.batch_size, val_frame)
             scores = predict(model, frames, corpus, static, test_idx, args.batch_size)
             flat = flatten_scores(corpus, test_idx, scores)
             name = f"frame_transformer_{objective}"
@@ -241,8 +276,10 @@ def main() -> int:
                        args.out_dir / f"{name}_split{repeat}.pt")
 
         y_test = test_frame["label_throughput_mbps"].to_numpy()
-        for name, pred in {**baseline_predictions(test_frame), **predictions}.items():
-            row = {"split_seed": repeat, "model": name}
+        for name, pred in {**baseline_predictions(test_frame, fit_frame=train_frame),
+                           **predictions}.items():
+            row = {"split_seed": repeat, "model": name,
+                   "uses_static": args.with_static}
             row.update(random_selection_metrics(test_frame) if name == "random"
                        else selection_metrics(test_frame, pred))
             if name == "frame_transformer_regression":

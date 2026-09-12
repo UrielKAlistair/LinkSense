@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
-"""Does the set context earn its keep, or do the relative features do its job?
+"""Does letting the model see the rival access points earn its keep?
 
-The choice-set model can learn to compare options in two quite different
-ways, and they overlap:
+Choosing an access point is a comparison, so a model has to get the comparison
+from somewhere. There are two places it can come from, and this script exists
+because they overlap.
 
-  * feat_rel_* columns hand-compute the comparison (RSSI rank, margin over
-    the best other AP, share of observed airtime), so even a model that
-    scores each option in isolation is handed the context.
-  * the set encoder pools across the options and conditions each score on
-    that pooling, learning the comparison instead.
+The first is the feature table. Some of its columns are already comparative -
+this AP's rank by signal strength among the ones on offer, how far its signal
+sits above the next best, its share of the airtime being used. A model that
+looks at one option at a time is still handed the comparison, precomputed, in
+those columns.
 
-This runs the full 2x2 needed to separate them: set context on/off, relative
-features present/removed. The interesting cell is bottom-left - no relative
-features, context on - which shows whether the architecture can recover by
-itself what the hand engineering supplies.
+The second is the architecture. The set encoder pools across all the options in
+a scan and conditions each option's score on that pool, so it can work
+the comparison out for itself.
 
-Run:  python scripts/ablation_context.py data/dataset.csv --repeats 3
+Give a model both and neither gets the credit. So this runs all four
+combinations: comparative columns kept or dropped, set encoder on or off. The
+cell that answers the question is the one with the columns dropped and the
+encoder on - if it holds up, the architecture recovers on its own what the hand
+engineering was supplying, and the hand engineering can go.
+
+The two architectures have the same number of parameters: switching the encoder
+off feeds zeros into the same score head rather than making a smaller network,
+so a difference between them cannot be a difference in capacity.
+
+Run:
+  .venv/bin/python3 scripts/train/ablation_context.py data/v3_dataset.csv \
+      --out results_v3/ablation_context.json
 """
 
 from __future__ import annotations
@@ -31,29 +43,30 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from models.data import feature_columns, impute_features, load_dataset, split_by_group  # noqa: E402
-from models.evaluate import selection_metrics  # noqa: E402
-from models.ranker import (SetRanker, Standardizer, make_groups, predict_rows,  # noqa: E402
+from models.data import feature_columns, impute_features, load_dataset, split_by_topology  # noqa: E402
+from models.evaluate import selection_metrics, validation_selection_key  # noqa: E402
+from models.ranker import (SetRanker, Standardizer, pack_scans, predict_rows,  # noqa: E402
                            train as train_ranker)
+from scripts.train.train_eval import RANKER_OBJECTIVES  # noqa: E402
 
 
 def run_cell(df, feats, use_context, seed, epochs, patience):
-    train, val, test = split_by_group(df, seed=seed)
+    """Train one cell of the 2x2 and return its test-set decision metrics."""
+    train, val, test = split_by_topology(df, seed=seed)
     scaler = Standardizer(train[feats].to_numpy(dtype=np.float32))
-    tr, va, te = (make_groups(d, feats, scaler) for d in (train, val, test))
+    tr, va, te = (pack_scans(d, feats, scaler) for d in (train, val, test))
 
     best = ((np.inf, np.inf), None)
-    for alpha, temp in ((0.3, 5.0), (0.7, 2.0), (0.7, 5.0),
-                        (0.7, 10.0), (0.9, 5.0)):
+    # The same five objective settings scripts/train/train_eval.py searches, so
+    # the two cells that both scripts measure stay comparable.
+    for alpha, temp in RANKER_OBJECTIVES:
         torch.manual_seed(seed)
         m = SetRanker(len(feats), dropout=0.1, use_context=use_context)
         m = train_ranker(m, tr, va, epochs=epochs, lr=3e-3, weight_decay=1e-3,
                          alpha=alpha, temperature=temp, seed=seed, verbose=False,
                          patience=patience)
         p = np.expm1(np.clip(predict_rows(m, va, len(val)), -5, 12))
-        sm = selection_metrics(val, p)
-        regret = sm.get("topology_mean_regret_mbps", sm["mean_regret_mbps"])
-        key = (regret, -sm["mean_spearman"])
+        key = validation_selection_key(val, p)
         if key < best[0]:
             best = (key, m)
     model = best[1]
@@ -64,7 +77,9 @@ def run_cell(df, feats, use_context, seed, epochs, patience):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=5,
+                        help="independent topology splits; matches train_eval.py so "
+                             "the shared cells can be compared row for row")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--out", type=Path, default=Path("results/ablation_context.json"))
@@ -108,7 +123,8 @@ def main():
                        label="tab:ablation")
     args.out.with_suffix(".tex").write_text(tex)
     print(f"\nwrote {args.out} and {args.out.with_suffix('.tex')}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

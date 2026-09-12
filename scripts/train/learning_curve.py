@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
-"""Measure whether tabular AP-selection models are still data-limited.
+"""Would generating more deployments still make the models better?
 
-The test partition is fixed within each repeat. Increasing fractions draw
-stratified subsets from that repeat's training topologies, always keeping all
-five ns-3 seed realizations of a selected topology. Models and hyperparameters
-are fixed so improvement reflects added data rather than a larger tuning search.
+Simulating a new deployment is expensive, so before paying for more of them it
+is worth knowing whether the models have stopped improving on the ones already
+there. This script answers that by training on deliberately reduced slices of
+the data and watching what the reduction costs.
+
+For each repeat it draws one split, holds the test partition fixed, and then
+trains on 12.5%, 25%, 50% and finally 100% of that repeat's training
+topologies. Subsets are nested and drawn separately within each AP count, so a
+smaller slice is always contained in the larger one and no deployment size
+disappears. A topology is taken whole: every scan recorded at that
+deployment moves together, since they are near-copies of each other and
+splitting them would leak.
+
+Models and hyperparameters are fixed rather than tuned per slice, so the curve
+measures what the extra data bought and not what a wider search bought. The
+heuristics are reported at zero training data as a flat reference line.
+
+A curve that is still falling at 100% says more deployments would help. One
+that has flattened says the next simulation run buys little, and the money is
+better spent elsewhere.
 
 Run:
-  python scripts/learning_curve.py data/dataset.csv --out results/learning_curve.csv
+  .venv/bin/python3 scripts/train/learning_curve.py data/v3_dataset.csv \
+      --out results_v3/learning_curve.csv
 """
 
 from __future__ import annotations
@@ -21,13 +38,19 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from models.data import (feature_columns, group_sample_weights, impute_features,  # noqa: E402
-                         load_dataset, split_by_group, to_xy)
+from models.data import (feature_columns, scan_sample_weights, impute_features,  # noqa: E402
+                         load_dataset, split_by_topology, to_xy)
 from models.evaluate import baseline_predictions, selection_metrics  # noqa: E402
 
 
 def subset_topologies(train: pd.DataFrame, fraction: float, seed: int) -> pd.DataFrame:
-    """Nested, AP-count-stratified subset of physical training topologies."""
+    """Nested, AP-count-stratified subset of physical training topologies.
+
+    Every scan belonging to a selected topology comes along with it. The
+    permutation depends only on `seed`, so calling this with a larger fraction
+    and the same seed returns a superset; change that and the curve stops
+    comparing like with like.
+    """
     topology = train.groupby("topology_id", sort=True).first().reset_index()
     rng = np.random.default_rng(seed)
     selected = []
@@ -48,7 +71,7 @@ def fit_models(train: pd.DataFrame, test: pd.DataFrame,
 
     X_train, y_train = to_xy(train, features)
     X_test, _ = to_xy(test, features)
-    weights = group_sample_weights(train)
+    weights = scan_sample_weights(train)
     specifications = {
         "ridge_linear": (
             make_pipeline(StandardScaler(), Ridge(alpha=100.0)), False),
@@ -73,25 +96,31 @@ def fit_models(train: pd.DataFrame, test: pd.DataFrame,
     return predictions
 
 
-def main() -> int:
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--out", type=Path, default=Path("results/learning_curve.csv"))
-    parser.add_argument("--fractions", default="0.125,0.25,0.5,1.0")
+    parser.add_argument("--fractions", type=float, nargs="+",
+                        default=[0.125, 0.25, 0.5, 1.0],
+                        help="shares of the training topologies to train on")
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
+    if any(not 0 < value <= 1 for value in args.fractions):
+        parser.error("--fractions must lie in (0, 1]")
+    args.fractions = sorted(set(args.fractions))
+    return args
 
-    fractions = [float(value) for value in args.fractions.split(",")]
-    if not fractions or any(not 0 < value <= 1 for value in fractions):
-        parser.error("--fractions must be comma-separated values in (0, 1]")
-    fractions = sorted(set(fractions))
+
+def main() -> int:
+    args = parse_args()
+    fractions = args.fractions
 
     frame = impute_features(load_dataset(args.dataset))
     features = feature_columns(frame)
     rows = []
     for repeat in range(args.repeats):
-        full_train, _, test = split_by_group(frame, seed=repeat)
-        for name, prediction in baseline_predictions(test).items():
+        full_train, _, test = split_by_topology(frame, seed=repeat)
+        for name, prediction in baseline_predictions(test, fit_frame=full_train).items():
             if name == "random":
                 continue
             rows.append({
@@ -110,7 +139,7 @@ def main() -> int:
                     "split_seed": repeat,
                     "train_fraction": fraction,
                     "train_topologies": train.topology_id.nunique(),
-                    "train_groups": train.group_id.nunique(),
+                    "train_groups": train.scan_id.nunique(),
                     "model": name,
                     **selection_metrics(test, prediction),
                 })
@@ -120,28 +149,30 @@ def main() -> int:
     result = pd.DataFrame(rows)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(args.out, index=False)
-    learned = result[result.model.isin(["ridge_linear", "hist_gbr", "random_forest"])]
+    # Only the trained rows form the curve; the heuristics sit at fraction 0.
+    learned = result[result.train_fraction > 0]
     summary = learned.groupby(["model", "train_fraction", "train_topologies"])[
         ["mean_regret_mbps", "topology_mean_regret_mbps"]].agg(["mean", "std"])
     print("\n=== learning curve: held-out regret (Mbps) ===")
     print(summary.round(3).to_string())
 
+    # The last step of the curve is the one that answers the question, so it is
+    # printed on its own. A single fraction has no step to report.
     if len(fractions) >= 2:
         previous, final = fractions[-2:]
         means = learned.groupby(["model", "train_fraction"])[
             "topology_mean_regret_mbps"].mean().unstack()
-        if previous in means and final in means:
-            delta = pd.DataFrame({
-                "previous_fraction": previous,
-                "final_fraction": final,
-                "previous_regret": means[previous],
-                "final_regret": means[final],
-                "improvement_mbps": means[previous] - means[final],
-            })
-            delta["improvement_fraction"] = (
-                delta.improvement_mbps / delta.previous_regret.replace(0, np.nan))
-            print("\n=== final learning-curve step (topology-balanced) ===")
-            print(delta.round(3).to_string())
+        delta = pd.DataFrame({
+            "previous_fraction": previous,
+            "final_fraction": final,
+            "previous_regret": means[previous],
+            "final_regret": means[final],
+            "improvement_mbps": means[previous] - means[final],
+        })
+        delta["improvement_fraction"] = (
+            delta.improvement_mbps / delta.previous_regret.replace(0, np.nan))
+        print("\n=== final learning-curve step (topology-balanced) ===")
+        print(delta.round(3).to_string())
     print(f"\nwrote {args.out}")
     return 0
 

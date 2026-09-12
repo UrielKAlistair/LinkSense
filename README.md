@@ -233,21 +233,23 @@ stopped. Treat 10 GB as a safety ceiling, not a generation target.
 Simulator 1 intentionally exposes only the scenario choices needed by the
 matched-set experiment. The main sweep uses 2, 3, 4, 6, or 8 APs at 30 m
 spacing. Two APs form one pair, three form an equilateral triangle, and the
-even counts use regular 2x2, 3x2, and 4x2 grids. Channels 36, 40, 44, and 48
-are assigned in AP-index order and reused only beyond four APs. Packet size,
+even counts use regular 2x2, 3x2, and 4x2 grids. Each AP draws its channel
+independently and uniformly from 36, 40, 44, and 48, so two APs may share one
+and a deployment of eight may occupy fewer than four. Packet size,
 propagation, traffic start, candidate join time, observation guard, simulation
 stop, and candidate saturation load are fixed in `sim/my-wifi-test.cc` rather
 than exposed as incidental sweep parameters.
 
 The number of crowded station regions is sampled rather than fixed. A quarter
 of topologies have no hotspot. The rest favor one hotspot but may contain more,
-capped at `min(3, ceil(nAPs / 3))`: at most one for 2/3 APs, two for 4/6 APs,
+capped at `ceil(nAPs / 3)`: at most one for 2/3 APs, two for 4/6 APs,
 and three for 8 APs. When enabled, 70% of background stations are drawn across
 the selected 10 m hotspot discs; the rest are uniform over the deployment.
 
 The candidate always uses absolute `(x, y)` coordinates, so changing
 `targetAP` cannot move it. `topologySeed` controls only background-station
-placement; `rngSeed` controls ns-3's fading, contention, and rate-control
+placement, per-AP channel choice, and per-station offered load; `rngSeed`
+controls ns-3's fading, contention, and rate-control
 randomness. Consequently the default five seeds per topology preserve the
 physical deployment while repeating its stochastic radio behaviour.
 

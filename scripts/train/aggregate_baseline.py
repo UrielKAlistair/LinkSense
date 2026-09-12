@@ -1,31 +1,21 @@
 #!/usr/bin/env python3
-"""Tabular models given exactly the same observation as the transformer.
+"""Tabular models given exactly the observation the transformer sees.
 
-The headline comparison in results/combined_* is confounded: the feat_*
-columns are aggregates of a 110 ms single-radio sweep, while the temporal
-transformer trained on data/combined_continuous.npz sees the full 5.5 s
-all-channel window. A win there could be representation OR simply more data,
-and the two cannot be separated.
+Comparing a transformer against models built on summary features confounds two
+things: the architecture, and the fact that the two are fed different data. This
+script removes the second. It reads the same binned corpus the transformer
+trains on, reduces each option to a feature vector, and fits ordinary tabular
+models on identical topology splits. Any remaining gap is representation.
 
-This script removes the confound by aggregating the *continuous* corpus down
-to per-option feature vectors and training ordinary tabular models on them.
-Every model here sees precisely the observation the transformer saw, on
-precisely the same topology splits, so any remaining difference is
-attributable to representation alone.
+Three encodings, in increasing faithfulness to the raw sequence:
 
-Three input encodings, in increasing faithfulness to the raw sequence:
-
-  mean   the 34 channel/option measurements averaged over the window. The
-         direct analogue of what feat_* does, but over the full observation.
-  rich   mean, std, min, max, last and linear slope of each measurement.
-         What a careful engineer would hand-build if given the whole window.
-  flat   the entire 55 x 34 sequence flattened, order preserved. No
-         aggregation at all - the tabular model gets the same numbers the
-         transformer does, just without an architecture that exploits them.
+  mean   every per-bin measurement averaged over the window
+  rich   mean, std, min, max, last value and linear slope of each measurement
+  flat   the whole sequence flattened, order preserved and nothing aggregated
 
 Run:
-  python scripts/aggregate_baseline.py data/combined_continuous.npz \
-      --out-dir results/combined_aggregate
+  python scripts/train/aggregate_baseline.py data/v3_temporal.npz \
+      --out-dir results_v3/aggregate
 """
 
 from __future__ import annotations
@@ -50,13 +40,13 @@ from scripts.train.train_temporal import _flat_frame, _flatten_scores  # noqa: E
 def build_inputs(corpus: TemporalCorpus, encoding: str) -> np.ndarray:
     """(groups, options, features) under one of the three encodings."""
     temporal = corpus.temporal
-    n_groups, n_options, n_steps, n_features = temporal.shape
+    n_scans, n_options, n_steps, n_features = temporal.shape
     valid = corpus.time_mask[:, None, :, None]          # (G,1,T,1)
     counts = corpus.time_mask.sum(axis=1)[:, None, None].astype(np.float32)
 
     if encoding == "flat":
         # Zero the padded tails so absent bins cannot masquerade as readings.
-        return (temporal * valid).reshape(n_groups, n_options, n_steps * n_features)
+        return (temporal * valid).reshape(n_scans, n_options, n_steps * n_features)
 
     masked = np.where(valid, temporal, np.nan)
     mean = np.nanmean(masked, axis=2)
@@ -68,10 +58,10 @@ def build_inputs(corpus: TemporalCorpus, encoding: str) -> np.ndarray:
     hi = np.nan_to_num(np.nanmax(masked, axis=2))
     last = np.stack([
         temporal[g, :, np.flatnonzero(corpus.time_mask[g])[-1], :]
-        for g in range(n_groups)])
+        for g in range(n_scans)])
     # Least-squares slope per option per feature, computed on valid bins only.
     slope = np.zeros_like(mean)
-    for g in range(n_groups):
+    for g in range(n_scans):
         idx = np.flatnonzero(corpus.time_mask[g])
         t = (idx - idx.mean()).astype(np.float32)
         denom = float((t ** 2).sum()) or 1.0
@@ -158,7 +148,7 @@ def fit_mlp(X, y, mask, train_idx, val_idx, test_idx, seed, epochs, patience):
     return np.expm1(np.clip(scores, -5, 10))
 
 
-def main() -> int:
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path)
     parser.add_argument("--out-dir", type=Path, default=Path("results/aggregate"))
@@ -168,11 +158,15 @@ def main() -> int:
     parser.add_argument("--encodings", nargs="+", default=["mean", "rich", "flat"])
     parser.add_argument("--contrast", action="store_true",
                         help="append peer-mean and deviation-from-peer-mean features")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     corpus = TemporalCorpus.load(args.corpus)
-    print(f"groups={len(corpus.group_ids)} shape={corpus.temporal.shape}")
+    print(f"scans={len(corpus.scan_ids)} shape={corpus.temporal.shape}")
     encoded = {name: build_inputs(corpus, name) for name in args.encodings}
     if args.contrast:
         encoded = {k: add_contrast(v, corpus.option_mask) for k, v in encoded.items()}
@@ -212,7 +206,7 @@ def main() -> int:
             print(f"    gbr_{name:5s} top1={row['top1_accuracy']:.3f} "
                   f"regret={row['mean_regret_mbps']:.3f} r2={row['r2']:.3f}")
 
-        for name, pred in baseline_predictions(test_frame).items():
+        for name, pred in baseline_predictions(test_frame, _flat_frame(corpus, train_idx)).items():
             row = {"split_seed": seed, "model": name}
             row.update(random_selection_metrics(test_frame) if name == "random"
                        else selection_metrics(test_frame, pred))

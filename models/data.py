@@ -1,17 +1,20 @@
 """Dataset loading, splitting and leakage control for AP selection.
 
-The dataset is a choice set: rows sharing a group_id describe one physical
-situation, one row per AP the client could join. Two rules follow from that
-and are enforced here rather than left to each model:
+Rows sharing a scan_id are one decision: one row per AP the client could have
+joined, from one place it stood. Two rules follow, enforced here rather than
+left to each model:
 
   1. Only feat_* columns may be model inputs. gt_* columns are simulator
-     ground truth (true distance, true offered load, seeds) that a real
-     station cannot observe before associating; label_* is the answer.
+     ground truth (true distance, true offered load, seeds) a real station
+     cannot observe before associating; label_* is the answer.
      feature_columns() is the single definition of "what the model sees".
 
-  2. Splits are by GROUP, never by row. Rows in a group share one
-     pre-association observation, so splitting rows would put near-copies
-     of a test observation into training and report an optimistic score.
+  2. Splits are by TOPOLOGY, never by row and never by scan. One topology is
+     scanned several times over the same deployment, so its scans are
+     near-copies; putting one in training and another in test reports a score
+     inflated by memorisation rather than prediction. split_by_topology() and
+     split_rows_by_topology() are the only entry points that produce a split,
+     and neither falls back to a finer unit.
 """
 
 from __future__ import annotations
@@ -20,30 +23,37 @@ import numpy as np
 import pandas as pd
 
 LABEL_COL = "label_throughput_mbps"
-GROUP_COL = "group_id"
+SCAN_COL = "scan_id"
 OPTION_COL = "ap_index"
+TOPOLOGY_COL = "topology_id"
 
-# The dataset builder excludes APs that were not discovered during the scan,
-# but RSSI-derived values can still be missing when a statistic needs more
-# samples than the scan captured. This out-of-range level remains a defensive
-# imputation value for absolute dBm columns.
+# Fewest topologies that can put one in validation, one in test and still
+# leave a training majority. Below this a split is not meaningful and both
+# split entry points refuse rather than return a degenerate partition.
+MIN_TOPOLOGIES = 5
+
+# Fill value for an absolute signal level (dBm) that the scan did not
+# measure. Filling a level with 0.0 like every other column would assert the
+# strongest signal physically possible and make the missing AP the preferred
+# choice; this level sits below the simulated noise floor of about -94 dBm,
+# so a missing AP sorts last instead. It is the only out-of-range level in
+# the repo - evaluate.py fills the same columns with the same value.
 MISSING_RSSI_SENTINEL = -100.0
 
 
 def _is_rssi_level(col: str) -> bool:
-    """True only for columns that are an absolute signal level in dBm.
+    """True for feature columns holding an absolute signal level in dBm.
 
-    The sentinel above is well formed for a LEVEL: the simulated noise floor
-    is about -94 dBm, so -100 is off the bottom of the physical scale and
-    points in the right direction.
+    Excluded are the other columns whose names contain "rssi" but whose
+    values are not levels: a standard deviation (never negative), and the
+    margins, differences, ranks and shares that compare one AP against the
+    others in its scan. Filling any of those with the level sentinel
+    would insert a value far outside their real range, which then dominates
+    the standardiser that ranker.py fits.
 
-    None of that holds for the other columns whose names happen to contain
-    "rssi". A standard deviation lives in [0, inf), so -100 is not extreme
-    there but impossible. A margin or a difference has a real range of
-    roughly +/-40 dB, so -100 asserts a measurement that never happened and
-    is 2.5x larger than anything real - which then dominates the standardiser
-    the MLP fits, squashing every genuine value into a fraction of a sigma.
-    Those get a neutral 0.0 instead.
+    Maintainers adding a feat_*rssi* column must check which side it falls
+    on: a new name matching none of the excluded keywords is treated as a
+    level by default.
     """
     if "rssi" not in col:
         return False
@@ -61,17 +71,20 @@ def ground_truth_columns(df: pd.DataFrame) -> list[str]:
 
 def load_dataset(csv_path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    missing = {LABEL_COL, GROUP_COL, OPTION_COL} - set(df.columns)
+    missing = {LABEL_COL, SCAN_COL, OPTION_COL} - set(df.columns)
     if missing:
         raise ValueError(f"dataset missing required columns: {missing}")
     return df
 
 
 def impute_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Give missing feature values a defined value so any model can consume them.
+    """Return a copy in which no feat_* column contains NaN.
 
-    Tree ensembles could take the NaNs directly, but the MLP cannot, and
-    using one imputed frame everywhere keeps the comparison honest.
+    Signal levels are filled with MISSING_RSSI_SENTINEL and every other
+    feature with 0.0. Tree ensembles accept NaN and the neural models do
+    not, so imputing once here means every model is fitted on identical
+    inputs. Callers that skip this step and hand a NaN to ranker.py or
+    temporal.py get NaN scores and a metric that refuses them.
     """
     df = df.copy()
     feats = feature_columns(df)
@@ -83,58 +96,111 @@ def impute_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def split_by_group(df: pd.DataFrame, val_frac: float = 0.2, test_frac: float = 0.2,
-                   seed: int = 0) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Partition whole choice sets, and repeated seeds of a topology together."""
-    split_col = "topology_id" if "topology_id" in df.columns else GROUP_COL
-    group_frame = df.groupby(split_col, sort=True).first().reset_index()
-    groups = group_frame[split_col].to_numpy()
-    if len(groups) < 5:
+def split_by_topology(df: pd.DataFrame, val_frac: float = 0.2, test_frac: float = 0.2,
+                      seed: int = 0) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Partition a flat dataframe into train/val/test whole topologies.
+
+    Every row of a topology lands in exactly one part, so no repeated seed of
+    a deployment is ever split across the boundary. Raises if the frame has
+    no topology_id: a frame that cannot be split safely must fail loudly
+    rather than be split by some finer unit.
+    """
+    if TOPOLOGY_COL not in df.columns:
         raise ValueError(
-            f"at least 5 independent {split_col} values are required for a 60/20/20 split; "
-            f"found {len(groups)}")
-    strata = group_frame["gt_n_aps"].to_numpy() if "gt_n_aps" in group_frame else None
-    train_groups, val_groups, test_groups = partition_groups(
-        groups, strata, val_frac, test_frac, seed)
-    sets = {"train": set(train_groups), "val": set(val_groups), "test": set(test_groups)}
-    out = tuple(df[df[split_col].isin(sets[k])].reset_index(drop=True)
-                for k in ("train", "val", "test"))
-    assert not (sets["train"] & sets["val"]) and not (sets["train"] & sets["test"])
-    return out
+            f"dataset has no {TOPOLOGY_COL} column, so it cannot be split without "
+            "risking repeated seeds of one deployment landing in two parts")
+    topology_frame = df.groupby(TOPOLOGY_COL, sort=True).first().reset_index()
+    topologies = topology_frame[TOPOLOGY_COL].to_numpy()
+    if len(topologies) < MIN_TOPOLOGIES:
+        raise ValueError(
+            f"at least {MIN_TOPOLOGIES} independent {TOPOLOGY_COL} values are "
+            f"required for a 60/20/20 split; found {len(topologies)}")
+    strata = (topology_frame["gt_n_aps"].to_numpy()
+              if "gt_n_aps" in topology_frame else None)
+    parts = partition_ids(topologies, strata, val_frac, test_frac, seed)
+    _assert_disjoint(parts)
+    return tuple(df[df[TOPOLOGY_COL].isin(set(part))].reset_index(drop=True)
+                 for part in parts)
 
 
-def partition_groups(groups: np.ndarray, strata: np.ndarray | None,
-                     val_frac: float, test_frac: float, seed: int
-                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Split group identifiers, stratifying only when every stratum is viable."""
-    groups = np.asarray(groups)
-    rng = np.random.default_rng(seed)
+def split_rows_by_topology(topology_ids: np.ndarray, strata: np.ndarray | None,
+                           val_frac: float = 0.2, test_frac: float = 0.2,
+                           seed: int = 0
+                           ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The same split for an array corpus: positions into a per-scan axis.
+
+    `topology_ids` and `strata` are both indexed by scan, so a topology that
+    appears in several scans contributes each of them to whichever part it
+    lands in. Returns train, val and test positions into that axis, which is
+    what temporal.py and frames.py index their arrays by.
+    """
+    topology_ids = np.asarray(topology_ids)
+    topologies = np.unique(topology_ids)
+    if len(topologies) < MIN_TOPOLOGIES:
+        raise ValueError(
+            f"at least {MIN_TOPOLOGIES} independent topologies are required for "
+            f"a 60/20/20 split; found {len(topologies)}")
+    per_topology_strata = None
     if strata is not None:
         strata = np.asarray(strata)
-        counts = pd.Series(strata).value_counts()
-    else:
-        counts = pd.Series(dtype=int)
+        first_group = [np.flatnonzero(topology_ids == t)[0] for t in topologies]
+        per_topology_strata = strata[first_group]
+    parts = partition_ids(topologies, per_topology_strata, val_frac, test_frac, seed)
+    _assert_disjoint(parts)
+    return tuple(np.flatnonzero(np.isin(topology_ids, part)) for part in parts)
 
-    # Five members are the minimum that can place one in validation, one in
-    # test, and retain a training majority. Tiny pilots use the unstratified
-    # fallback rather than deleting a rare AP count from training.
-    if len(counts) and counts.min() >= 5:
-        partitions = {"train": [], "val": [], "test": []}
+
+def _assert_disjoint(parts: tuple[np.ndarray, ...]) -> None:
+    """Fail if any identifier reached two parts.
+
+    partition_ids builds disjoint parts by construction, so this only fires
+    if that function is changed incorrectly - which is the one bug in this
+    file that would not show up as an error anywhere, only as scores that
+    are too good. Kept as a real check rather than an assert so that running
+    under python -O cannot switch it off.
+    """
+    names = ("train", "val", "test")
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts)):
+            shared = set(parts[i]) & set(parts[j])
+            if shared:
+                raise AssertionError(
+                    f"{names[i]} and {names[j]} share {len(shared)} identifiers: "
+                    f"{sorted(shared)[:5]}")
+
+
+def partition_ids(ids: np.ndarray, strata: np.ndarray | None,
+                  val_frac: float, test_frac: float, seed: int
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Shuffle identifiers into train/val/test, stratifying when it is viable.
+
+    `ids` are the units being split - topology identifiers everywhere in this
+    repo - and `strata` is a parallel array of the value to balance across
+    the three parts, or None to skip balancing. Stratification is skipped
+    when any stratum has fewer than MIN_TOPOLOGIES members, because taking
+    one for validation and one for test out of a stratum that small leaves
+    too little of it to train on.
+    """
+    ids = np.asarray(ids)
+    rng = np.random.default_rng(seed)
+    counts = (pd.Series(np.asarray(strata)).value_counts()
+              if strata is not None else pd.Series(dtype=int))
+
+    def cut(members: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        members = members[rng.permutation(len(members))]
+        n_val = max(1, round(len(members) * val_frac))
+        n_test = max(1, round(len(members) * test_frac))
+        return (members[n_val + n_test:], members[:n_val],
+                members[n_val:n_val + n_test])
+
+    if len(counts) and counts.min() >= MIN_TOPOLOGIES:
+        strata = np.asarray(strata)
+        parts = ([], [], [])
         for value in sorted(counts.index):
-            members = groups[strata == value]
-            members = members[rng.permutation(len(members))]
-            n_val = max(1, int(round(len(members) * val_frac)))
-            n_test = max(1, int(round(len(members) * test_frac)))
-            partitions["val"].extend(members[:n_val])
-            partitions["test"].extend(members[n_val:n_val + n_test])
-            partitions["train"].extend(members[n_val + n_test:])
-        return tuple(np.asarray(partitions[name]) for name in ("train", "val", "test"))
-
-    permuted = groups[rng.permutation(len(groups))]
-    n_val = int(len(groups) * val_frac)
-    n_test = int(len(groups) * test_frac)
-    return (permuted[n_val + n_test:], permuted[:n_val],
-            permuted[n_val:n_val + n_test])
+            for part, members in zip(parts, cut(ids[strata == value])):
+                part.extend(members)
+        return tuple(np.asarray(part) for part in parts)
+    return cut(ids)
 
 
 def to_xy(df: pd.DataFrame, feature_cols: list[str]):
@@ -143,15 +209,17 @@ def to_xy(df: pd.DataFrame, feature_cols: list[str]):
     return X, y
 
 
-def group_sample_weights(df: pd.DataFrame) -> np.ndarray:
+def scan_sample_weights(df: pd.DataFrame) -> np.ndarray:
     """Per-row weights giving every AP-choice decision equal total weight.
 
-    Without this, a group with seven discovered APs contributes 3.5 times the
-    regression loss of a two-option group even though both count as one
-    decision in the headline metrics. Scaling to mean one keeps estimator
-    regularisation parameters on their usual numerical scale.
+    A row's weight is the reciprocal of its scan's size, so an
+    eight-option scan and a two-option scan contribute the same total to a
+    regression loss even though one has four times the rows - matching the
+    headline metrics, which count each scan once. The weights are then
+    scaled to mean one, which keeps an estimator's regularisation parameters
+    on the numerical scale they were tuned for.
     """
-    group_size = df.groupby(GROUP_COL)[GROUP_COL].transform("size").to_numpy()
+    group_size = df.groupby(SCAN_COL)[SCAN_COL].transform("size").to_numpy()
     weights = 1.0 / group_size
     return (weights / weights.mean()).astype(np.float64)
 

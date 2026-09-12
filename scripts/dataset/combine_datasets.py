@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""Combine compatible tabular CSVs or temporal NPZ corpora.
+"""Merge independently generated sweeps into one dataset.
 
-Every input must have the same schema and globally unique topology/group IDs.
-Temporal inputs may have different padded option/time dimensions; valid values
-are copied into the largest required shape before concatenation.
+Sweeps run at different times, or on different machines, produce separate
+tables over disjoint topologies. This joins them without reshaping anything:
+schemas must already match, and topology IDs must not collide, since a
+repeated ID would put the same physical deployment on both sides of a split.
+
+Padded NPZ corpora may differ in their option and time dimensions. Valid
+values are copied into the largest required shape, so the padding grows and
+no real value moves.
+
+This never splits anything. Train/validation/test partitioning happens at
+training time, by topology, in models/data.py.
 
 Run:
-  python scripts/combine_datasets.py data/a.csv data/b.csv --out data/all.csv
-  python scripts/combine_datasets.py data/a.npz data/b.npz --out data/all.npz
+  python scripts/dataset/combine_datasets.py data/a.csv data/b.csv --out data/all.csv
+  python scripts/dataset/combine_datasets.py data/a.npz data/b.npz --out data/all.npz
 """
 
 from __future__ import annotations
@@ -27,26 +35,30 @@ def combine_csv(paths: list[Path], out: Path) -> None:
             raise ValueError(f"{path}: columns or column order do not match the first input")
 
     combined = pd.concat(frames, ignore_index=True)
-    for column in ("topology_id", "group_id", "run_id"):
+
+    # A topology appearing in two inputs would be split across train and test.
+    seen: set = set()
+    overlap: set = set()
+    for frame in frames:
+        current = set(frame["topology_id"])
+        overlap |= seen & current
+        seen |= current
+    if overlap:
+        raise ValueError(f"duplicate topology IDs across inputs: {sorted(overlap)[:10]}")
+
+    # Scan and run IDs must stay nested inside one topology, or splitting by
+    # topology no longer separates the scans.
+    for column in ("scan_id", "run_id"):
         if column not in combined:
             continue
         owners = combined.groupby(column, dropna=False)["topology_id"].nunique()
-        if column == "topology_id":
-            overlap = set()
-            seen = set()
-            for frame in frames:
-                current = set(frame[column])
-                overlap |= seen & current
-                seen |= current
-            if overlap:
-                raise ValueError(f"duplicate topology IDs across inputs: {sorted(overlap)[:10]}")
-        elif (owners > 1).any():
+        if (owners > 1).any():
             raise ValueError(f"{column} maps to more than one topology")
 
-    combined = combined.sort_values(["topology_id", "group_id", "ap_index"])
+    combined = combined.sort_values(["topology_id", "scan_id", "ap_index"])
     out.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(out, index=False)
-    print(f"wrote {len(combined)} rows, {combined.group_id.nunique()} groups, "
+    print(f"wrote {len(combined)} rows, {combined.scan_id.nunique()} scans, "
           f"{combined.topology_id.nunique()} topologies to {out}")
 
 
@@ -85,13 +97,13 @@ def combine_npz(paths: list[Path], out: Path) -> None:
                   "option_mask", "time_mask")
     padded = {key: [] for key in array_keys}
     for corpus in corpora:
-        groups, options, steps, _ = corpus["temporal"].shape
-        temporal = np.zeros((groups, max_options, max_steps, n_temporal), np.float32)
-        static = np.zeros((groups, max_options, n_static), np.float32)
-        labels = np.zeros((groups, max_options), np.float32)
-        indices = np.full((groups, max_options), -1, np.int16)
-        option_mask = np.zeros((groups, max_options), bool)
-        time_mask = np.zeros((groups, max_steps), bool)
+        scans, options, steps, _ = corpus["temporal"].shape
+        temporal = np.zeros((scans, max_options, max_steps, n_temporal), np.float32)
+        static = np.zeros((scans, max_options, n_static), np.float32)
+        labels = np.zeros((scans, max_options), np.float32)
+        indices = np.full((scans, max_options), -1, np.int16)
+        option_mask = np.zeros((scans, max_options), bool)
+        time_mask = np.zeros((scans, max_steps), bool)
 
         temporal[:, :options, :steps] = corpus["temporal"]
         static[:, :options] = corpus["static"]
@@ -103,18 +115,18 @@ def combine_npz(paths: list[Path], out: Path) -> None:
                                            option_mask, time_mask)):
             padded[key].append(value)
 
-    vector_keys = ("group_ids", "topology_ids", "configured_n_aps",
+    vector_keys = ("scan_ids", "topology_ids", "configured_n_aps",
                    "n_hotspots", "candidate_strata")
     payload = {key: np.concatenate(values) for key, values in padded.items()}
     payload.update({key: np.concatenate([corpus[key] for corpus in corpora])
                     for key in vector_keys})
     payload.update({key: corpora[0][key] for key in constant_keys})
 
-    if len(set(payload["group_ids"].tolist())) != len(payload["group_ids"]):
-        raise ValueError("duplicate temporal group IDs across inputs")
+    if len(set(payload["scan_ids"].tolist())) != len(payload["scan_ids"]):
+        raise ValueError("duplicate scan IDs across inputs")
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, **payload)
-    print(f"wrote {len(payload['group_ids'])} groups, "
+    print(f"wrote {len(payload['scan_ids'])} scans, "
           f"{int(payload['option_mask'].sum())} options, {len(seen)} topologies to {out}")
 
 

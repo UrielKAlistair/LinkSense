@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Describe the dataset and check the properties the pipeline depends on.
+"""Describe a dataset and fail on the structural properties models rely on.
 
-Run this after build_dataset.py. It reports the label distribution, how much
-a perfect chooser would gain over a random one, and how well the observable
-features track the ground truth they are meant to proxy - and it fails
-loudly on structural problems (leakage-prone columns, groups with a single
-option, features that vary within a group when they should not).
+Run after build_dataset.py. It prints the label distribution, how much a
+perfect chooser would gain over a random one, and how well each observable
+feature tracks the ground truth it is meant to proxy.
 
-Run:  python scripts/inspect_dataset.py data/dataset.csv
+It exits non-zero on anything that would make a trained score meaningless
+rather than merely worse: a scan with one option (no decision to get right),
+a feature that never varies, or an observable whose correlation with ground
+truth runs the wrong way.
+
+Run:  python scripts/dataset/inspect_dataset.py data/dataset.csv
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from models.data import (feature_columns, ground_truth_columns, impute_features,  # noqa: E402
                          load_dataset)
-from models.evaluate import evaluate_all, oracle_ceiling  # noqa: E402
+from models.evaluate import evaluate_all, label_spread  # noqa: E402
 
 
 def main():
@@ -37,44 +40,44 @@ def main():
     y = df["label_throughput_mbps"]
     problems = []
 
-    print(f"=== SHAPE ===")
-    topo = df.topology_id.nunique() if "topology_id" in df.columns else df.group_id.nunique()
-    print(f"rows={len(df)}  groups={df.group_id.nunique()}  topologies={topo}  "
+    print("=== SHAPE ===")
+    topo = df.topology_id.nunique() if "topology_id" in df.columns else df.scan_id.nunique()
+    print(f"rows={len(df)}  scans={df.scan_id.nunique()}  topologies={topo}  "
           f"features={len(feats)}  ground-truth cols={len(ground_truth_columns(df))}")
-    sizes = df.groupby("group_id").size()
-    print(f"options per group: min={sizes.min()} median={int(sizes.median())} max={sizes.max()}")
+    sizes = df.groupby("scan_id").size()
+    print(f"options per scan: min={sizes.min()} median={int(sizes.median())} max={sizes.max()}")
     if (sizes < 2).any():
-        problems.append(f"{(sizes < 2).sum()} group(s) have a single option; "
-                        "a choice set needs at least two")
+        problems.append(f"{(sizes < 2).sum()} scan(s) have a single option; "
+                        "with nothing to choose between there is no decision to score")
 
-    print(f"\n=== LABEL ===")
+    print("\n=== LABEL ===")
     print(f"zero={float((y == 0).mean()):.1%}  <1Mbps={float((y < 1).mean()):.1%}  "
           f">5={float((y > 5).mean()):.1%}  >20={float((y > 20).mean()):.1%}")
     print(f"quantiles: {[round(v, 2) for v in y.quantile([0, .25, .5, .75, .9, 1]).tolist()]}")
     print(f"association failures: {int((df.label_associated == 0).sum())} rows")
 
-    print(f"\n=== HOW MUCH IS AT STAKE ===")
-    oc = oracle_ceiling(df)
+    print("\n=== HOW MUCH IS AT STAKE ===")
+    oc = label_spread(df)
     for k, v in oc.items():
         print(f"  {k}: {v:.2f}" if isinstance(v, float) else f"  {k}: {v}")
     if oc["mean_spread_mbps"] < 1.0:
         problems.append("best and worst AP are nearly identical; the choice barely matters")
 
-    print(f"\n=== HEURISTIC BASELINES (whole dataset) ===")
-    print(evaluate_all(df, {}).to_string(index=False))
+    print("\n=== HEURISTIC BASELINES (whole dataset, rules fitted in-sample) ===")
+    print(evaluate_all(df, {}, fit_frame=df).to_string(index=False))
 
     if "gt_n_aps" in df:
-        print(f"\n=== DISCOVERY AND DECISION COVERAGE ===")
-        group = df.groupby("group_id").agg(
+        print("\n=== DISCOVERY AND DECISION COVERAGE ===")
+        per_scan = df.groupby("scan_id").agg(
             n_options=("ap_index", "size"),
             n_aps=("gt_n_aps", "first"),
             best_mbps=("label_throughput_mbps", "max"),
             worst_mbps=("label_throughput_mbps", "min"),
         )
-        group["discovery_fraction"] = group.n_options / group.n_aps
-        group["spread_mbps"] = group.best_mbps - group.worst_mbps
-        coverage = group.groupby("n_aps").agg(
-            groups=("n_options", "size"),
+        per_scan["discovery_fraction"] = per_scan.n_options / per_scan.n_aps
+        per_scan["spread_mbps"] = per_scan.best_mbps - per_scan.worst_mbps
+        coverage = per_scan.groupby("n_aps").agg(
+            scans=("n_options", "size"),
             mean_options=("n_options", "mean"),
             mean_discovery=("discovery_fraction", "mean"),
             full_discovery=("discovery_fraction", lambda x: float((x == 1.0).mean())),
@@ -82,7 +85,7 @@ def main():
             spread_mbps=("spread_mbps", "mean"),
         )
         print(coverage.round(3).to_string())
-        quantiles = group.discovery_fraction.quantile([0, .1, .25, .5, .75, .9, 1])
+        quantiles = per_scan.discovery_fraction.quantile([0, .1, .25, .5, .75, .9, 1])
         print("discovery-fraction quantiles:",
               {float(k): round(float(v), 3) for k, v in quantiles.items()})
 
@@ -90,9 +93,9 @@ def main():
                               ("gt_candidate_stratum", "CANDIDATE STRATUM")):
             if column not in df or df[column].isna().all():
                 continue
-            values = df.groupby("group_id")[column].first()
-            stratified = group.join(values).groupby(column).agg(
-                groups=("n_options", "size"),
+            values = df.groupby("scan_id")[column].first()
+            stratified = per_scan.join(values).groupby(column).agg(
+                scans=("n_options", "size"),
                 mean_options=("n_options", "mean"),
                 mean_discovery=("discovery_fraction", "mean"),
                 best_mbps=("best_mbps", "mean"),
@@ -101,7 +104,7 @@ def main():
             print(f"\n=== BY {label} ===")
             print(stratified.round(3).to_string())
 
-    print(f"\n=== DO OBSERVABLES TRACK GROUND TRUTH? ===")
+    print("\n=== DO OBSERVABLES TRACK GROUND TRUTH? ===")
     checks = [
         ("feat_ap_rssi_mean", "gt_true_distance", "RSSI vs true distance", "negative"),
         ("feat_ap_n_clients", "gt_ap_sta_count", "seen clients vs true count", "positive"),
@@ -123,24 +126,23 @@ def main():
         if not ok:
             problems.append(f"{desc}: r={r:+.3f} contradicts the expected {expect} relation")
 
-    print(f"\n=== STRUCTURAL CHECKS ===")
+    print("\n=== STRUCTURAL CHECKS ===")
     const = [c for c in feats if df[c].nunique() <= 1]
     print(f"  constant features (no information): {const if const else 'none'}")
-    # This used to print and pass. A column with one value cannot inform a
-    # prediction, and its presence usually means an upstream statistic had too
-    # few samples to be computed - which is a defect in the observation, not a
-    # harmless quirk of the table.
+    # A column with one value cannot inform a prediction, and usually means an
+    # upstream statistic had too few samples to compute - a defect in the
+    # observation rather than a quirk of the table.
     if const:
         problems.append(f"{len(const)} feature(s) take a single value and carry no "
                         f"information: {const}")
     nan_raw = [c for c in feature_columns(raw) if raw[c].isna().any()]
     print(f"  features with NaNs before imputation: {len(nan_raw)} "
           f"(expected: statistics needing more samples than a short scan captured)")
-    # Option-relative features must vary within a group. n_options is the
-    # intentional exception: it describes the group itself, not one AP.
+    # Option-relative features must vary within a scan. n_options is the
+    # exception by design: it describes the scan, not any one AP.
     flat = [c for c in feats if c.startswith("feat_rel_") and c != "feat_rel_n_options"
-            and df.groupby("group_id")[c].nunique().max() <= 1]
-    print(f"  relative features constant within every group: {flat if flat else 'none'}")
+            and df.groupby("scan_id")[c].nunique().max() <= 1]
+    print(f"  relative features constant within every scan: {flat if flat else 'none'}")
 
     print()
     if problems:

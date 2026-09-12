@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Build a compact, ordered scan representation for temporal models.
+"""Build the ordered, binned view of a scan for temporal models.
 
-The ordinary dataset contains one row per discovered AP after aggregating the
-passive scan. This companion artifact preserves time: every 110 ms channel
-dwell is divided into short bins, and each AP option receives the same ordered
-channel context plus the activity attributable to that AP in each bin.
+build_dataset.py collapses each scan to 36 scalars per option. This keeps the
+time axis: the same single-radio sweep, cut into short bins, with every option
+given the shared channel context plus the activity attributable to its own BSS
+in each bin.
 
-The output is a compressed NumPy archive. It is deliberately derived from the
-same observation files, scan schedule, RSSI degradation, and discovered-option
-table as build_dataset.py, so temporal and tabular models are evaluated on the
-same decisions and labels.
+The output covers the same scans, options and labels as the tabular table, so
+the two differ only in what a model is handed. That is the comparison the
+corpus exists to support.
+
+A real client tunes one channel at a time, so an option's own BSS is visible
+only during the dwells on its channel. build_continuous_temporal.py lifts that
+restriction, to separate "the trajectory carries nothing" from "the dwell was
+too short to see it".
 
 Run:
-  python scripts/build_temporal_dataset.py data/pilot_runs data/pilot_dataset.csv \
-      --out data/pilot_temporal.npz
+  python scripts/dataset/build_temporal_dataset.py data/runs data/dataset.csv \
+      --out data/temporal.npz
 """
 
 from __future__ import annotations
@@ -29,15 +33,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from models.data import feature_columns, impute_features, load_dataset  # noqa: E402
-from scripts.dataset.build_dataset import (TYPE_DATA, ScanConfig, _rng,  # noqa: E402
-                                   apply_rssi_realism, read_chanbusy,
-                                   read_observation, single_radio_sweep)
+from scripts.dataset.build_dataset import (SCAN_CHANNELS, TYPE_DATA,  # noqa: E402
+                                   ScanConfig, _rng, apply_rssi_realism,
+                                   read_chanbusy, read_observation,
+                                   reference_dir, single_radio_sweep)
 
 
 # One summary block, in the order _frame_summary() emits it. The last two are
-# not measurements: `observed` says whether this bin carried any frame from the
-# subject at all, and `age` says how long ago the level readings below it were
-# actually taken.
+# not measurements: `observed` says whether the bin carried any frame from the
+# subject, and `age` how long ago the level readings were actually taken.
 SUMMARY_NAMES = ("frames_log1p", "bytes_log1p", "airtime_fraction",
                  "rssi_mean", "rssi_max", "beacons_log1p", "data_fraction",
                  "retry_fraction", "rate_log1p", "transmitters_log1p",
@@ -66,16 +70,11 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
 def _frame_summary(frames: list[dict], listen_s: float) -> list[float]:
     """One summary block for one time bin; levels are NaN when nothing was heard.
 
-    An empty bin has no signal reading at all. Emitting an out-of-range
-    constant here instead - which this file did until 2026-08-24, using
-    -100 dBm - puts a value 30 dB below anything physical into most of the
-    option cells. It then dominates the standardiser, and the time-average of
-    the column stops measuring signal strength and starts measuring how many
-    bins happened to contain a frame. models/data.py:_is_rssi_level documents
-    the same trap for the tabular path and avoids it there.
-
-    NaN is resolved by _fill_levels() once the whole series exists; `observed`
-    and `age` preserve what the fill would otherwise erase.
+    An empty bin has no signal reading, so the level columns are NaN rather than
+    a sentinel. A sentinel would sit far below anything physical, dominate the
+    standardiser, and turn the time-average of the column into a count of how
+    many bins held a frame. _fill_levels() resolves the NaN once the whole
+    series exists, and `observed`/`age` preserve what that fill would erase.
     """
     if not frames:
         nan = float("nan")
@@ -106,8 +105,8 @@ def _fill_levels(out: np.ndarray, block_starts: tuple[int, ...]) -> None:
 
     Forward fill is what a scan cache does: the last measurement stands until a
     newer one replaces it. The leading gap before an option's first reading is
-    back-filled, so no value outside the physical range ever enters the tensor,
-    and `age` records that those bins were not live readings.
+    back-filled, so nothing outside the physical range enters the tensor, and
+    `age` marks those bins as not live.
     """
     n_options, n_steps, _ = out.shape
     steps = np.arange(n_steps)
@@ -131,7 +130,7 @@ def _fill_levels(out: np.ndarray, block_starts: tuple[int, ...]) -> None:
         out[:, :, base + OBSERVED_OFFSET] = seen
 
 
-def temporal_group(rows: list[dict], busy: list[dict], slots: list[int], t0: float,
+def scan_sequence(rows: list[dict], busy: list[dict], slots: list[int], t0: float,
                    cfg: ScanConfig, option_meta: list[dict], bin_ms: float
                    ) -> tuple[np.ndarray, np.ndarray]:
     """Return (N options, T bins, F features) and the valid-time mask."""
@@ -144,7 +143,10 @@ def temporal_group(rows: list[dict], busy: list[dict], slots: list[int], t0: flo
     frames_by_step: list[list[dict]] = [[] for _ in range(n_steps)]
     for frame in rows:
         start = frame["t"] - frame["dur"] / 1e6
-        step = int((start - t0) / bin_s) if bin_s else -1
+        # floor, not int: a frame starting before the window has a negative
+        # offset, and int() truncates toward zero, landing it in bin 0 instead
+        # of being rejected by the guard below.
+        step = math.floor((start - t0) / bin_s) if bin_s else -1
         if 0 <= step < n_steps:
             frames_by_step[step].append(frame)
 
@@ -192,30 +194,6 @@ def temporal_group(rows: list[dict], busy: list[dict], slots: list[int], t0: flo
                        len(PREFIX_FEATURES) + SUMMARY_WIDTH))
     assert not np.isnan(out).any(), "unresolved NaN in temporal tensor"
     return out, time_mask
-
-
-def _reference_dir(runs_dirs, topology_id: str, seed_key: str) -> Path:
-    """Locate a run directory across one or more sweep output roots.
-
-    A combined dataset is stitched from several independently generated sweeps
-    whose runs live under different roots, so the lookup has to span them.
-    Prefixes are disjoint per sweep, which makes the first match unambiguous.
-    """
-    if isinstance(runs_dirs, Path):
-        runs_dirs = [runs_dirs]
-    prefix = f"{topology_id}__{seed_key}__"
-    for runs_dir in runs_dirs:
-        exact = runs_dir / f"{prefix}ap0"
-        if (exact / "observation.csv").exists():
-            return exact
-        refs = [d for d in runs_dir.iterdir()
-                if d.is_dir() and d.name.startswith(prefix)
-                and (d / "observation.csv").exists()]
-        if refs:
-            return sorted(refs)[0]
-    raise FileNotFoundError(
-        f"no observation for {topology_id}/{seed_key} under "
-        f"{[str(d) for d in runs_dirs]}")
 
 
 def main() -> int:
@@ -266,11 +244,11 @@ def main() -> int:
 
     static_features = feature_columns(frame)
     built = []
-    for number, (group_id, group) in enumerate(frame.groupby("group_id", sort=True), 1):
-        group = group.sort_values("ap_index")
-        topology_id = str(group["topology_id"].iloc[0])
-        seed_key = group_id.rsplit("__", 1)[-1] if "__s" in group_id else "s00"
-        ref_dir = _reference_dir(args.runs_dir, topology_id, seed_key)
+    for number, (scan_id, rows_of_scan) in enumerate(frame.groupby("scan_id", sort=True), 1):
+        rows_of_scan = rows_of_scan.sort_values("ap_index")
+        topology_id = str(rows_of_scan["topology_id"].iloc[0])
+        scan_key = scan_id.split("__", 1)[1]
+        ref_dir = reference_dir(args.runs_dir, topology_id, scan_key)
         meta = json.loads((ref_dir / "metadata.json").read_text())
 
         ap_by_index = {int(ap["index"]): {
@@ -278,56 +256,56 @@ def main() -> int:
             "mac": ap["mac"].lower(),
             "channel": int(ap["channel"]),
         } for ap in meta["aps"]}
-        chan_of = {idx: ap["channel"] for idx, ap in ap_by_index.items()}
-        freq_of_chan = {ch: 5000 + 5 * ch for ch in set(chan_of.values())}
+        freq_of_chan = {ch: 5000 + 5 * ch for ch in SCAN_CHANNELS}
 
         rows = read_observation(ref_dir / "observation.csv")
-        apply_rssi_realism(rows, cfg, _rng(cfg, group_id, "rssi"))
+        apply_rssi_realism(rows, cfg, _rng(cfg, scan_id, "rssi"))
         rows, _, _, slots, t0 = single_radio_sweep(
             rows, freq_of_chan, meta["params"]["feature_window_end"], cfg,
-            _rng(cfg, group_id, "sweep"))
+            _rng(cfg, scan_id, "sweep"))
         assert slots is not None
 
-        option_indices = group["ap_index"].astype(int).to_numpy()
+        option_indices = rows_of_scan["ap_index"].astype(int).to_numpy()
         option_meta = [ap_by_index[index] for index in option_indices]
-        sequence, time_mask = temporal_group(
+        sequence, time_mask = scan_sequence(
             rows, read_chanbusy(ref_dir / "chanbusy.csv"), slots, t0, cfg,
             option_meta, args.bin_ms)
 
-        # The tabular builder's passive discovery rule requires a decoded
-        # beacon. Rechecking it here catches scan-seed or provenance drift.
+        # The tabular builder admits an option only if a beacon decoded.
+        # Rechecking here catches scan-seed or provenance drift between the two.
         beacon_macs = {r["bssid"] for r in rows if r["beacon"] and r["bssid"]}
         missing = [ap["index"] for ap in option_meta if ap["mac"] not in beacon_macs]
         if missing:
-            raise ValueError(f"{group_id}: tabular options missing from temporal scan: {missing}")
+            raise ValueError(
+                f"{scan_id}: tabular options missing from temporal scan: {missing}")
 
         built.append({
-            "group_id": group_id,
+            "scan_id": scan_id,
             "topology_id": topology_id,
-            "n_aps": int(group["gt_n_aps"].iloc[0]),
-            "n_hotspots": int(group["gt_n_hotspots"].iloc[0]),
-            "candidate_stratum": str(group["gt_candidate_stratum"].iloc[0]),
+            "n_aps": int(rows_of_scan["gt_n_aps"].iloc[0]),
+            "n_hotspots": int(rows_of_scan["gt_n_hotspots"].iloc[0]),
+            "candidate_stratum": str(rows_of_scan["gt_candidate_stratum"].iloc[0]),
             "sequence": sequence,
             "time_mask": time_mask,
-            "static": group[static_features].to_numpy(dtype=np.float32),
+            "static": rows_of_scan[static_features].to_numpy(dtype=np.float32),
             "option_indices": option_indices,
-            "labels": group["label_throughput_mbps"].to_numpy(dtype=np.float32),
+            "labels": rows_of_scan["label_throughput_mbps"].to_numpy(dtype=np.float32),
         })
-        if number % 25 == 0 or number == frame["group_id"].nunique():
-            print(f"[{number}/{frame['group_id'].nunique()}] temporal groups")
+        if number % 25 == 0 or number == frame["scan_id"].nunique():
+            print(f"[{number}/{frame['scan_id'].nunique()}] temporal scans")
 
     max_options = max(len(item["option_indices"]) for item in built)
     max_steps = max(item["sequence"].shape[1] for item in built)
-    n_groups = len(built)
+    n_scans = len(built)
     n_temporal = len(TEMPORAL_FEATURES)
     n_static = len(static_features)
 
-    temporal = np.zeros((n_groups, max_options, max_steps, n_temporal), dtype=np.float32)
-    static = np.zeros((n_groups, max_options, n_static), dtype=np.float32)
-    labels = np.zeros((n_groups, max_options), dtype=np.float32)
-    option_indices = np.full((n_groups, max_options), -1, dtype=np.int16)
-    option_mask = np.zeros((n_groups, max_options), dtype=bool)
-    time_mask = np.zeros((n_groups, max_steps), dtype=bool)
+    temporal = np.zeros((n_scans, max_options, max_steps, n_temporal), dtype=np.float32)
+    static = np.zeros((n_scans, max_options, n_static), dtype=np.float32)
+    labels = np.zeros((n_scans, max_options), dtype=np.float32)
+    option_indices = np.full((n_scans, max_options), -1, dtype=np.int16)
+    option_mask = np.zeros((n_scans, max_options), dtype=bool)
+    time_mask = np.zeros((n_scans, max_steps), dtype=bool)
 
     for i, item in enumerate(built):
         n_options, n_steps = item["sequence"].shape[:2]
@@ -348,7 +326,7 @@ def main() -> int:
         option_indices=option_indices,
         option_mask=option_mask,
         time_mask=time_mask,
-        group_ids=np.array([item["group_id"] for item in built]),
+        scan_ids=np.array([item["scan_id"] for item in built]),
         topology_ids=np.array([item["topology_id"] for item in built]),
         configured_n_aps=np.array([item["n_aps"] for item in built], dtype=np.int16),
         n_hotspots=np.array([item["n_hotspots"] for item in built], dtype=np.int16),
@@ -358,7 +336,7 @@ def main() -> int:
         bin_ms=np.array(args.bin_ms, dtype=np.float32),
         scan_description=np.array(cfg.describe()),
     )
-    print(f"wrote {n_groups} groups, {int(option_mask.sum())} options, "
+    print(f"wrote {n_scans} scans, {int(option_mask.sum())} options, "
           f"{max_steps} time steps x {n_temporal} features to {args.out}")
     return 0
 

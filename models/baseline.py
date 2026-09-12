@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Gradient-boosted and random-forest regressors over the choice set.
+"""Gradient-boosted and random-forest regressors over the scan.
 
-Each row is scored independently and the argmax within a group is the
+Each row is scored independently and the argmax within a scan is the
 chosen AP. That is a pointwise ranking approach: simple, and a sensible
-default for a few hundred groups of tabular features, where boosting is
+default for a few hundred scans of tabular features, where boosting is
 hard to beat. models/ranker.py adds a set-context alternative that optimises
 pairwise ordering directly.
 
@@ -19,9 +19,9 @@ import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.inspection import permutation_importance
 
-from .data import (LABEL_COL, assert_no_leakage, feature_columns, group_sample_weights,
-                   impute_features, load_dataset, split_by_group, to_xy)
-from .evaluate import evaluate_all, oracle_ceiling
+from .data import (LABEL_COL, assert_no_leakage, feature_columns, scan_sample_weights,
+                   impute_features, load_dataset, split_by_topology, to_xy)
+from .evaluate import evaluate_all, label_spread, selection_metrics
 
 
 def build_models(seed: int = 0) -> dict:
@@ -48,16 +48,16 @@ def main():
     df = impute_features(load_dataset(args.dataset))
     feats = feature_columns(df)
     assert_no_leakage(feats)
-    train, val, test = split_by_group(df, seed=args.seed)
+    train, val, test = split_by_topology(df, seed=args.seed)
 
     X_tr, y_tr = to_xy(train, feats)
     X_va, y_va = to_xy(val, feats)
-    train_weights = group_sample_weights(train)
+    train_weights = scan_sample_weights(train)
 
     print(f"dataset={args.dataset}  rows={len(df)}  features={len(feats)}")
-    print(f"groups: train={train.group_id.nunique()} val={val.group_id.nunique()} "
-          f"test={test.group_id.nunique()}")
-    oc = oracle_ceiling(val)
+    print(f"scans: train={train.scan_id.nunique()} val={val.scan_id.nunique()} "
+          f"test={test.scan_id.nunique()}")
+    oc = label_spread(val)
     print(f"val oracle: best={oc['mean_best_mbps']:.1f} random={oc['mean_random_choice_mbps']:.1f} "
           f"spread={oc['mean_spread_mbps']:.1f} Mbps\n")
 
@@ -70,10 +70,9 @@ def main():
         preds[name] = np.expm1(p) if args.log_target else p
         fitted[name] = model
 
-    print(evaluate_all(val, preds).to_string(index=False))
+    print(evaluate_all(val, preds, train).to_string(index=False))
 
-    best = min(preds, key=lambda n: evaluate_all(val, {n: preds[n]})
-               .set_index("model").loc[n, "mean_regret_mbps"])
+    best = min(preds, key=lambda n: selection_metrics(val, preds[n])["mean_regret_mbps"])
     imp = permutation_importance(fitted[best], X_va,
                                  np.log1p(y_va) if args.log_target else y_va,
                                  n_repeats=15, random_state=args.seed, n_jobs=1)
