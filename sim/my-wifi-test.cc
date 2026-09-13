@@ -1,4 +1,5 @@
 #include "ns3/abort.h"
+#include "ns3/ampdu-subframe-header.h"
 #include "ns3/boolean.h"
 #include "ns3/command-line.h"
 #include "ns3/double.h"
@@ -23,7 +24,9 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -36,66 +39,91 @@ namespace
 {
 
 // ---------------------------------------------------------------------------
-// Simulator 1 models one stationary client choosing between several nearby
-// access points. Every matched run uses the same physical deployment and
-// pre-association observation; only the AP that the candidate eventually
-// joins changes. The resulting throughput is the label for that AP option.
+// Simulates one Wi-Fi deployment and reports what a newly arriving client
+// would observe before joining, and the throughput it gets after joining a
+// given AP.
 //
-// These constants are assumptions of this experiment, not sweep dimensions.
-// Keeping them together makes the simulated system visible without requiring
-// the reader to reconstruct it from command-line defaults spread through
-// main().
+// Command-line inputs:
+//   nAPs, nSTAs        number of APs and of background stations
+//   hotspotAPs         which APs background stations crowd around
+//   targetAP           the AP the candidate joins
+//   candidateSeed      seed for the candidate's draws listed below (or
+//                      candidateX/Y to place the candidate by hand)
+//   topologySeed       seed for the deployment draws listed below
+//   rngSeed            seed for ns-3's radio randomness: fading, backoff, rate
+//                      control, packet timing
+//   outDir, runTag     where the outputs go
+//
+// Drawn inside from the seeds:
+//   AP positions        not drawn: a fixed lattice set by nAPs
+//   AP channels         topologySeed
+//   station positions   topologySeed, denser around hotspotAPs
+//   station uplink load topologySeed, one log-normal draw per station
+//   candidate position  candidateSeed, uniform over the area stations occupy
+//   link shadowing      topologySeed; the candidate's own links candidateSeed
+//
+// What happens:
+//   0.5 s        background stations start sending uplink traffic, each at
+//                its own drawn rate
+//   2.0-8.0 s    the candidate listens passively on every occupied channel
+//                and records every frame it hears
+//   8.0 s        the candidate starts joining targetAP, and from then until
+//                20 s offers more uplink traffic than its link can carry
+//
+// Outputs, in outDir/runTag/:
+//   observation.csv   every frame from a transmission wholly inside the
+//                     listening window
+//   chanbusy.csv      per-channel busy fraction, one row per channel per 1 ms
+//   metadata.json     parameters, the candidate's throughput (the label),
+//                     association outcome, and simulator ground truth
+//
+// Nothing before 8 s depends on targetAP, so running the same inputs once per
+// AP gives the true throughput of every AP from one shared observation.
 // ---------------------------------------------------------------------------
 constexpr uint16_t kBasePort = 8000;
 constexpr uint32_t kPacketSize = 1250;
-// TGax Simulation Scenarios (IEEE 802.11-14/0980r16) states "~10-20m inter AP
-// distance" for both dense indoor scenarios (2 Enterprise, 3 Indoor Small BSS
-// Hotspot). 20 m is the top of that range, chosen as a round declared value
-// rather than inheriting the exact hexagon arithmetic of a layout we do not
-// otherwise follow.
-constexpr double kApSpacingM = 20.0;
-constexpr double kBackgroundStartS = 0.5;
+constexpr double kApSpacingM = 20.0; // distance between neighbouring APs
+
 // Background traffic needs ~1.5 s to reach steady state: association
-// completes quickly but Minstrel-HT converges only after heavy early
-// retransmission. Recording from 2.0 s means the client joins a network
-// already in flight rather than watching the same rising edge every run.
+// completes quickly but Minstrel-HT converges only after heavy retransmission.
+constexpr double kBackgroundStartS = 0.5;
 constexpr double kObservationStartS = 2.0;
-constexpr double kCandidateStartS = 8.0;
-constexpr double kFeatureGuardS = 0.5;
+constexpr double kCandidateStartS = 8.0; // listening ends and joining starts here
 constexpr double kSimulationStopS = 20.0;
-constexpr double kCandidateOfferedMbps = 100.0;
-// A station is kHotspotDensity times more likely to land in a hotspot disc
-// than anywhere else of equal area. This is a density, not a per-AP count: the
-// disc is 314 m^2 against a 346 m^2 cell, so a 4x density gives a hotspot AP
-// roughly 2.2x the clients of an ordinary one, not 4x (measured 2.17-2.19
-// over 4000 sampled scenarios, flat across AP count).
-constexpr double kHotspotDensity = 4.0;
-// Half the AP spacing, so the rim of the disc is equidistant from the
-// neighbouring AP. Stations seeded near the rim therefore associate away from
-// the intended hotspot a good fraction of the time, which caps how far a
-// hotspot can concentrate.
+
+constexpr double kCandidateOfferedMbps = 100.0; // saturates the candidate's link
+// Each background station's uplink load is one log-normal draw, clamped at the cap.
+constexpr double kBgLoadMedianMbps = 2.25;
+constexpr double kBgLoadSigmaLog = 0.9;
+constexpr double kBgLoadCapMbps = 25.0;
+
+constexpr double kHotspotDensity = 4.0; // A station is kHotspotDensity times more 
+// likely to land in a hotspot disc than anywhere else of equal area. 
 constexpr double kHotspotRadiusM = kApSpacingM / 2.0;
-constexpr double kBusyBucketS = 0.1024;
+
+// Time resolution of chanbusy.csv. The listening window is cut into buckets of
+// this length, and each row reports the fraction of one bucket during which the
+// candidate's radio on that channel sensed the medium busy. 1 ms is the
+// resolution at which real clients export channel busy time.
+constexpr double kBusyBucketS = 0.001;
 constexpr double kPathLossExponent = 3.0;
-// TGax uses 5 dB log-normal shadowing, iid per link, in Residential,
-// Enterprise and Indoor Small BSS alike. One draw per unordered node pair,
-// fixed for the whole run, applied BOTH by the association model and by the
-// simulated channel -- so the power a station used to pick its AP is the power
-// the channel then delivers. A per-transmission draw (as Nakagami is) would
-// average away over a window of beacons; real shadowing does not.
+// Log-normal shadowing sigma. One draw per unordered node pair, fixed for the
+// whole run, applied both by the association model and by the simulated
+// channel, so the power a station used to pick its AP is the power the channel
+// then delivers.
 constexpr double kLinkShadowingDb = 5.0;
 constexpr double kPi = 3.14159265358979323846;
 
-// Four non-overlapping 20 MHz channels in the 5 GHz band. Each AP draws one
-// uniformly at random, so co-channel separation is not a function of AP count.
-// The propagation reference loss below is free-space loss at 1 m near 5.2 GHz,
-// so the channel plan and propagation model describe the same frequency band.
+// Four non-overlapping 20 MHz channels in the 5 GHz band; each AP draws one
+// uniformly at random. The propagation reference loss below is free-space loss
+// at 1 m at 5.15 GHz, within 0.2 dB of all four, so it must change if these
+// channels do.
 const std::vector<uint8_t> kApChannels = {36, 40, 44, 48};
 
-// A channel no AP occupies. The candidate's association radio parks here
-// until the decision time. This prevents that radio from receiving frames and
-// consuming fading RNG draws before the matched variants are allowed to
-// differ. Scanner radios are moved here when their observation window ends.
+// A channel no AP occupies. The candidate's association radio parks here until
+// 8 s so it hears nothing and consumes no fading RNG draws, which is what keeps
+// everything before 8 s independent of targetAP. Scanner radios move here when
+// the listening window ends.
 constexpr uint8_t kParkChannel = 149;
 
 struct RunConfig
@@ -103,21 +131,14 @@ struct RunConfig
     uint32_t nStas{12};
     uint32_t nAps{3};
     uint32_t targetAp{0};
-    double candidateX{15.0};
-    double candidateY{8.66};
-    // Empty uses candidateX/candidateY as given. "boundary" or "ap_near" instead
-    // draw the position from candidateSeed, so one topology can be sampled at
-    // several places with everything else held fixed.
-    std::string candidateStratum;
+    // NaN when not given, in which case the position is drawn from candidateSeed.
+    double candidateX{std::numeric_limits<double>::quiet_NaN()};
+    double candidateY{std::numeric_limits<double>::quiet_NaN()};
     uint32_t candidateSeed{0};
     std::string hotspotApsText{"none"};
     std::vector<uint32_t> hotspotAps;
     double backgroundMbpsPerSta{0.0};   // >0 pins every station to one rate
-    double backgroundMedianMbps{2.25};
-    double backgroundSigmaLog{0.9};
-    double backgroundCapMbps{25.0};
     double linkShadowingDb{kLinkShadowingDb};
-    double backgroundMeanMbps{0.0};
     uint32_t topologySeed{1};
     uint32_t rngSeed{0};
     std::string outDir{"runs"};
@@ -129,12 +150,14 @@ struct Topology
 {
     std::vector<Vector> apPositions;
     std::vector<Vector> staPositions;
-    std::vector<uint32_t> staServingAp;
+    std::vector<uint32_t> staAssociatedAp; // What AP is each STA associated with
     Vector candidatePosition;
     std::vector<double> candidateApDistance;
     double hotspotProbability{0.0};
-    // [i][j] in dB, symmetric, zero diagonal. Node order matches allNodes:
-    // APs, then background stations, then the candidate.
+    // Shadowing in dB between every pair of nodes; positive means a stronger
+    // signal. shadowingDb[i][j] == shadowingDb[j][i]. Nodes are numbered APs
+    // first, then background stations, then the candidate: the same order
+    // main() adds them to allNodes, which is how the channel looks them up.
     std::vector<std::vector<double>> shadowingDb;
 };
 
@@ -163,16 +186,12 @@ ParseHotspotAps(const std::string& text, uint32_t nAps)
         hotspotAps.push_back(ap);
     }
 
-    NS_ABORT_MSG_IF(hotspotAps.empty(),
-                    "hotspotAPs must be 'none' or contain at least one AP index");
     return hotspotAps;
 }
 
 // ---------------------------------------------------------------------------
-// Command-line options describe either the physical scenario or the identity
-// of one matched run. Radio standard, timing, propagation, channel reuse, and
-// packet-generation assumptions are fixed above and deliberately unavailable
-// as incidental command-line variations.
+// Command-line options set the deployment, the candidate, the seeds and the
+// output location.
 // ---------------------------------------------------------------------------
 RunConfig
 ParseRunConfig(int argc, char* argv[])
@@ -183,43 +202,31 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("nSTAs", "total number of background stations", config.nStas);
     cmd.AddValue("nAPs", "number of APs in the fixed two-dimensional layout", config.nAps);
     cmd.AddValue("targetAP", "index of the AP the candidate joins", config.targetAp);
-    cmd.AddValue("candidateX", "candidate x coordinate in metres", config.candidateX);
+    cmd.AddValue("candidateX",
+                 "candidate x coordinate in metres; omit both coordinates to draw "
+                 "the position from candidateSeed",
+                 config.candidateX);
     cmd.AddValue("candidateY", "candidate y coordinate in metres", config.candidateY);
-    cmd.AddValue("candidateStratum",
-                 "empty to use candidateX/candidateY as given; 'boundary' to draw a "
-                 "point on a lattice edge; 'ap_near' to draw one close to one AP",
-                 config.candidateStratum);
     cmd.AddValue("candidateSeed",
-                 "seeds the candidate position and its shadowing links; required "
-                 "when candidateStratum is set",
+                 "seeds the candidate's shadowing links, and its position when "
+                 "candidateX/candidateY are omitted",
                  config.candidateSeed);
     cmd.AddValue("hotspotAPs",
                  "comma-separated APs around which background stations gather; 'none' disables",
                  config.hotspotApsText);
-    cmd.AddValue("bgLoadMeanMbps",
-                 "target mean per-station offered load; overrides bgLoadMedianMbps "
-                 "so sigma varies spread without moving the mean",
-                 config.backgroundMeanMbps);
     cmd.AddValue("linkShadowingDb",
                  "log-normal shadowing sigma in dB, one draw per node pair fixed "
                  "for the run, used by both association and the channel; 0 gives "
                  "nearest-AP assignment and an unshadowed channel",
                  config.linkShadowingDb);
-    cmd.AddValue("bgLoadMedianMbps",
-                 "median of the log-normal per-station offered load",
-                 config.backgroundMedianMbps);
-    cmd.AddValue("bgLoadSigmaLog",
-                 "shape (sigma of log) of the per-station offered load",
-                 config.backgroundSigmaLog);
-    cmd.AddValue("bgLoadCapMbps",
-                 "upper clamp on a drawn per-station offered load",
-                 config.backgroundCapMbps);
     cmd.AddValue("bgPerStaMbps",
                  "pin every background station to this load instead of drawing; "
                  "0 draws each station from the log-normal",
                  config.backgroundMbpsPerSta);
     cmd.AddValue("topologySeed",
-                 "seed used only for background-station placement",
+                 "seeds the whole deployment: station placement and offered "
+                 "loads, AP channel assignment, and the shadowing between "
+                 "every pair of non-candidate nodes",
                  config.topologySeed);
     cmd.AddValue("rngSeed",
                  "ns-3 PHY/MAC seed; 0 chooses and records a random seed",
@@ -227,7 +234,8 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("outDir", "directory under which the run directory is written", config.outDir);
     cmd.AddValue("runTag", "run directory name; empty derives one from the seeds and target AP", config.runTag);
     cmd.AddValue("captureObs",
-                 "write the shared pre-association observation for this matched variant",
+                 "write observation.csv and chanbusy.csv; 0 skips them without "
+                 "changing the simulation",
                  config.captureObservation);
     cmd.Parse(argc, argv);
 
@@ -235,29 +243,14 @@ ParseRunConfig(int argc, char* argv[])
     NS_ABORT_MSG_IF(config.nAps > 200, "nAPs must be at most 200");
     NS_ABORT_MSG_IF(config.nStas == 0, "nSTAs must be at least 1");
     NS_ABORT_MSG_IF(config.targetAp >= config.nAps, "targetAP must be less than nAPs");
-    // Mean of a log-normal is median * exp(sigma^2 / 2), so pinning the mean
-    // lets sigma control spread alone rather than dragging the mean with it.
-    if (config.backgroundMeanMbps > 0.0)
-    {
-        config.backgroundMedianMbps =
-            config.backgroundMeanMbps /
-            std::exp(config.backgroundSigmaLog * config.backgroundSigmaLog / 2.0);
-    }
-    NS_ABORT_MSG_IF(config.backgroundMedianMbps <= 0.0,
-                    "bgLoadMedianMbps must be positive");
-    NS_ABORT_MSG_IF(config.backgroundSigmaLog < 0.0,
-                    "bgLoadSigmaLog must not be negative");
-    NS_ABORT_MSG_IF(config.backgroundCapMbps <= config.backgroundMedianMbps,
-                    "bgLoadCapMbps must exceed bgLoadMedianMbps");
     NS_ABORT_MSG_IF(config.backgroundMbpsPerSta < 0.0,
                     "bgPerStaMbps must be zero (draw per station) or positive");
     NS_ABORT_MSG_IF(config.topologySeed == 0, "topologySeed must be positive");
-    NS_ABORT_MSG_IF(!config.candidateStratum.empty() &&
-                        config.candidateStratum != "boundary" &&
-                        config.candidateStratum != "ap_near",
-                    "candidateStratum must be empty, 'boundary' or 'ap_near'");
-    NS_ABORT_MSG_IF(!config.candidateStratum.empty() && config.candidateSeed == 0,
-                    "candidateSeed must be positive when candidateStratum is set");
+    NS_ABORT_MSG_IF(config.linkShadowingDb < 0.0, "linkShadowingDb must not be negative");
+    NS_ABORT_MSG_IF(std::isnan(config.candidateX) != std::isnan(config.candidateY),
+                    "give both candidateX and candidateY, or neither");
+    NS_ABORT_MSG_IF(std::isnan(config.candidateX) && config.candidateSeed == 0,
+                    "candidateSeed must be positive when candidateX/candidateY are omitted");
     config.hotspotAps = ParseHotspotAps(config.hotspotApsText, config.nAps);
 
     if (config.rngSeed == 0)
@@ -268,7 +261,10 @@ ParseRunConfig(int argc, char* argv[])
 
     if (config.runTag.empty())
     {
-        config.runTag = "topology_" + std::to_string(config.topologySeed) + "_seed_" +
+        // candidateSeed belongs here: without it two candidate positions drawn
+        // from one deployment derive the same tag and overwrite each other.
+        config.runTag = "topology_" + std::to_string(config.topologySeed) + "_candidate_" +
+                        std::to_string(config.candidateSeed) + "_seed_" +
                         std::to_string(config.rngSeed) + "_ap_" +
                         std::to_string(config.targetAp);
     }
@@ -277,58 +273,40 @@ ParseRunConfig(int argc, char* argv[])
 }
 
 // ---------------------------------------------------------------------------
-// AP geometry is deterministic: a triangular (hexagonal) lattice at
-// kApSpacingM, filled row-major with alternate rows offset by half a spacing.
-// Two APs form a pair, three an equilateral triangle, and the four-, six- and
-// eight-AP cases use two rows of two, three and four. AP 0 remains at the
-// origin, which keeps controlled distance tests simple.
+// APs sit on a fixed triangular lattice in at most two rows, kApSpacingM
+// between neighbours, with AP 0 at the origin. The bottom row holds half the
+// APs, rounded up but never fewer than two, filled left to right; the rest
+// fill the row above. So 2 APs form one row, 3 a triangle of 2 below and 1
+// above, and 4, 6 and 8 two rows of 2, 3 and 4.
+//
+//     3 APs:     2           6 APs:     3   4   5
+//              0   1                  0   1   2
 // ---------------------------------------------------------------------------
 std::vector<Vector>
 BuildApPositions(uint32_t nAps)
 {
-    // Triangular (hexagonal) lattice: every AP sits at the centre of one
-    // hexagonal cell, adjacent centres are exactly kApSpacingM apart, and
-    // alternate rows are offset by half a spacing. Every neighbour is therefore
-    // one spacing away, so choice difficulty does not vary with AP count.
-    uint32_t columns = nAps >= 4 && nAps <= 8 && nAps % 2 == 0
-                           ? nAps / 2
-                           : static_cast<uint32_t>(
-                                 std::ceil(std::sqrt(static_cast<double>(nAps))));
+    const uint32_t perRow = std::max<uint32_t>(2, (nAps + 1) / 2);
+    const double rowPitch = kApSpacingM * std::sqrt(3.0) / 2.0;
+
     std::vector<Vector> positions;
     positions.reserve(nAps);
-
-    const double rowPitch = kApSpacingM * std::sqrt(3.0) / 2.0;
     for (uint32_t index = 0; index < nAps; ++index)
     {
-        uint32_t row = index / columns;
-        uint32_t column = index % columns;
-        double rowOffset = (row % 2) * kApSpacingM / 2.0;
-        positions.emplace_back(rowOffset + column * kApSpacingM,
-                               row * rowPitch,
-                               0.0);
+        uint32_t row = index / perRow;
+        uint32_t column = index % perRow;
+        positions.emplace_back((column + 0.5 * row) * kApSpacingM, row * rowPitch, 0.0);
     }
 
     return positions;
 }
 
-// A station joins the AP it hears most strongly, which is what a real client
-// does. Received power is the same log-distance path loss the channel uses,
-// plus a log-normal shadowing term: transmit power and reference loss are
-// identical for every AP, so they cancel in the comparison and only distance
-// and shadowing decide it.
-//
-// Shadowing is why association is not a Voronoi partition in practice. Without
-// it, an AP's client count would be a deterministic function of the geometry,
-// and counting transmitters would substitute for measuring load. Sigma is in
-// dB; 0 reproduces nearest-AP assignment exactly and leaves the channel
-// unshadowed. At 5 dB roughly one station in six does not join its nearest AP.
-//
-// Shadowing is drawn once per node pair before any station is placed, so this
-// reads the station's row rather than drawing: the same value is handed to the
-// channel below, and the stream cannot depend on which AP wins.
+// A background station joins the AP with the strongest received power:
+// log-distance path loss plus that link's shadowing, taken from the same
+// shadowingDb the channel uses. Transmit power and reference loss are equal
+// for every AP, so they are left out of the comparison.
 uint32_t
-ChooseServingAp(double x, double y, const std::vector<Vector>& apPositions,
-                const std::vector<double>& shadowingToApsDb)
+StrongestAp(double x, double y, const std::vector<Vector>& apPositions,
+            const std::vector<double>& shadowingToApsDb)
 {
     uint32_t best = 0;
     double bestPowerDb = -std::numeric_limits<double>::infinity();
@@ -349,93 +327,21 @@ ChooseServingAp(double x, double y, const std::vector<Vector>& apPositions,
     return best;
 }
 
-// Unordered AP pairs one spacing apart: the edges of the triangular lattice.
-std::vector<std::pair<uint32_t, uint32_t>>
-NeighbouringApPairs(const std::vector<Vector>& positions)
-{
-    std::vector<std::pair<uint32_t, uint32_t>> pairs;
-    for (uint32_t left = 0; left < positions.size(); ++left)
-    {
-        for (uint32_t right = left + 1; right < positions.size(); ++right)
-        {
-            double dx = positions[right].x - positions[left].x;
-            double dy = positions[right].y - positions[left].y;
-            if (std::hypot(dx, dy) <= kApSpacingM * 1.01)
-            {
-                pairs.emplace_back(left, right);
-            }
-        }
-    }
-    return pairs;
-}
-
-// Where the candidate stands, given a stratum and its own seed. Resolving this
-// here rather than in the sweep script keeps one implementation of the lattice.
-Vector
-DrawCandidatePosition(const std::vector<Vector>& aps,
-                      const std::string& stratum,
-                      uint32_t candidateSeed)
-{
-    std::mt19937 rng(candidateSeed);
-    std::uniform_real_distribution<double> unit(0.0, 1.0);
-
-    if (stratum == "boundary")
-    {
-        // A point along a lattice edge, displaced perpendicular to it. The
-        // displacement stays under a fifth of the spacing, so the edge's own two
-        // APs remain the nearest pair even when it points at a third.
-        auto pairs = NeighbouringApPairs(aps);
-        NS_ABORT_MSG_IF(pairs.empty(),
-                        "boundary stratum needs at least one neighbouring AP pair");
-        std::uniform_int_distribution<std::size_t> pick(0, pairs.size() - 1);
-        auto pair = pairs[pick(rng)];
-        const Vector& a = aps[pair.first];
-        const Vector& b = aps[pair.second];
-        double fraction = 0.35 + 0.30 * unit(rng);
-        double edgeX = a.x + fraction * (b.x - a.x);
-        double edgeY = a.y + fraction * (b.y - a.y);
-        double length = std::hypot(b.x - a.x, b.y - a.y);
-        double offset = (2.0 * unit(rng) - 1.0) * 0.20 * kApSpacingM;
-        return Vector(edgeX - offset * (b.y - a.y) / length,
-                      edgeY + offset * (b.x - a.x) / length,
-                      0.0);
-    }
-
-    // ap_near: 0.15-0.45 spacings out, so the anchor really is the nearest AP.
-    std::uniform_int_distribution<std::size_t> anchorPick(0, aps.size() - 1);
-    const Vector& anchor = aps[anchorPick(rng)];
-    double distance = (0.15 + 0.30 * unit(rng)) * kApSpacingM;
-    double angle = 2.0 * kPi * unit(rng);
-    return Vector(anchor.x + distance * std::cos(angle),
-                  anchor.y + distance * std::sin(angle),
-                  0.0);
-}
-
 // ---------------------------------------------------------------------------
-// Three seeds, three jobs. topologySeed fixes the world: AP lattice, channel
-// assignment, station positions and loads, associations, and the shadowing
-// among them. candidateSeed fixes the observer: where the candidate stands and
-// its own shadowing links. The ns-3 rngSeed drives fading, contention and rate
-// control. Holding topologySeed while varying candidateSeed samples one
-// deployment at several places, with the background bit-identical throughout.
-//
-// Placement is one inhomogeneous point process either way. Without hotspots it
-// is uniform over the AP footprint plus a border. With hotspots the density is
-// kHotspotDensity times higher inside the discs, so the share landing in one is
-// k*A_D / (A_B + (k-1)*A_D) -- a consequence of the geometry, not a quota. The
-// disc radius equals half the AP spacing, so its rim is equidistant from the
-// neighbouring AP and a fraction of those stations associate away.
+// Builds the parts of the deployment that are fixed before simulation starts:
+//   1. AP positions on the lattice.
+//   2. The placement area: the AP footprint plus a border.
+//   3. Shadowing for every pair of nodes.
+//   4. The candidate's position, uniform over the area unless given.
+//   5. Background station positions, uniform over the area except that a
+//      point inside a hotspot disc is kHotspotDensity times as likely as one
+//      outside. Each station joins its StrongestAp.
 // ---------------------------------------------------------------------------
 Topology
 BuildTopology(const RunConfig& config)
 {
     Topology topology;
     topology.apPositions = BuildApPositions(config.nAps);
-    topology.candidatePosition =
-        config.candidateStratum.empty()
-            ? Vector(config.candidateX, config.candidateY, 0.0)
-            : DrawCandidatePosition(topology.apPositions, config.candidateStratum,
-                                    config.candidateSeed);
 
     double minX = topology.apPositions[0].x;
     double maxX = topology.apPositions[0].x;
@@ -449,32 +355,35 @@ BuildTopology(const RunConfig& config)
         maxY = std::max(maxY, position.y);
     }
 
-    // The border equals the hotspot radius, so every disc lies wholly inside the
-    // box and its area needs no clipping. It is also the more defensible rule:
-    // coverage reaches half a cell past the outermost APs. The border does not
-    // depend on whether the scenario has hotspots, so uniform and clustered
-    // scenarios share one box and one baseline density.
+    // Equal to the hotspot radius, so every hotspot disc lies inside the box.
     double border = kHotspotRadiusM;
     std::mt19937 placementRng(config.topologySeed);
 
-    // One shadowing draw per unordered node pair, on its own stream so it can
-    // neither shift nor be shifted by placement. Node indices match allNodes in
-    // main(): APs, background stations, candidate. Fixed for the run, so a
-    // window of beacons cannot average it away the way it averages Nakagami.
+    // Shadowing has its own random streams, so it never shifts placement draws.
     const uint32_t nNodes = config.nAps + config.nStas + 1;
     const uint32_t candidateIndex = nNodes - 1;
     std::mt19937 shadowRng(config.topologySeed * 2654435761u + 4u);
-    // The candidate's links come off candidateSeed, so moving it redraws its own
-    // shadowing without perturbing a single background pair.
+    // The candidate's links use candidateSeed, so moving the candidate leaves
+    // every background pair unchanged.
     std::mt19937 candidateShadowRng(
         (config.candidateSeed ? config.candidateSeed : config.topologySeed) *
             2654435761u +
         7u);
-    std::normal_distribution<double> shadowDraw(
-        0.0, std::max(0.0, config.linkShadowingDb));
     topology.shadowingDb.assign(nNodes, std::vector<double>(nNodes, 0.0));
     if (config.linkShadowingDb > 0.0)
     {
+        // Each stream needs its own distribution object. This is a C++ standard
+        // library pitfall, not an ns-3 one: std::normal_distribution generates
+        // values in pairs, keeps the spare inside the distribution object, and
+        // returns it on the next call whichever engine that call passes. With
+        // one shared object, whenever the number of background pairs was odd,
+        // the candidate's link to AP 0 received the background stream's
+        // leftover value, identical for every candidateSeed. Nothing crashes
+        // and every value is a valid draw, so it only shows up as candidate
+        // positions that fail to vary. (The uniform distributions below are
+        // shared safely: libstdc++ keeps no state in them.)
+        std::normal_distribution<double> shadowDraw(0.0, config.linkShadowingDb);
+        std::normal_distribution<double> candidateShadowDraw(0.0, config.linkShadowingDb);
         for (uint32_t i = 0; i < candidateIndex; ++i)
         {
             for (uint32_t j = i + 1; j < candidateIndex; ++j)
@@ -486,7 +395,7 @@ BuildTopology(const RunConfig& config)
         }
         for (uint32_t i = 0; i < candidateIndex; ++i)
         {
-            double draw = shadowDraw(candidateShadowRng);
+            double draw = candidateShadowDraw(candidateShadowRng);
             topology.shadowingDb[i][candidateIndex] = draw;
             topology.shadowingDb[candidateIndex][i] = draw;
         }
@@ -495,12 +404,23 @@ BuildTopology(const RunConfig& config)
     std::uniform_real_distribution<double> uniformY(minY - border, maxY + border);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
 
-    // Placement is an inhomogeneous process: density is kHotspotDensity inside
-    // the discs and 1 outside. Normalising f = k*c on D and c on B\D over the
-    // box gives c = 1 / (A_B + (k-1)*A_D), so a station lands in a disc with
-    // probability k*A_D / (A_B + (k-1)*A_D). Discs never overlap -- the radius
-    // is half the lattice spacing, so neighbouring discs are at worst tangent --
-    // hence A_D is just their summed area.
+    // The candidate lands uniformly anywhere in the same box as the stations,
+    // on its own stream so that moving it never shifts a background draw.
+    if (std::isnan(config.candidateX))
+    {
+        std::mt19937 candidateRng(config.candidateSeed);
+        double x = uniformX(candidateRng);
+        double y = uniformY(candidateRng);
+        topology.candidatePosition = Vector(x, y, 0.0);
+    }
+    else
+    {
+        topology.candidatePosition = Vector(config.candidateX, config.candidateY, 0.0);
+    }
+
+    // The chance a station lands in some hotspot disc, set so that density
+    // inside a disc is kHotspotDensity times the density outside. Discs never
+    // overlap, so their areas simply add.
     const double boxArea = (maxX - minX + 2.0 * border) * (maxY - minY + 2.0 * border);
     const double discArea =
         config.hotspotAps.size() * kPi * kHotspotRadiusM * kHotspotRadiusM;
@@ -514,7 +434,7 @@ BuildTopology(const RunConfig& config)
         config.hotspotAps.empty() ? 0 : config.hotspotAps.size() - 1);
 
     topology.staPositions.reserve(config.nStas);
-    topology.staServingAp.reserve(config.nStas);
+    topology.staAssociatedAp.reserve(config.nStas);
     for (uint32_t sta = 0; sta < config.nStas; ++sta)
     {
         double x;
@@ -530,9 +450,8 @@ BuildTopology(const RunConfig& config)
         }
         else
         {
-            // The discs carry their own density, so the baseline draw rejects
-            // anything landing inside one. Discs cover at most a third of the
-            // box, so this accepts on the first or second try.
+            // Discs got their share in the branch above, so reject points
+            // that land inside one.
             bool insideDisc;
             do
             {
@@ -552,7 +471,7 @@ BuildTopology(const RunConfig& config)
         }
 
         topology.staPositions.emplace_back(x, y, 0.0);
-        topology.staServingAp.push_back(ChooseServingAp(
+        topology.staAssociatedAp.push_back(StrongestAp(
             x, y, topology.apPositions, topology.shadowingDb[config.nAps + sta]));
     }
 
@@ -567,7 +486,8 @@ BuildTopology(const RunConfig& config)
     return topology;
 }
 
-/** Build the ChannelSettings attribute string for a 20 MHz 5 GHz channel. */
+// ns-3's ChannelSettings attribute string for a 20 MHz 5 GHz channel:
+// {channel number, width in MHz, band, index of the primary 20 MHz channel}.
 std::string
 ChannelSettings(uint8_t number)
 {
@@ -583,19 +503,18 @@ MacToString(Mac48Address address)
 }
 
 // ---------------------------------------------------------------------------
-// Pre-association observation recording.
-//
-// Each occupied channel has one passive scanner PHY on the candidate node.
-// MonitorSnifferRx records frames the scanner successfully decodes, while the
-// PHY-state trace separately records how long carrier sense reports the medium
-// busy. Both stop 0.5 s before association begins, so every target-AP variant
-// is built from one shared observation that predates the choice.
+// Recording what the candidate observes while listening.
 // ---------------------------------------------------------------------------
-struct BusyMeter
+
+// Busy time on one channel, summed into kBusyBucketS buckets. UpdateCCARecord()
+// takes one busy interval, in seconds from the window start, and splits it
+// across the buckets it overlaps; CCABusyFraction() gives the share of one
+// bucket that was busy.
+struct CCABusyRecord
 {
     std::vector<double> busySeconds;
 
-    void Add(double start, double end)
+    void UpdateCCARecord(double start, double end)
     {
         if (end <= start)
         {
@@ -620,171 +539,225 @@ struct BusyMeter
         }
     }
 
-    double Fraction(std::size_t bucket, double bucketDuration) const
+    double CCABusyFraction(std::size_t bucket, double bucketDuration) const
     {
-        if (bucket >= busySeconds.size() || bucketDuration <= 0.0)
+        // busySeconds stops at the last bucket that saw any busy time.
+        if (bucket >= busySeconds.size())
         {
             return 0.0;
         }
-        return std::min(1.0, busySeconds[bucket] / bucketDuration);
+        return busySeconds[bucket] / bucketDuration;
     }
 };
 
-struct ObservationRecorder
+// Records what the candidate hears while listening. On each listening radio,
+// three ns-3 traces are tapped:
+//   PhyRxPayloadBegin  when a decodable transmission started and will end
+//   MonitorSnifferRx   every frame the radio decodes        -> observation.csv
+//   PHY state          when carrier sense reports busy       -> chanbusy.csv
+// Both files keep only what happens inside the listening window, with times in
+// seconds from its start. Radios are numbered by their position in the list
+// given to the constructor.
+class ObservationRecorder
 {
+  public:
+    // Opens both files in runDir and taps the traces of every listening radio.
+    // channels[i] is the channel devices[i] listens on.
+    ObservationRecorder(const std::string& runDir,
+                        const std::vector<Ptr<WifiNetDevice>>& devices,
+                        const std::vector<uint32_t>& channels)
+    {
+        frames.open(runDir + "/observation.csv");
+        channelBusy.open(runDir + "/chanbusy.csv");
+        NS_ABORT_MSG_IF(!frames.is_open(), "could not open observation.csv");
+        NS_ABORT_MSG_IF(!channelBusy.is_open(), "could not open chanbusy.csv");
+        // 9 significant digits write times in the 6 s window to 10 ns. The
+        // default of 6 would round them to 10 us.
+        frames << std::setprecision(9);
+        channelBusy << std::setprecision(9);
+        frames << "tx_start,tx_end,freq_mhz,bssid,ta,cat,is_beacon,retry,len,signal_dbm,"
+                  "duration_us,rate_mbps\n";
+        channelBusy << "start,end,channel,freq_mhz,busy_frac\n";
+
+        radios.resize(devices.size());
+        for (std::size_t radio = 0; radio < devices.size(); ++radio)
+        {
+            radios[radio].channel = channels[radio];
+            Ptr<WifiPhy> phy = devices[radio]->GetPhy();
+            phy->TraceConnectWithoutContext(
+                "PhyRxPayloadBegin",
+                MakeCallback(&ObservationRecorder::OnPayloadBegin, this, radio));
+            phy->TraceConnectWithoutContext(
+                "MonitorSnifferRx",
+                MakeCallback(&ObservationRecorder::OnFrame, this, radio));
+            phy->GetState()->TraceConnectWithoutContext(
+                "State",
+                MakeCallback(&ObservationRecorder::OnPhyState, this, radio));
+        }
+    }
+
+    // The traces hold a pointer to this object, so it must not be copied.
+    ObservationRecorder(const ObservationRecorder&) = delete;
+    ObservationRecorder& operator=(const ObservationRecorder&) = delete;
+
+    // Writes chanbusy.csv and closes both files. Call after Simulator::Run().
+    void Close()
+    {
+        frames.close();
+
+        std::size_t nBuckets = static_cast<std::size_t>(std::ceil(kWindowS / kBusyBucketS));
+        for (const Radio& radio : radios)
+        {
+            for (std::size_t bucket = 0; bucket < nBuckets; ++bucket)
+            {
+                double start = bucket * kBusyBucketS;
+                double end = std::min(kWindowS, (bucket + 1) * kBusyBucketS);
+                channelBusy << start << ',' << end << ',' << radio.channel << ','
+                            << (5000 + 5 * radio.channel) << ','
+                            << radio.busy.CCABusyFraction(bucket, end - start) << '\n';
+            }
+        }
+        channelBusy.close();
+    }
+
+  private:
+    static constexpr double kWindowS = kCandidateStartS - kObservationStartS;
+
+    struct Radio
+    {
+        uint32_t channel{0};
+        CCABusyRecord busy;
+        // Start and end of the transmission the radio is receiving.
+        Time txStart;
+        Time txEnd;
+    };
+
     std::ofstream frames;
     std::ofstream channelBusy;
-    double windowStart{0.0};
-    double windowEnd{0.0};
+    std::vector<Radio> radios;
 
-    double Duration() const { return windowEnd - windowStart; }
-    std::vector<BusyMeter> busyByChannel;
-    std::vector<uint32_t> busyChannelNumbers;
-};
-
-ObservationRecorder gObservation;
-
-void
-MonitorSniffRx(Ptr<const Packet> packet,
-               uint16_t channelFreqMhz,
-               WifiTxVector txVector,
-               MpduInfo /*aMpdu*/,
-               SignalNoiseDbm signalNoise,
-               uint16_t /*staId*/)
-{
-    double now = Simulator::Now().GetSeconds();
-    if (!gObservation.frames.is_open() || now < gObservation.windowStart ||
-        now >= gObservation.windowEnd)
+    // A listening radio has decoded a transmission's preamble and header and
+    // begins its payload. The transmission started one preamble-and-header
+    // earlier and ends when the payload does.
+    void OnPayloadBegin(std::size_t radio, WifiTxVector txVector, Time payloadDuration)
     {
-        return;
+        Time now = Simulator::Now();
+        radios[radio].txStart = now - WifiPhy::CalculatePhyPreambleAndHeaderDuration(txVector);
+        radios[radio].txEnd = now + payloadDuration;
     }
 
-    Ptr<Packet> copy = packet->Copy();
-    WifiMacHeader header;
-    if (copy->PeekHeader(header) == 0)
+    void OnFrame(std::size_t radio,
+                 Ptr<const Packet> packet,
+                 uint16_t channelFreqMhz,
+                 WifiTxVector txVector,
+                 MpduInfo aMpdu,
+                 SignalNoiseDbm signalNoise,
+                 uint16_t /*staId*/)
     {
-        return;
-    }
-
-    // Which address carries the BSSID depends on the distribution-system
-    // bits. Control frames such as ACK and CTS have no BSSID at all.
-    std::string bssid;
-    if (header.IsMgt())
-    {
-        bssid = MacToString(header.GetAddr3());
-    }
-    else if (header.IsData())
-    {
-        if (header.IsToDs() && !header.IsFromDs())
+        // Only frames whose whole transmission lies inside the window.
+        Time txStart = radios[radio].txStart;
+        Time txEnd = radios[radio].txEnd;
+        if (txStart < Seconds(kObservationStartS) || txEnd > Seconds(kCandidateStartS))
         {
-            bssid = MacToString(header.GetAddr1());
+            return;
         }
-        else if (!header.IsToDs() && header.IsFromDs())
+
+        // Each frame of an aggregate arrives with a 4-byte delimiter in front
+        // and, on every frame but the last, padding behind to a 4-byte
+        // boundary. Strip both, so the packet starts at the MAC header and its
+        // size is the frame length the delimiter records.
+        Ptr<Packet> copy = packet->Copy();
+        if (aMpdu.type != NORMAL_MPDU)
         {
-            bssid = MacToString(header.GetAddr2());
+            AmpduSubframeHeader delimiter;
+            copy->RemoveHeader(delimiter);
+            copy->RemoveAtEnd(copy->GetSize() - delimiter.GetLength());
         }
-        else
+
+        WifiMacHeader header;
+        copy->PeekHeader(header);
+
+        // BSSID: address 3 in management frames. In data frames, address 1
+        // when sent to the AP, address 2 when sent by it, otherwise address 3.
+        // Control frames get none.
+        std::string bssid;
+        if (header.IsMgt())
         {
             bssid = MacToString(header.GetAddr3());
         }
-    }
-
-    std::string transmitter =
-        header.IsCtl() && !header.IsRts() ? "" : MacToString(header.GetAddr2());
-    Time duration =
-        WifiPhy::CalculateTxDuration(packet->GetSize(), txVector, WIFI_PHY_BAND_5GHZ);
-
-    // Frame category 0/1/2 follows the 802.11 management/control/data type
-    // field rather than ns-3's finer-grained internal WifiMacType values.
-    int category = header.IsMgt() ? 0 : (header.IsCtl() ? 1 : 2);
-
-    // Timestamps are emitted relative to the window start, so everything
-    // downstream still sees a window that begins at t = 0.
-    gObservation.frames << (now - gObservation.windowStart) << ',' << channelFreqMhz << ',' << bssid << ','
-                        << transmitter << ',' << category << ','
-                        << (header.IsBeacon() ? 1 : 0) << ','
-                        << (header.IsRetry() ? 1 : 0) << ',' << packet->GetSize() << ','
-                        << signalNoise.signal << ',' << signalNoise.noise << ','
-                        << duration.GetMicroSeconds() << ','
-                        << txVector.GetMode().GetDataRate(txVector) / 1e6 << '\n';
-}
-
-void
-ScannerPhyState(uint32_t channelNumber, Time start, Time duration, WifiPhyState state)
-{
-    if (duration <= Time(0))
-    {
-        return;
-    }
-
-    double intervalStart = start.GetSeconds() - gObservation.windowStart;
-    double intervalEnd = intervalStart + duration.GetSeconds();
-    if (intervalStart >= gObservation.Duration() || intervalEnd <= 0.0)
-    {
-        return;
-    }
-
-    intervalStart = std::max(0.0, intervalStart);
-    intervalEnd = std::min(gObservation.Duration(), intervalEnd);
-    bool busy = state == WifiPhyState::CCA_BUSY || state == WifiPhyState::TX ||
-                state == WifiPhyState::RX;
-    if (!busy || intervalEnd <= intervalStart)
-    {
-        return;
-    }
-
-    auto channel = std::find(gObservation.busyChannelNumbers.begin(),
-                             gObservation.busyChannelNumbers.end(),
-                             channelNumber);
-    if (channel != gObservation.busyChannelNumbers.end())
-    {
-        std::size_t index =
-            static_cast<std::size_t>(channel - gObservation.busyChannelNumbers.begin());
-        if (index < gObservation.busyByChannel.size())
+        else if (header.IsData())
         {
-            gObservation.busyByChannel[index].Add(intervalStart, intervalEnd);
-        }
-    }
-}
-
-void
-WriteChannelBusyCsv()
-{
-    if (!gObservation.channelBusy.is_open())
-    {
-        return;
-    }
-
-    std::size_t nBuckets =
-        static_cast<std::size_t>(std::ceil(gObservation.Duration() / kBusyBucketS));
-    for (std::size_t channelIndex = 0;
-         channelIndex < gObservation.busyByChannel.size();
-         ++channelIndex)
-    {
-        uint32_t channel = gObservation.busyChannelNumbers[channelIndex];
-        for (std::size_t bucket = 0; bucket < nBuckets; ++bucket)
-        {
-            double start = bucket * kBusyBucketS;
-            double end = std::min(gObservation.Duration(), (bucket + 1) * kBusyBucketS);
-            double duration = end - start;
-            if (duration <= 0.0)
+            if (header.IsToDs() && !header.IsFromDs())
             {
-                continue;
+                bssid = MacToString(header.GetAddr1());
             }
-
-            gObservation.channelBusy
-                << start << ',' << end << ',' << channel << ',' << (5000 + 5 * channel)
-                << ',' << gObservation.busyByChannel[channelIndex].Fraction(bucket, duration)
-                << '\n';
+            else if (!header.IsToDs() && header.IsFromDs())
+            {
+                bssid = MacToString(header.GetAddr2());
+            }
+            else
+            {
+                bssid = MacToString(header.GetAddr3());
+            }
         }
+
+        // CTS and ACK carry no transmitter address; every other frame has it
+        // in address 2.
+        std::string transmitter =
+            (header.IsCts() || header.IsAck()) ? "" : MacToString(header.GetAddr2());
+
+        // Airtime of this frame. An aggregate goes out as one transmission
+        // behind one preamble, so only its first frame is charged for the
+        // preamble.
+        Time duration =
+            WifiPhy::CalculateTxDuration(copy->GetSize(), txVector, WIFI_PHY_BAND_5GHZ);
+        if (aMpdu.type == MIDDLE_MPDU_IN_AGGREGATE || aMpdu.type == LAST_MPDU_IN_AGGREGATE)
+        {
+            duration -= WifiPhy::CalculatePhyPreambleAndHeaderDuration(txVector);
+        }
+
+        // 0 management, 1 control, 2 data.
+        int category = header.IsMgt() ? 0 : (header.IsCtl() ? 1 : 2);
+
+        // Times are in seconds from the window start. Every frame of an
+        // aggregate carries the start and end of the whole transmission;
+        // duration_us is its own share of it.
+        frames << (txStart.GetSeconds() - kObservationStartS) << ','
+               << (txEnd.GetSeconds() - kObservationStartS) << ','
+               << channelFreqMhz << ',' << bssid << ','
+               << transmitter << ',' << category << ','
+               << (header.IsBeacon() ? 1 : 0) << ','
+               << (header.IsRetry() ? 1 : 0) << ',' << copy->GetSize() << ','
+               << signalNoise.signal << ','
+               << duration.GetMicroSeconds() << ','
+               << txVector.GetMode().GetDataRate(txVector) / 1e6 << '\n';
     }
-}
+
+    // ns-3 reports each PHY state interval once it ends, as (start, duration,
+    // state). On one radio, receiving and carrier-sense-busy intervals never
+    // overlap, so adding them up gives the channel's busy time. The interval
+    // is clipped to the listening window; one wholly outside clips to zero
+    // length, which UpdateCCARecord ignores.
+    void OnPhyState(std::size_t radio, Time start, Time duration, WifiPhyState state)
+    {
+        if (state != WifiPhyState::RX && state != WifiPhyState::CCA_BUSY)
+        {
+            return;
+        }
+
+        double intervalStart = start.GetSeconds() - kObservationStartS;
+        double intervalEnd = std::min(kWindowS, intervalStart + duration.GetSeconds());
+        intervalStart = std::max(0.0, intervalStart);
+        radios[radio].busy.UpdateCCARecord(intervalStart, intervalEnd);
+    }
+};
 
 // ---------------------------------------------------------------------------
-// Traffic accounting records bytes delivered by each uplink flow. Background
-// flows are later aggregated per AP; the candidate flow becomes the throughput
-// label. Binding the flow index directly into the receive callback avoids a
-// second address-to-flow lookup structure.
+// Uplink traffic, and a count of the bytes each flow delivers.
+//
+// A flow is one sender's packets to its own receiving socket on an AP. Each
+// flow has a byte counter, and its socket's receive callback carries the
+// counter's index, so arriving bytes go straight to the right counter.
 // ---------------------------------------------------------------------------
 struct FlowStats
 {
@@ -815,22 +788,12 @@ InstallSink(Ptr<Node> node, const Address& localAddress, TypeId socketType)
     return flowIndex;
 }
 
-// Background arrivals are a Poisson process at the station's mean rate, not a
-// metronome. Deterministic same-phase CBR gives every bin the same expected
-// occupancy once the transient passes, so the binned sequence carries little
-// beyond its own mean - which would bias this study against the temporal
-// hypothesis it exists to test. Exponential gaps preserve E[offered load], so
-// the label is unchanged. Every non-full-buffer model in the TGax set
-// randomises phase; its own calibration config specifies "Random start time
-// during a 10 ms interval". Note MEASURED: this removed the artefact but did
-// not add temporal structure -- busy-fraction autocorrelation sits inside the
-// noise band, so the series is white noise about a constant.
+// Background packets leave at exponentially distributed gaps, so each station
+// sends a Poisson stream at its mean rate.
 //
-// Each station owns one mt19937 seeded off BOTH seeds (see trafficBase in
-// main). Its mean rate is a property of the deployment and hangs off
-// topologySeed; when its packets actually leave does not, so the arrival
-// realisation varies across radio seeds while staying fixed within a matched
-// target-AP replay.
+// Each station draws its gaps from its own generator (seeded in main, see
+// trafficBase), so its packet times do not depend on the order in which the
+// simulation interleaves different stations' events.
 std::vector<std::mt19937> gTrafficRngs;
 
 void
@@ -858,8 +821,8 @@ ScheduleBackgroundTraffic(Ptr<Node> sender,
     Ptr<Socket> source = Socket::CreateSocket(sender, socketType);
     source->Connect(destination);
     double meanInterval = meanPacketInterval.GetSeconds();
-    // A uniform phase over one mean interval breaks the lock-step that made
-    // same-rate stations on one AP transmit in formation for the whole run.
+    // The first packet leaves at a uniformly random offset within one mean
+    // interval after start, so stations do not all begin at the same instant.
     std::uniform_real_distribution<double> phase(0.0, meanInterval);
     Simulator::ScheduleWithContext(sender->GetId(),
                                    start + Seconds(phase(gTrafficRngs[stream])),
@@ -870,9 +833,8 @@ ScheduleBackgroundTraffic(Ptr<Node> sender,
                                    stream);
 }
 
-// The candidate stays deliberately deterministic: it is offered 100 Mbit/s to
-// remain backlogged so its delivered rate measures capacity. Jittering it would
-// add variance to the label for no gain.
+// The candidate sends one packet every packetInterval, a constant rate above
+// what its link can carry, so it always has a packet waiting to send.
 void
 GenerateCandidateTraffic(Ptr<Socket> socket, uint32_t packetSize, Time packetInterval)
 {
@@ -894,6 +856,8 @@ ScheduleCandidateTraffic(Ptr<Node> sender,
                                    source, kPacketSize, packetInterval);
 }
 
+// When, and with which AP, the candidate first associated. time stays -1 if it
+// never does.
 struct AssociationResult
 {
     double time{-1.0};
@@ -926,24 +890,17 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Radio and propagation model.
     //
-    // Every radio shares one MultiModelSpectrumChannel, so scanner radios retune
-    // across the same physical environment. Channel numbers do not partition the
-    // medium: under the spectrum model an adjacent-channel neighbour still
-    // deposits power through the transmit mask (see below).
+    // Every radio shares one MultiModelSpectrumChannel. Channel numbers do not
+    // isolate radios from one another: a transmission on an adjacent channel
+    // still puts power into a receiver's band.
     // -----------------------------------------------------------------------
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211n);
     wifi.SetRemoteStationManager("ns3::MinstrelHtWifiManager");
 
-    // SpectrumWifiPhy rather than Yans. YansWifiChannel::Send skips outright
-    // any receiver whose channel number differs from the sender's -- "For now
-    // don't account for inter channel interference nor channel bonding" -- so an
-    // AP alone on its channel is perfectly isolated. The spectrum model carries
-    // an 802.11 transmit spectral mask instead, so an adjacent-channel neighbour
-    // deposits real power in the receiver's band and appears in its carrier
-    // sense, which is what a client measuring occupancy would actually see.
-    // Measured on matched scenarios, a channel with no offered load reads a
-    // busy fraction of 0.072 here against 0.002 under Yans.
+    // SpectrumWifiPhy spreads each transmission's power across frequency with
+    // the 802.11 transmit spectral mask, so a transmitter on an adjacent channel
+    // adds power in a receiver's band and can register in its carrier sense.
     SpectrumWifiPhyHelper wifiPhy;
     wifiPhy.Set("RxGain", DoubleValue(0.0));
 
@@ -956,11 +913,9 @@ main(int argc, char* argv[])
     sharedChannel->AddPropagationLossModel(
         CreateObject<NakagamiPropagationLossModel>());
 
-    // Per-link shadowing, held constant for the run. A matrix model is the only
-    // stock loss model whose value is a property of the pair rather than of the
-    // call: RandomPropagationLossModel redraws every transmission, so it would
-    // average out over a window of beacons exactly as Nakagami does. Unset pairs
-    // must default to 0 dB, not the model's default of infinite loss.
+    // Per-link shadowing, fixed for the whole run: the matrix model applies one
+    // stored loss per pair of nodes, filled in once positions exist (below).
+    // Pairs never set get 0 dB rather than the model's default of infinite loss.
     Ptr<MatrixPropagationLossModel> shadowingModel =
         CreateObject<MatrixPropagationLossModel>();
     shadowingModel->SetDefaultLoss(0.0);
@@ -970,7 +925,7 @@ main(int argc, char* argv[])
         CreateObject<LogDistancePropagationLossModel>();
     pathLoss->SetAttribute("Exponent", DoubleValue(kPathLossExponent));
     pathLoss->SetAttribute("ReferenceDistance", DoubleValue(1.0));
-    pathLoss->SetAttribute("ReferenceLoss", DoubleValue(46.6777));
+    pathLoss->SetAttribute("ReferenceLoss", DoubleValue(46.6777)); // free-space loss at 1 m, 5.15 GHz
     sharedChannel->AddPropagationLossModel(pathLoss);
 
     sharedChannel->SetPropagationDelayModel(
@@ -978,11 +933,11 @@ main(int argc, char* argv[])
 
     wifiPhy.SetChannel(sharedChannel);
 
-    // Channel per AP is drawn independently, so co-channel separation and the
-    // number of channels in use stop being functions of the AP count and the
-    // fixed layout. Both streams below hang off topologySeed alone: they must
-    // be identical across the matched target-AP replays and across radio
-    // seeds, and they must not consume from the placement stream.
+    // Each AP's channel is drawn uniformly from kApChannels. AP channels and
+    // station loads come from topologySeed alone, each through its own
+    // generator, so neither shifts the placement draws in BuildTopology.
+    // (2654435761 is a multiplicative hash constant that spreads nearby seeds
+    // apart.)
     std::mt19937 channelRng(config.topologySeed * 2654435761u + 1u);
     std::mt19937 rateRng(config.topologySeed * 2654435761u + 2u);
     std::uniform_int_distribution<std::size_t> channelPick(0, kApChannels.size() - 1);
@@ -995,9 +950,8 @@ main(int argc, char* argv[])
         apSsid.emplace_back("wifi-ap" + std::to_string(ap));
     }
 
-    // Whatever the draw produced. Two APs may share a channel and four may
-    // occupy one; the scanner set follows the channels actually in use rather
-    // than a prefix of kApChannels.
+    // The distinct channels in use, in ascending order. APs can share a
+    // channel, so there may be fewer of these than APs.
     std::vector<uint32_t> occupiedChannels;
     for (uint8_t channel : apChannel)
     {
@@ -1008,32 +962,23 @@ main(int argc, char* argv[])
                            occupiedChannels.end());
     uint32_t nOccupiedChannels = static_cast<uint32_t>(occupiedChannels.size());
 
-    // Offered load is drawn per station, so two APs with equal station counts
-    // can differ in load. That is what stops a transmitter count from standing
-    // in for the measurement.
+    // Each background station's offered load: backgroundMbpsPerSta for every
+    // station when it is given, otherwise one log-normal draw per station,
+    // capped at kBgLoadCapMbps.
     std::vector<double> staOfferedMbps(config.nStas, config.backgroundMbpsPerSta);
     if (config.backgroundMbpsPerSta <= 0.0)
     {
-        // Per-user traffic volume is log-normal, not Gaussian: an 18-year
-        // longitudinal study finds log-normal beats both Gaussian and Weibull
-        // at every timescale tested, and WLAN flow sizes fit log-normal
-        // regardless of device type. The right skew is what puts most stations
-        // on a light load and a few on a heavy one without needing a mixture.
-        std::lognormal_distribution<double> loadDraw(
-            std::log(config.backgroundMedianMbps), config.backgroundSigmaLog);
+        std::lognormal_distribution<double> loadDraw(std::log(kBgLoadMedianMbps),
+                                                     kBgLoadSigmaLog);
         for (uint32_t sta = 0; sta < config.nStas; ++sta)
         {
-            staOfferedMbps[sta] =
-                std::min(config.backgroundCapMbps, loadDraw(rateRng));
+            staOfferedMbps[sta] = std::min(kBgLoadCapMbps, loadDraw(rateRng));
         }
     }
 
-    // One traffic stream per background station. Each station's mean rate is a
-    // property of the deployment and hangs off topologySeed; when its packets
-    // actually leave is not, so the arrival realisation is drawn from both
-    // seeds. A radio seed therefore means the same deployment observed on a
-    // different occasion. Both seeds are fixed within a matched target-AP
-    // replay, so the observation stays byte-identical across it.
+    // One packet-timing generator per background station, seeded from both
+    // topologySeed and rngSeed. A station's mean rate comes from topologySeed
+    // alone (above); the moments its packets leave also change with rngSeed.
     const uint32_t trafficBase =
         (config.topologySeed * 2654435761u) ^ (config.rngSeed * 2246822519u);
     gTrafficRngs.clear();
@@ -1048,10 +993,9 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Nodes and Wi-Fi devices.
     //
-    // Background stations associate by strongest shadowed received power, as
-    // computed in BuildTopology and applied by the channel. Each AP
-    // uses a distinct SSID so a matched variant can force the candidate onto
-    // exactly one option without changing any other part of the deployment.
+    // Every AP has its own SSID. Each background station is given the SSID of
+    // the AP chosen for it in BuildTopology (strongest received power), so it
+    // can only associate with that AP.
     // -----------------------------------------------------------------------
     NodeContainer apNodes;
     NodeContainer backgroundNodes;
@@ -1078,17 +1022,16 @@ main(int argc, char* argv[])
 
     for (uint32_t sta = 0; sta < config.nStas; ++sta)
     {
-        uint32_t ap = topology.staServingAp[sta];
+        uint32_t ap = topology.staAssociatedAp[sta];
         wifiPhy.Set("ChannelSettings", StringValue(ChannelSettings(apChannel[ap])));
         wifiMac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(apSsid[ap]));
         apGroupDevices[ap].Add(wifi.Install(wifiPhy, wifiMac, backgroundNodes.Get(sta)));
         apStaGlobalIndex[ap].push_back(sta);
     }
 
-    // Scanner radios are passive and never associate. One scanner per occupied
-    // channel gives the raw observation for the whole guarded window. The
-    // dataset builder subsequently applies the dwell schedule of one sweeping
-    // radio, using these parallel captures as the complete source material.
+    // One listening radio per occupied channel, all on the candidate node. They
+    // do not probe and their SSID matches no AP, so they never associate or
+    // transmit.
     std::vector<Ptr<WifiNetDevice>> scannerDevices;
     scannerDevices.reserve(nOccupiedChannels);
     for (uint32_t channelIndex = 0; channelIndex < nOccupiedChannels; ++channelIndex)
@@ -1105,11 +1048,9 @@ main(int argc, char* argv[])
         scannerDevices.push_back(DynamicCast<WifiNetDevice>(installed.Get(0)));
     }
 
-    // The association radio remains on an unused channel with an unmatched
-    // SSID until the decision time. It then retunes to the selected AP and
-    // adopts that AP's SSID. Association is allowed to complete normally, so
-    // the throughput window begins at the traced completion time rather than
-    // at an assumed fixed delay.
+    // The candidate's association radio waits on kParkChannel with an SSID no
+    // AP uses. At kCandidateStartS it moves to targetAP's channel and takes its
+    // SSID (scheduled below), then associates through the normal procedure.
     wifiPhy.Set("ChannelSettings", StringValue(ChannelSettings(kParkChannel)));
     wifiMac.SetType("ns3::StaWifiMac",
                     "Ssid",
@@ -1125,10 +1066,10 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Position and network-layer configuration.
     //
-    // ListPositionAllocator consumes positions in exactly the order in which
-    // allNodes was assembled: APs, background stations, then the candidate.
-    // Each AP group receives its own IPv4 subnet; the candidate receives an
-    // address only in the subnet of the AP selected for this variant.
+    // ListPositionAllocator hands out positions in the order allNodes was
+    // assembled: APs, background stations, then the candidate. Each AP and its
+    // stations get their own IPv4 subnet; the candidate's association radio is
+    // addressed in targetAP's subnet.
     // -----------------------------------------------------------------------
     MobilityHelper mobility;
     Ptr<ListPositionAllocator> positionAllocator = CreateObject<ListPositionAllocator>();
@@ -1146,9 +1087,9 @@ main(int argc, char* argv[])
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobility.Install(allNodes);
 
-    // Now that every node has a mobility model, hand the channel the same
-    // shadowing draws the association model used. SetLoss takes attenuation, so
-    // the sign flips: a positive draw was extra received power there.
+    // Now that every node has a mobility model, give the channel the shadowing
+    // drawn in BuildTopology, the same values StrongestAp used. SetLoss takes
+    // attenuation, so the sign flips: a positive draw means extra received power.
     if (config.linkShadowingDb > 0.0)
     {
         for (uint32_t i = 0; i < allNodes.GetN(); ++i)
@@ -1179,10 +1120,9 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Uplink traffic and byte accounting.
     //
-    // Every background station sends to a dedicated socket on its AP. The
-    // candidate is offered 100 Mbps so it remains backlogged; its delivered
-    // rate therefore measures capacity won from the selected BSS rather than
-    // merely reproducing a low application sending rate.
+    // Every background station sends to its own socket on its AP from
+    // kBackgroundStartS. The candidate sends to its own socket on targetAP from
+    // kCandidateStartS.
     // -----------------------------------------------------------------------
     TypeId udpSocketType = TypeId::LookupByName("ns3::UdpSocketFactory");
     std::vector<std::vector<std::size_t>> apFlowStats(config.nAps);
@@ -1238,46 +1178,23 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Per-run files and observation traces.
     //
-    // Only one variant in a matched set needs to write the shared observation;
-    // every variant still installs identical scanner devices so trace capture
-    // cannot alter the simulated radio configuration or RNG sequence.
+    // The listening radios are installed whether or not captureObs writes
+    // their traces, so writing them never changes the simulation.
     // -----------------------------------------------------------------------
     std::string runDir = config.outDir + "/" + config.runTag;
     std::filesystem::create_directories(runDir);
 
+    std::optional<ObservationRecorder> recorder;
     if (config.captureObservation)
     {
-        gObservation.windowStart = kObservationStartS;
-        gObservation.windowEnd = kCandidateStartS - kFeatureGuardS;
-        gObservation.frames.open(runDir + "/observation.csv");
-        gObservation.channelBusy.open(runDir + "/chanbusy.csv");
-        NS_ABORT_MSG_IF(!gObservation.frames.is_open(), "could not open observation.csv");
-        NS_ABORT_MSG_IF(!gObservation.channelBusy.is_open(), "could not open chanbusy.csv");
-
-        gObservation.frames
-            << "t,freq_mhz,bssid,ta,cat,is_beacon,retry,len,signal_dbm,noise_dbm,"
-               "duration_us,rate_mbps\n";
-        gObservation.channelBusy << "start,end,channel,freq_mhz,busy_frac\n";
-        gObservation.busyByChannel.assign(nOccupiedChannels, BusyMeter{});
-        gObservation.busyChannelNumbers = occupiedChannels;
-
-        for (uint32_t channelIndex = 0; channelIndex < nOccupiedChannels; ++channelIndex)
-        {
-            scannerDevices[channelIndex]->GetPhy()->TraceConnectWithoutContext(
-                "MonitorSnifferRx",
-                MakeCallback(&MonitorSniffRx));
-            scannerDevices[channelIndex]->GetPhy()->GetState()->TraceConnectWithoutContext(
-                "State",
-                MakeBoundCallback(&ScannerPhyState, occupiedChannels[channelIndex]));
-        }
+        recorder.emplace(runDir, scannerDevices, occupiedChannels);
     }
 
-    // The 0.5 s guard excludes ns-3's target-dependent pre-join polling near
-    // association time. Once that guarded window closes, scanners move to the
-    // parking channel because no later frame contributes to the observation.
+    // When the listening window closes, the scanners move to the park channel:
+    // nothing they hear afterwards is recorded.
     for (const auto& scanner : scannerDevices)
     {
-        Simulator::Schedule(Seconds(kCandidateStartS - kFeatureGuardS),
+        Simulator::Schedule(Seconds(kCandidateStartS),
                             setOperatingChannel,
                             scanner->GetPhy(),
                             WifiPhy::ChannelTuple{
@@ -1295,10 +1212,12 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Throughput label and structured run metadata.
     //
-    // Candidate throughput is averaged from actual association completion to
-    // simulation stop. Bytes sent during scanning are not delivered and do not
-    // enter the numerator. Metadata records both observable identities and
-    // simulator-only ground truth needed to validate the generated dataset.
+    // throughput_mbps is the candidate's delivered bytes averaged from the
+    // moment it associated to kSimulationStopS; nothing it sends before
+    // association is delivered. background_mbps is each AP's background
+    // stations' delivered bytes averaged from kBackgroundStartS to
+    // kSimulationStopS. metadata.json also records the run's parameters and
+    // the deployment.
     // -----------------------------------------------------------------------
     bool candidateAssociated = gAssociation.time >= 0.0;
     double candidateObservedSeconds =
@@ -1326,12 +1245,11 @@ main(int argc, char* argv[])
     metadata << "    \"target_ap\": " << config.targetAp << ",\n";
     metadata << "    \"ap_spacing\": " << kApSpacingM << ",\n";
     metadata << "    \"candidate_start_time\": " << kCandidateStartS << ",\n";
-    metadata << "    \"feature_guard\": " << kFeatureGuardS << ",\n";
     metadata << "    \"observation_start_time\": " << kObservationStartS << ",\n";
-    // Emitted as the window DURATION: frame and bucket timestamps are relative
-    // to the window start, so downstream still sees a window beginning at 0.
-    metadata << "    \"feature_window_end\": "
-             << (kCandidateStartS - kFeatureGuardS - kObservationStartS) << ",\n";
+    // The listening window's length, not its end time: times in observation.csv
+    // and chanbusy.csv count from the window's start.
+    metadata << "    \"feature_window_end\": " << (kCandidateStartS - kObservationStartS)
+             << ",\n";
     metadata << "    \"sim_stop_time\": " << kSimulationStopS << ",\n";
     metadata << "    \"background_start_time\": " << kBackgroundStartS << ",\n";
     metadata << "    \"candidate_interval_s\": " << candidateInterval.GetSeconds()
@@ -1342,10 +1260,9 @@ main(int argc, char* argv[])
         bgTotalOffered += rate;
     }
     metadata << "    \"link_shadowing_db\": " << config.linkShadowingDb << ",\n";
-    metadata << "    \"bg_load_median_mbps\": " << config.backgroundMedianMbps
-             << ",\n";
-    metadata << "    \"bg_load_sigma_log\": " << config.backgroundSigmaLog << ",\n";
-    metadata << "    \"bg_load_cap_mbps\": " << config.backgroundCapMbps << ",\n";
+    metadata << "    \"bg_load_median_mbps\": " << kBgLoadMedianMbps << ",\n";
+    metadata << "    \"bg_load_sigma_log\": " << kBgLoadSigmaLog << ",\n";
+    metadata << "    \"bg_load_cap_mbps\": " << kBgLoadCapMbps << ",\n";
     metadata << "    \"bg_per_sta_fixed_mbps\": " << config.backgroundMbpsPerSta << ",\n";
     metadata << "    \"bg_mean_per_sta_mbps\": "
              << (config.nStas ? bgTotalOffered / config.nStas : 0.0) << ",\n";
@@ -1353,7 +1270,7 @@ main(int argc, char* argv[])
     std::vector<double> apOfferedMbps(config.nAps, 0.0);
     for (uint32_t sta = 0; sta < config.nStas; ++sta)
     {
-        apOfferedMbps[topology.staServingAp[sta]] += staOfferedMbps[sta];
+        apOfferedMbps[topology.staAssociatedAp[sta]] += staOfferedMbps[sta];
     }
     metadata << "    \"candidate_offered_mbps\": " << kCandidateOfferedMbps
              << ",\n";
@@ -1372,7 +1289,6 @@ main(int argc, char* argv[])
     metadata << "    \"n_channels\": " << nOccupiedChannels << "\n";
     metadata << "  },\n";
     metadata << "  \"candidate_seed\": " << config.candidateSeed << ",\n";
-    metadata << "  \"candidate_stratum\": \"" << config.candidateStratum << "\",\n";
     metadata << "  \"candidate_position\": {\"x\": " << topology.candidatePosition.x
              << ", \"y\": " << topology.candidatePosition.y << "},\n";
     metadata << "  \"aps\": [\n";
@@ -1406,7 +1322,7 @@ main(int argc, char* argv[])
     for (uint32_t sta = 0; sta < config.nStas; ++sta)
     {
         metadata << "    {\"index\": " << sta << ", \"ap\": "
-                 << topology.staServingAp[sta] << ", \"position\": {\"x\": "
+                 << topology.staAssociatedAp[sta] << ", \"position\": {\"x\": "
                  << topology.staPositions[sta].x << ", \"y\": "
                  << topology.staPositions[sta].y << "}, \"offered_mbps\": "
                  << staOfferedMbps[sta] << "}"
@@ -1430,14 +1346,9 @@ main(int argc, char* argv[])
     metadata << "}\n";
     metadata.close();
 
-    if (gObservation.frames.is_open())
+    if (recorder)
     {
-        gObservation.frames.close();
-    }
-    if (gObservation.channelBusy.is_open())
-    {
-        WriteChannelBusyCsv();
-        gObservation.channelBusy.close();
+        recorder->Close();
     }
 
     Simulator::Destroy();
