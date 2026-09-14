@@ -36,7 +36,7 @@ import torch.nn as nn
 
 from .data import split_rows_by_topology
 
-TEMPORAL_SCHEMA_VERSION = 2
+TEMPORAL_SCHEMA_VERSION = 4
 
 
 @dataclass
@@ -49,7 +49,6 @@ class TemporalCorpus:
     """
 
     temporal: np.ndarray
-    static: np.ndarray
     labels: np.ndarray
     option_indices: np.ndarray
     option_mask: np.ndarray
@@ -58,9 +57,7 @@ class TemporalCorpus:
     topology_ids: np.ndarray
     configured_n_aps: np.ndarray
     n_hotspots: np.ndarray
-    candidate_strata: np.ndarray
     temporal_features: list[str]
-    static_features: list[str]
 
     @classmethod
     def load(cls, path: Path) -> "TemporalCorpus":
@@ -70,17 +67,15 @@ class TemporalCorpus:
                     f"temporal corpus at {path} is schema version "
                     f"{int(data['schema_version'])}, expected "
                     f"{TEMPORAL_SCHEMA_VERSION}; rebuild it with "
-                    "scripts/dataset/build_temporal_dataset.py")
+                    "scripts/dataset/build_binned_corpus.py")
             return cls(
-                temporal=data["temporal"], static=data["static"], labels=data["labels"],
+                temporal=data["temporal"], labels=data["labels"],
                 option_indices=data["option_indices"], option_mask=data["option_mask"],
                 time_mask=data["time_mask"], scan_ids=data["scan_ids"],
                 topology_ids=data["topology_ids"],
                 configured_n_aps=data["configured_n_aps"],
                 n_hotspots=data["n_hotspots"],
-                candidate_strata=data["candidate_strata"],
                 temporal_features=data["temporal_features"].tolist(),
-                static_features=data["static_features"].tolist(),
             )
 
     def split(self, seed: int = 0, val_frac: float = 0.2,
@@ -100,8 +95,8 @@ class MaskedStandardizer:
 
     Fitted on training data only. `mask` selects the entries of `values` that
     are real observations; including padding would drag every statistic toward
-    whatever the padding happens to hold. Features with no spread are left
-    alone rather than divided by nearly zero.
+    whatever the padding happens to hold. A feature with no spread is still
+    centred, but its scale is left at 1.0 rather than dividing by nearly zero.
     """
 
     def __init__(self, values: np.ndarray, mask: np.ndarray):
@@ -118,12 +113,10 @@ class TemporalSetTransformer(nn.Module):
     """Encode time per AP, then compare AP embeddings without option order."""
 
     def __init__(self, n_temporal_features: int, max_steps: int,
-                 n_static_features: int = 0, model_dim: int = 48,
-                 heads: int = 4, temporal_layers: int = 2, set_layers: int = 2,
-                 dropout: float = 0.1):
+                 model_dim: int = 48, heads: int = 4, temporal_layers: int = 2,
+                 set_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.max_steps = max_steps
-        self.n_static_features = n_static_features
         self.input = nn.Linear(n_temporal_features, model_dim)
         self.cls = nn.Parameter(torch.zeros(1, 1, model_dim))
         self.position = nn.Parameter(torch.zeros(1, max_steps + 1, model_dim))
@@ -138,9 +131,6 @@ class TemporalSetTransformer(nn.Module):
             batch_first=True, norm_first=True)
         self.options = nn.TransformerEncoder(
             set_layer, set_layers, enable_nested_tensor=False)
-        self.static = (nn.Sequential(
-            nn.Linear(n_static_features, model_dim), nn.GELU(), nn.LayerNorm(model_dim))
-            if n_static_features else None)
         self.norm = nn.LayerNorm(model_dim)
         self.score = nn.Sequential(
             nn.Linear(model_dim, model_dim), nn.GELU(), nn.Dropout(dropout),
@@ -150,8 +140,7 @@ class TemporalSetTransformer(nn.Module):
         nn.init.normal_(self.position, std=0.02)
 
     def forward(self, temporal: torch.Tensor, option_mask: torch.Tensor,
-                time_mask: torch.Tensor,
-                static: torch.Tensor | None = None) -> torch.Tensor:
+                time_mask: torch.Tensor) -> torch.Tensor:
         batch, options, steps, _ = temporal.shape
         if steps > self.max_steps:
             raise ValueError(
@@ -162,8 +151,10 @@ class TemporalSetTransformer(nn.Module):
         cls = self.cls.expand(batch * options, -1, -1)
         tokens = torch.cat([cls, tokens], dim=1) + self.position[:, :steps + 1]
 
-        # Every option of a scan shares one time mask, because they were all
-        # heard during the same scan.
+        # One time mask per scan: it marks which BINS EXIST, not which options
+        # were heard in them. A bin where this option was silent still carries a
+        # level - forward-filled by the builder, with option_age saying how
+        # stale it is - so masking per option here would discard those.
         temporal_padding = ~time_mask[:, None, :].expand(batch, options, steps)
         temporal_padding = temporal_padding.reshape(batch * options, steps)
         # The prepended CLS token is never padding; it is what carries the
@@ -174,10 +165,6 @@ class TemporalSetTransformer(nn.Module):
         ], dim=1)
         encoded = self.temporal(tokens, src_key_padding_mask=temporal_padding)
         option_embeddings = encoded[:, 0].reshape(batch, options, -1)
-        if self.static is not None:
-            if static is None:
-                raise ValueError("static option features are required by this model")
-            option_embeddings = option_embeddings + self.static(static)
 
         compared = self.options(option_embeddings, src_key_padding_mask=~option_mask)
         return self.score(self.norm(compared)).squeeze(-1)

@@ -9,16 +9,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from models.data import (scan_sample_weights, split_by_topology,
+from scripts.models.data import (scan_sample_weights, split_by_topology,
                          split_rows_by_topology)
-from models.evaluate import (baseline_predictions, fit_rssi_busy_k,
-                             random_selection_metrics, selection_metrics)
-from models.frames import FrameCorpus
-from models.ranker import SetRanker, pack_scans, pointwise_loss, ranking_loss
-from models.temporal import (TemporalCorpus, TemporalSetTransformer,
+from scripts.models.evaluate import (baseline_predictions, fit_rssi_busy_k,
+                             selection_metrics)
+from scripts.models.frames import FrameCorpus
+from scripts.models.temporal import (TemporalCorpus, TemporalSetTransformer,
                              load_temporal_checkpoint)
 from scripts.simulate.run_sweep import Run, already_done
-from scripts.dataset.combine_datasets import combine_csv, combine_npz
 from scripts.train.learning_curve import subset_topologies
 from scripts.train.train_eval import choose_by_validation_regret, stratified_report
 
@@ -52,7 +50,7 @@ class ScanSplitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least 5 independent"):
             split_by_topology(frame)
 
-    def test_sample_weights_give_each_choice_set_equal_mass(self):
+    def test_sample_weights_give_each_scan_equal_mass(self):
         frame = pd.DataFrame({
             "scan_id": ["a", "a", "b", "b", "b", "b"],
         })
@@ -96,59 +94,6 @@ class ScanSplitTests(unittest.TestCase):
         self.assertTrue((small.groupby("topology_id").size() == 3).all())
 
 
-class DatasetCombinationTests(unittest.TestCase):
-    def test_csv_combination_rejects_duplicate_topologies(self):
-        columns = ["topology_id", "scan_id", "ap_index", "run_id",
-                   "label_throughput_mbps"]
-        first = pd.DataFrame([["a", "a_s0", 0, "a0", 1.0]], columns=columns)
-        second = pd.DataFrame([["b", "b_s0", 0, "b0", 2.0]], columns=columns)
-        duplicate = pd.DataFrame([["a", "a_s1", 0, "a1", 3.0]], columns=columns)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            paths = [root / "a.csv", root / "b.csv", root / "duplicate.csv"]
-            for frame, path in zip((first, second, duplicate), paths):
-                frame.to_csv(path, index=False)
-            out = root / "combined.csv"
-            combine_csv(paths[:2], out)
-            self.assertEqual(set(pd.read_csv(out).topology_id), {"a", "b"})
-            with self.assertRaisesRegex(ValueError, "duplicate topology IDs"):
-                combine_csv([paths[0], paths[2]], out)
-
-    def test_temporal_combination_pads_compatible_corpora(self):
-        def payload(prefix, options, steps):
-            return {
-                "schema_version": np.array(2, np.int16),
-                "temporal": np.ones((1, options, steps, 2), np.float32),
-                "static": np.ones((1, options, 3), np.float32),
-                "labels": np.ones((1, options), np.float32),
-                "option_indices": np.arange(options, dtype=np.int16)[None],
-                "option_mask": np.ones((1, options), bool),
-                "time_mask": np.ones((1, steps), bool),
-                "scan_ids": np.array([f"{prefix}_s0"]),
-                "topology_ids": np.array([prefix]),
-                "configured_n_aps": np.array([options], np.int16),
-                "n_hotspots": np.array([0], np.int16),
-                "candidate_strata": np.array(["boundary"]),
-                "temporal_features": np.array(["t0", "t1"]),
-                "static_features": np.array(["s0", "s1", "s2"]),
-                "bin_ms": np.array(10.0, np.float32),
-                "scan_description": np.array("passive"),
-            }
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            paths = [root / "a.npz", root / "b.npz"]
-            np.savez_compressed(paths[0], **payload("a", 2, 3))
-            np.savez_compressed(paths[1], **payload("b", 3, 4))
-            out = root / "combined.npz"
-            combine_npz(paths, out)
-            with np.load(out, allow_pickle=False) as combined:
-                self.assertEqual(combined["temporal"].shape, (2, 3, 4, 2))
-                self.assertEqual(int(combined["option_mask"].sum()), 5)
-                self.assertFalse(bool(combined["option_mask"][0, 2]))
-                self.assertFalse(bool(combined["time_mask"][0, 3]))
-
-
 class SweepResumeTests(unittest.TestCase):
     def test_resume_requires_matching_scenario_and_complete_shared_trace(self):
         topology = {
@@ -157,7 +102,7 @@ class SweepResumeTests(unittest.TestCase):
             "hotspotAPs": "1",
             "topologySeed": 19,
         }
-        candidate = {"candidateStratum": "boundary", "candidateSeed": 77}
+        candidate = {"candidateSeed": 77}
         metadata = {
             "rng_seed": 23,
             "params": {
@@ -168,7 +113,6 @@ class SweepResumeTests(unittest.TestCase):
                 "hotspot_aps": [1],
             },
             "candidate_seed": 77,
-            "candidate_stratum": "boundary",
             "candidate_position": {"x": 12.5, "y": 3.0},
             "candidate": {"target_ap": 0},
         }
@@ -185,58 +129,8 @@ class SweepResumeTests(unittest.TestCase):
             # a different candidate seed is a different position, not a resume
             self.assertFalse(already_done(root, job._replace(
                 candidate=dict(candidate, candidateSeed=99))))
-            self.assertFalse(already_done(root, job._replace(
-                candidate=dict(candidate, candidateStratum="ap_near"))))
             (run / "chanbusy.csv").write_text("short")
             self.assertFalse(already_done(root, job))
-
-
-class RankingLossTests(unittest.TestCase):
-    def test_correct_order_has_lower_loss(self):
-        labels = torch.tensor([[20.0, 10.0, 9.8, 0.0]])
-        mask = torch.tensor([[True, True, True, False]])
-        correct = torch.tensor([[2.0, 1.0, 0.0, 99.0]])
-        reversed_order = torch.tensor([[0.0, 1.0, 2.0, -99.0]])
-        self.assertLess(ranking_loss(correct, labels, mask),
-                        ranking_loss(reversed_order, labels, mask))
-
-    def test_near_ties_and_padding_are_ignored(self):
-        labels = torch.tensor([[1.0, 1.2, 999.0]])
-        mask = torch.tensor([[True, True, False]])
-        scores = torch.tensor([[0.0, 100.0, -100.0]], requires_grad=True)
-        loss = ranking_loss(scores, labels, mask)
-        self.assertEqual(float(loss.detach()), 0.0)
-        loss.backward()
-        self.assertTrue(torch.isfinite(scores.grad).all())
-
-    def test_pointwise_loss_weights_groups_not_rows(self):
-        scores = torch.tensor([[1.0, 1.0, 0.0, 0.0],
-                               [3.0, 3.0, 3.0, 3.0]])
-        labels = torch.zeros_like(scores)
-        mask = torch.tensor([[True, True, False, False],
-                             [True, True, True, True]])
-        self.assertAlmostEqual(float(pointwise_loss(scores, labels, mask)), 5.0)
-
-
-class SetRankerTests(unittest.TestCase):
-    def test_option_permutation_equivariance_and_padding_isolation(self):
-        torch.manual_seed(3)
-        model = SetRanker(5, hidden=12, embed=8, dropout=0.0).eval()
-        values = torch.randn(1, 4, 5)
-        mask = torch.tensor([[True, True, True, False]])
-        with torch.no_grad():
-            reference = model(values, mask)
-
-            permutation = torch.tensor([2, 0, 1, 3])
-            permuted = model(values[:, permutation], mask[:, permutation])
-            changed_padding = values.clone()
-            changed_padding[:, 3] = 1e6
-            padded = model(changed_padding, mask)
-
-        inverse = torch.argsort(permutation)
-        self.assertTrue(torch.allclose(reference[:, :3],
-                                       permuted[:, inverse][:, :3], atol=1e-6))
-        self.assertTrue(torch.allclose(reference[:, :3], padded[:, :3], atol=1e-6))
 
 
 class EvaluationTests(unittest.TestCase):
@@ -303,10 +197,13 @@ class EvaluationTests(unittest.TestCase):
             "ap_index": [0, 1, 0, 1, 2],
             "label_throughput_mbps": [10.0, 0.0, 9.0, 6.0, 0.0],
         })
-        metrics = random_selection_metrics(frame)
+        flat = baseline_predictions(frame, frame)["random"]
+        metrics = selection_metrics(frame, flat)
+        # a flat score ties every option, so regret is the mean over the set
         self.assertAlmostEqual(metrics["mean_regret_mbps"], (5.0 + 4.0) / 2)
         shuffled = frame.sample(frac=1.0, random_state=2)
-        self.assertEqual(metrics, random_selection_metrics(shuffled))
+        self.assertEqual(metrics, selection_metrics(
+            shuffled, baseline_predictions(shuffled, shuffled)["random"]))
 
         original = dict(zip(zip(frame.scan_id, frame.ap_index),
                             baseline_predictions(frame, frame)["random"]))
@@ -330,8 +227,7 @@ class EvaluationTests(unittest.TestCase):
 
 class TemporalTransformerTests(unittest.TestCase):
     def test_checkpoint_loads_through_safe_weights_only_path(self):
-        model = TemporalSetTransformer(3, 4, n_static_features=2,
-                                       model_dim=8, heads=2,
+        model = TemporalSetTransformer(3, 4, model_dim=8, heads=2,
                                        temporal_layers=1, set_layers=1)
         payload = {
             "state_dict": model.state_dict(),
@@ -339,7 +235,6 @@ class TemporalTransformerTests(unittest.TestCase):
             "model": {
                 "n_temporal_features": 3,
                 "max_steps": 4,
-                "n_static_features": 2,
                 "model_dim": 8,
                 "heads": 2,
                 "temporal_layers": 1,
@@ -347,11 +242,8 @@ class TemporalTransformerTests(unittest.TestCase):
                 "dropout": 0.1,
             },
             "temporal_features": ["a", "b", "c"],
-            "static_features": ["x", "y"],
             "scaler_mean": torch.zeros(3),
             "scaler_std": torch.ones(3),
-            "static_scaler_mean": torch.zeros(2),
-            "static_scaler_std": torch.ones(2),
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"
@@ -363,8 +255,7 @@ class TemporalTransformerTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(3)
         self.model = TemporalSetTransformer(
-            n_temporal_features=6, max_steps=5, n_static_features=3,
-            model_dim=16, heads=4,
+            n_temporal_features=6, max_steps=5, model_dim=16, heads=4,
             temporal_layers=1, set_layers=1, dropout=0.0)
         self.model.eval()
         self.temporal = torch.randn(2, 4, 5, 6)
@@ -376,16 +267,13 @@ class TemporalTransformerTests(unittest.TestCase):
             [True, True, True, False, False],
             [True, True, True, True, True],
         ])
-        self.static = torch.randn(2, 4, 3)
 
     def test_option_permutation_equivariance(self):
         permutation = torch.tensor([2, 0, 3, 1])
         with torch.no_grad():
-            original = self.model(self.temporal, self.option_mask, self.time_mask,
-                                  self.static)
+            original = self.model(self.temporal, self.option_mask, self.time_mask)
             permuted = self.model(self.temporal[:, permutation],
-                                  self.option_mask[:, permutation], self.time_mask,
-                                  self.static[:, permutation])
+                                  self.option_mask[:, permutation], self.time_mask)
         np.testing.assert_allclose(
             permuted.numpy(), original[:, permutation].numpy(), rtol=1e-5, atol=1e-6)
 
@@ -394,12 +282,8 @@ class TemporalTransformerTests(unittest.TestCase):
         changed[0, 3] = 1e6
         changed[0, :3, 3:] = -1e6
         with torch.no_grad():
-            original = self.model(self.temporal, self.option_mask, self.time_mask,
-                                  self.static)
-            changed_static = self.static.clone()
-            changed_static[0, 3] = 1e6
-            altered = self.model(changed, self.option_mask, self.time_mask,
-                                 changed_static)
+            original = self.model(self.temporal, self.option_mask, self.time_mask)
+            altered = self.model(changed, self.option_mask, self.time_mask)
         np.testing.assert_allclose(
             altered[0, :3].numpy(), original[0, :3].numpy(), rtol=1e-5, atol=1e-6)
 
@@ -443,7 +327,6 @@ class CorpusSplitTests(unittest.TestCase):
         n = len(topology_ids)
         return TemporalCorpus(
             temporal=np.zeros((n, 2, 3, 4), np.float32),
-            static=np.zeros((n, 2, 1), np.float32),
             labels=np.zeros((n, 2), np.float32),
             option_indices=np.zeros((n, 2), np.int16),
             option_mask=np.ones((n, 2), bool),
@@ -451,8 +334,7 @@ class CorpusSplitTests(unittest.TestCase):
             scan_ids=np.array([f"g{i}" for i in range(n)]),
             topology_ids=topology_ids, configured_n_aps=configured,
             n_hotspots=np.zeros(n, np.int16),
-            candidate_strata=np.array(["boundary"] * n),
-            temporal_features=["a", "b", "c", "d"], static_features=["s"])
+            temporal_features=["a", "b", "c", "d"])
 
     def _frame_corpus(self):
         topology_ids, configured = self._ids()
@@ -461,15 +343,13 @@ class CorpusSplitTests(unittest.TestCase):
             frames=np.zeros((n, 5, 2), np.float32),
             relations=np.zeros((n, 2, 5), np.uint8),
             frame_mask=np.ones((n, 5), bool),
-            static=np.zeros((n, 2, 1), np.float32),
             labels=np.zeros((n, 2), np.float32),
             option_indices=np.zeros((n, 2), np.int16),
             option_mask=np.ones((n, 2), bool),
             scan_ids=np.array([f"g{i}" for i in range(n)]),
             topology_ids=topology_ids, configured_n_aps=configured,
-            n_hotspots=np.zeros(n, np.int16),
-            candidate_strata=np.array(["boundary"] * n),
-            frame_features=["a", "b"], static_features=["s"])
+            n_hotspots=np.zeros(n, np.int16), window_s=np.full(n, 6.0, np.float32),
+            frame_features=["a", "b"])
 
     def test_binned_and_frame_corpora_split_identically(self):
         temporal, frames = self._temporal_corpus(), self._frame_corpus()
@@ -494,7 +374,7 @@ class SpearmanTests(unittest.TestCase):
         metrics = selection_metrics(frame, np.array([1.0, 0.0, 5.0, 5.0]))
         self.assertAlmostEqual(metrics["mean_spearman"], 0.5)
 
-    def test_a_choice_set_with_nothing_to_order_is_left_out_of_the_average(self):
+    def test_a_scan_with_nothing_to_order_is_left_out_of_the_average(self):
         frame = pd.DataFrame({
             "scan_id": ["a", "a", "b", "b"],
             "label_throughput_mbps": [10.0, 0.0, 7.0, 7.0],
@@ -530,17 +410,6 @@ class BusyHeuristicFitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing"):
             fit_rssi_busy_k(self._frame().drop(columns=["feat_ap_rssi_mean"]),
                             "feat_chan_cca_busy_frac")
-
-
-class MakeGroupsTests(unittest.TestCase):
-    def test_a_frame_that_was_not_reindexed_is_refused(self):
-        frame = pd.DataFrame({
-            "scan_id": ["a", "a"],
-            "label_throughput_mbps": [1.0, 2.0],
-            "feat_x": [0.0, 1.0],
-        }, index=[7, 8])
-        with self.assertRaisesRegex(ValueError, "indexed 0..n-1"):
-            pack_scans(frame, ["feat_x"])
 
 
 if __name__ == "__main__":

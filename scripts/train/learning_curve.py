@@ -23,8 +23,8 @@ that has flattened says the next simulation run buys little, and the money is
 better spent elsewhere.
 
 Run:
-  .venv/bin/python3 scripts/train/learning_curve.py data/v3_dataset.csv \
-      --out results_v3/learning_curve.csv
+  .venv/bin/python3 scripts/train/learning_curve.py data/aggregate.csv \
+      --out results/learning_curve.csv
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from models.data import (feature_columns, scan_sample_weights, impute_features,  # noqa: E402
+from scripts.models.data import (feature_columns, scan_sample_weights, impute_features,  # noqa: E402
                          load_dataset, split_by_topology, to_xy)
-from models.evaluate import baseline_predictions, selection_metrics  # noqa: E402
+from scripts.models.evaluate import baseline_predictions, selection_metrics  # noqa: E402
 
 
 def subset_topologies(train: pd.DataFrame, fraction: float, seed: int) -> pd.DataFrame:
@@ -121,8 +121,6 @@ def main() -> int:
     for repeat in range(args.repeats):
         full_train, _, test = split_by_topology(frame, seed=repeat)
         for name, prediction in baseline_predictions(test, fit_frame=full_train).items():
-            if name == "random":
-                continue
             rows.append({
                 "split_seed": repeat,
                 "train_fraction": 0.0,

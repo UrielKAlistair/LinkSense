@@ -126,11 +126,8 @@ def sample_topology(rng: random.Random) -> dict:
 
 
 def sample_candidate(rng: random.Random) -> dict:
-    """Where the client stands, as a stratum the simulator resolves."""
-    return {
-        "candidateStratum": "boundary" if rng.random() < 0.70 else "ap_near",
-        "candidateSeed": rng.randrange(1, 2**31 - 1),
-    }
+    """Where the client stands: a seed the simulator draws a uniform position from."""
+    return {"candidateSeed": rng.randrange(1, 2**31 - 1)}
 
 
 def merge_manifest(out_dir: Path, manifest: dict) -> None:
@@ -194,8 +191,7 @@ def already_done(out_dir: Path, run: Run) -> bool:
             params["n_aps"] == topology["nAPs"] and
             params["n_stas"] == topology["nSTAs"] and
             params["hotspot_aps"] == expected_hotspots and
-            stored["candidate_seed"] == candidate["candidateSeed"] and
-            stored["candidate_stratum"] == candidate["candidateStratum"]
+            stored["candidate_seed"] == candidate["candidateSeed"]
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False

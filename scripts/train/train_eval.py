@@ -8,12 +8,11 @@ was, how this option compares to the others on offer - and labelled with the
 throughput it would actually have delivered. Rows sharing a scan_id are the
 options in one scan, and the job is to score them so the best comes top.
 
-Four learned models are trained on that table: a regularised linear model, two
-tree ensembles, and a small neural ranker that sees a whole scan at once
-together with the same network with that ability switched off. All of them are
-reported against the heuristics a real client could run instead - strongest
-signal, least busy channel, and signal traded off against channel occupancy. A
-model that cannot beat strongest signal has not justified itself.
+Three learned models are trained on that table: a regularised linear model and
+two tree ensembles, each predicting throughput per row. All are reported against
+the heuristics a real client could run instead - strongest signal, least busy
+channel, and signal traded off against channel occupancy. A model that cannot
+beat strongest signal has not justified itself.
 
 The protocol is strict because the corpus is small enough that sloppiness would
 dominate the result:
@@ -32,8 +31,12 @@ sliced by deployment size, hotspot count, client placement and whether the scan
 found every access point.
 
 Run:
-  .venv/bin/python3 scripts/train/train_eval.py data/v3_dataset.csv \
-      --out-dir results_v3/static
+  .venv/bin/python3 scripts/train/train_eval.py data/aggregate.csv \
+      --out-dir results/static
+
+TODO: this overlaps scripts/models/baseline.py, which fits the same tree models
+from its own entry point, scoring on validation and adding permutation
+importance. One of the two is to be deleted.
 """
 
 from __future__ import annotations
@@ -48,25 +51,14 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from models.data import (assert_no_leakage, feature_columns, scan_sample_weights,  # noqa: E402
+from scripts.models.data import (assert_no_leakage, feature_columns, scan_sample_weights,  # noqa: E402
                          impute_features, load_dataset, split_by_topology, to_xy)
-from models.evaluate import (evaluate_all, label_spread,  # noqa: E402
+from scripts.models.evaluate import (evaluate_all, label_spread,  # noqa: E402
                              selection_metrics, validation_selection_key)
 
 METRICS = ["top1_accuracy", "mean_regret_mbps", "median_regret_mbps",
            "mean_regret_frac", "mean_spearman", "topology_top1_accuracy",
            "topology_mean_regret_mbps", "mae", "rmse", "r2", "r2_log"]
-
-# (alpha, temperature) settings searched for the neural ranker. alpha is the
-# weight on the ranking term and stays below 1 so the pointwise term is always
-# present: a purely ranking-based score is defined only up to a monotone
-# transform, which leaves the ordering intact but makes the regression metrics
-# meaningless. temperature is the Mbps scale over which regret weights saturate.
-# The five settings cover calibration-heavy, balanced and ranking-heavy
-# objectives, varying the regret scale around the balanced one.
-# scripts/train/ablation_context.py searches the same five so that the cells
-# both scripts measure stay comparable.
-RANKER_OBJECTIVES = ((0.3, 5.0), (0.7, 2.0), (0.7, 5.0), (0.7, 10.0), (0.9, 5.0))
 
 # A scan counts as one where signal strength already gives the right
 # answer if the strongest option is within this many Mbps of the best. Matches
@@ -189,8 +181,7 @@ def dimension_report(preds_df: pd.DataFrame, models: list[str]) -> pd.DataFrame:
     """Regret by simulator regime and full/partial passive discovery."""
     pooled = pool_across_splits(preds_df)
     rows = []
-    for dimension in ("gt_n_aps", "gt_n_hotspots", "gt_candidate_stratum",
-                      "discovery"):
+    for dimension in ("gt_n_aps", "gt_n_hotspots", "discovery"):
         if dimension not in pooled:
             continue
         for value, subset in pooled.groupby(dimension):
@@ -206,56 +197,16 @@ def dimension_report(preds_df: pd.DataFrame, models: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fit_ranker(train, val, test, feats, seed, epochs, patience):
-    import torch
-
-    from models.ranker import (SetRanker, Standardizer, pack_scans, predict_rows,
-                               train as train_ranker)
-
-    scaler = Standardizer(train[feats].to_numpy(dtype=np.float32))
-    tr, va, te = (pack_scans(d, feats, scaler) for d in (train, val, test))
-
-    val_pred, test_pred, chosen = {}, {}, {}
-    # "mlp_pointwise" is the same network with the set context switched off:
-    # it feeds zeros where the pooled context would go, so both architectures
-    # carry the same parameter count and any difference between them is
-    # attributable to seeing the alternatives rather than to capacity.
-    for name, use_context in (("set_ranker", True), ("mlp_pointwise", False)):
-        cands, models = [], {}
-        for alpha, temp in RANKER_OBJECTIVES:
-            torch.manual_seed(seed)
-            m = SetRanker(len(feats), dropout=0.1, use_context=use_context)
-            m = train_ranker(m, tr, va, epochs=epochs, lr=3e-3,
-                             weight_decay=1e-3, alpha=alpha, temperature=temp,
-                             seed=seed, verbose=False, patience=patience)
-            p = np.expm1(np.clip(predict_rows(m, va, len(val)), -5, 12))
-            cands.append(((alpha, temp), p))
-            models[(alpha, temp)] = m
-        (regret, _), (alpha, temp) = choose_by_validation_regret(cands, val)
-        model = models[(alpha, temp)]
-        val_pred[name] = np.expm1(np.clip(predict_rows(model, va, len(val)), -5, 12))
-        test_pred[name] = np.expm1(np.clip(predict_rows(model, te, len(test)), -5, 12))
-        chosen[name] = {"alpha": alpha, "temperature": temp,
-                        "val_topology_regret": round(regret, 4)}
-    return val_pred, test_pred, chosen
-
-
-def run_once(df, feats, seed, ranker_epochs, ranker_patience):
+def run_once(df, feats, seed):
     train, val, test = split_by_topology(df, seed=seed)
     val_pred, test_pred, chosen = fit_tree_models(train, val, test, feats, seed)
-    v, t, c = fit_ranker(train, val, test, feats, seed,
-                         ranker_epochs, ranker_patience)
-    val_pred.update(v)
-    test_pred.update(t)
-    chosen.update(c)
     res = evaluate_all(test, test_pred, train)
     res["split_seed"] = seed
 
     # keep per-row test predictions so results can be sliced afterwards
-    from models.evaluate import baseline_predictions
+    from scripts.models.evaluate import baseline_predictions
     keep = ["topology_id", "scan_id", "ap_index", "label_throughput_mbps",
-            "gt_n_aps", "gt_n_hotspots", "gt_candidate_stratum",
-            "gt_n_channels", "gt_true_distance", "feat_ap_rssi_mean"]
+            "gt_n_aps", "gt_n_hotspots", "gt_n_channels", "gt_true_distance", "feat_ap_rssi_mean"]
     rows = test[[c for c in keep if c in test.columns]].copy()
     rows["split_seed"] = seed
     for name, p in {**baseline_predictions(test, fit_frame=train), **test_pred}.items():
@@ -325,8 +276,6 @@ def parse_args():
     parser.add_argument("--out-dir", type=Path, default=Path("results/main"))
     parser.add_argument("--repeats", type=int, default=5,
                         help="number of independent topology splits to average over")
-    parser.add_argument("--ranker-epochs", type=int, default=200)
-    parser.add_argument("--ranker-patience", type=int, default=25)
     return parser.parse_args()
 
 
@@ -404,7 +353,7 @@ def main():
     for i in range(args.repeats):
         print(f"--- split seed {i} ---")
         res, chosen, test, test_pred, rows = run_once(
-            df, feats, i, args.ranker_epochs, args.ranker_patience)
+            df, feats, i)
         pred_rows.append(rows)
         print(res[["model", "top1_accuracy", "mean_regret_mbps", "mean_spearman"]]
               .to_string(index=False))

@@ -28,6 +28,7 @@
 #include <limits>
 #include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -137,8 +138,6 @@ struct RunConfig
     uint32_t candidateSeed{0};
     std::string hotspotApsText{"none"};
     std::vector<uint32_t> hotspotAps;
-    double backgroundMbpsPerSta{0.0};   // >0 pins every station to one rate
-    double linkShadowingDb{kLinkShadowingDb};
     uint32_t topologySeed{1};
     uint32_t rngSeed{0};
     std::string outDir{"runs"};
@@ -214,15 +213,6 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("hotspotAPs",
                  "comma-separated APs around which background stations gather; 'none' disables",
                  config.hotspotApsText);
-    cmd.AddValue("linkShadowingDb",
-                 "log-normal shadowing sigma in dB, one draw per node pair fixed "
-                 "for the run, used by both association and the channel; 0 gives "
-                 "nearest-AP assignment and an unshadowed channel",
-                 config.linkShadowingDb);
-    cmd.AddValue("bgPerStaMbps",
-                 "pin every background station to this load instead of drawing; "
-                 "0 draws each station from the log-normal",
-                 config.backgroundMbpsPerSta);
     cmd.AddValue("topologySeed",
                  "seeds the whole deployment: station placement and offered "
                  "loads, AP channel assignment, and the shadowing between "
@@ -243,10 +233,7 @@ ParseRunConfig(int argc, char* argv[])
     NS_ABORT_MSG_IF(config.nAps > 200, "nAPs must be at most 200");
     NS_ABORT_MSG_IF(config.nStas == 0, "nSTAs must be at least 1");
     NS_ABORT_MSG_IF(config.targetAp >= config.nAps, "targetAP must be less than nAPs");
-    NS_ABORT_MSG_IF(config.backgroundMbpsPerSta < 0.0,
-                    "bgPerStaMbps must be zero (draw per station) or positive");
     NS_ABORT_MSG_IF(config.topologySeed == 0, "topologySeed must be positive");
-    NS_ABORT_MSG_IF(config.linkShadowingDb < 0.0, "linkShadowingDb must not be negative");
     NS_ABORT_MSG_IF(std::isnan(config.candidateX) != std::isnan(config.candidateY),
                     "give both candidateX and candidateY, or neither");
     NS_ABORT_MSG_IF(std::isnan(config.candidateX) && config.candidateSeed == 0,
@@ -370,35 +357,32 @@ BuildTopology(const RunConfig& config)
             2654435761u +
         7u);
     topology.shadowingDb.assign(nNodes, std::vector<double>(nNodes, 0.0));
-    if (config.linkShadowingDb > 0.0)
+    // Each stream needs its own distribution object. This is a C++ standard
+    // library pitfall, not an ns-3 one: std::normal_distribution generates
+    // values in pairs, keeps the spare inside the distribution object, and
+    // returns it on the next call whichever engine that call passes. With
+    // one shared object, whenever the number of background pairs was odd,
+    // the candidate's link to AP 0 received the background stream's
+    // leftover value, identical for every candidateSeed. Nothing crashes
+    // and every value is a valid draw, so it only shows up as candidate
+    // positions that fail to vary. (The uniform distributions below are
+    // shared safely: libstdc++ keeps no state in them.)
+    std::normal_distribution<double> shadowDraw(0.0, kLinkShadowingDb);
+    std::normal_distribution<double> candidateShadowDraw(0.0, kLinkShadowingDb);
+    for (uint32_t i = 0; i < candidateIndex; ++i)
     {
-        // Each stream needs its own distribution object. This is a C++ standard
-        // library pitfall, not an ns-3 one: std::normal_distribution generates
-        // values in pairs, keeps the spare inside the distribution object, and
-        // returns it on the next call whichever engine that call passes. With
-        // one shared object, whenever the number of background pairs was odd,
-        // the candidate's link to AP 0 received the background stream's
-        // leftover value, identical for every candidateSeed. Nothing crashes
-        // and every value is a valid draw, so it only shows up as candidate
-        // positions that fail to vary. (The uniform distributions below are
-        // shared safely: libstdc++ keeps no state in them.)
-        std::normal_distribution<double> shadowDraw(0.0, config.linkShadowingDb);
-        std::normal_distribution<double> candidateShadowDraw(0.0, config.linkShadowingDb);
-        for (uint32_t i = 0; i < candidateIndex; ++i)
+        for (uint32_t j = i + 1; j < candidateIndex; ++j)
         {
-            for (uint32_t j = i + 1; j < candidateIndex; ++j)
-            {
-                double draw = shadowDraw(shadowRng);
-                topology.shadowingDb[i][j] = draw;
-                topology.shadowingDb[j][i] = draw;
-            }
+            double draw = shadowDraw(shadowRng);
+            topology.shadowingDb[i][j] = draw;
+            topology.shadowingDb[j][i] = draw;
         }
-        for (uint32_t i = 0; i < candidateIndex; ++i)
-        {
-            double draw = candidateShadowDraw(candidateShadowRng);
-            topology.shadowingDb[i][candidateIndex] = draw;
-            topology.shadowingDb[candidateIndex][i] = draw;
-        }
+    }
+    for (uint32_t i = 0; i < candidateIndex; ++i)
+    {
+        double draw = candidateShadowDraw(candidateShadowRng);
+        topology.shadowingDb[i][candidateIndex] = draw;
+        topology.shadowingDb[candidateIndex][i] = draw;
     }
     std::uniform_real_distribution<double> uniformX(minX - border, maxX + border);
     std::uniform_real_distribution<double> uniformY(minY - border, maxY + border);
@@ -753,39 +737,30 @@ class ObservationRecorder
 };
 
 // ---------------------------------------------------------------------------
-// Uplink traffic, and a count of the bytes each flow delivers.
+// Uplink traffic, and the bytes the candidate delivers.
 //
-// A flow is one sender's packets to its own receiving socket on an AP. Each
-// flow has a byte counter, and its socket's receive callback carries the
-// counter's index, so arriving bytes go straight to the right counter.
+// gCandidateBytes adds up every packet that reaches the candidate's socket on
+// its AP. Divided by the time from association to the end of the run, it is
+// the candidate's throughput.
 // ---------------------------------------------------------------------------
-struct FlowStats
-{
-    uint64_t bytesTotal{0};
-};
-
-std::vector<FlowStats> gFlowStats;
+uint64_t gCandidateBytes{0};
 
 void
-ReceivePacket(std::size_t flowIndex, Ptr<Socket> socket)
+ReceiveCandidatePacket(Ptr<Socket> socket)
 {
     Ptr<Packet> packet;
     while ((packet = socket->Recv()))
     {
-        gFlowStats.at(flowIndex).bytesTotal += packet->GetSize();
+        gCandidateBytes += packet->GetSize();
     }
 }
 
-std::size_t
+Ptr<Socket>
 InstallSink(Ptr<Node> node, const Address& localAddress, TypeId socketType)
 {
-    std::size_t flowIndex = gFlowStats.size();
-    gFlowStats.emplace_back();
-
     Ptr<Socket> sink = Socket::CreateSocket(node, socketType);
     sink->Bind(localAddress);
-    sink->SetRecvCallback(MakeBoundCallback(&ReceivePacket, flowIndex));
-    return flowIndex;
+    return sink;
 }
 
 // Background packets leave at exponentially distributed gaps, so each station
@@ -888,22 +863,12 @@ main(int argc, char* argv[])
         Seconds(kPacketSize * 8.0 / (kCandidateOfferedMbps * 1e6));
 
     // -----------------------------------------------------------------------
-    // Radio and propagation model.
+    // Propagation.
     //
     // Every radio shares one MultiModelSpectrumChannel. Channel numbers do not
     // isolate radios from one another: a transmission on an adjacent channel
     // still puts power into a receiver's band.
     // -----------------------------------------------------------------------
-    WifiHelper wifi;
-    wifi.SetStandard(WIFI_STANDARD_80211n);
-    wifi.SetRemoteStationManager("ns3::MinstrelHtWifiManager");
-
-    // SpectrumWifiPhy spreads each transmission's power across frequency with
-    // the 802.11 transmit spectral mask, so a transmitter on an adjacent channel
-    // adds power in a receiver's band and can register in its carrier sense.
-    SpectrumWifiPhyHelper wifiPhy;
-    wifiPhy.Set("RxGain", DoubleValue(0.0));
-
     Ptr<MultiModelSpectrumChannel> sharedChannel =
         CreateObject<MultiModelSpectrumChannel>();
 
@@ -931,7 +896,10 @@ main(int argc, char* argv[])
     sharedChannel->SetPropagationDelayModel(
         CreateObject<ConstantSpeedPropagationDelayModel>());
 
-    wifiPhy.SetChannel(sharedChannel);
+    // -----------------------------------------------------------------------
+    // The deployment: AP channels and SSIDs, station loads, packet timing and
+    // positions.
+    // -----------------------------------------------------------------------
 
     // Each AP's channel is drawn uniformly from kApChannels. AP channels and
     // station loads come from topologySeed alone, each through its own
@@ -952,28 +920,17 @@ main(int argc, char* argv[])
 
     // The distinct channels in use, in ascending order. APs can share a
     // channel, so there may be fewer of these than APs.
-    std::vector<uint32_t> occupiedChannels;
-    for (uint8_t channel : apChannel)
-    {
-        occupiedChannels.push_back(channel);
-    }
-    std::sort(occupiedChannels.begin(), occupiedChannels.end());
-    occupiedChannels.erase(std::unique(occupiedChannels.begin(), occupiedChannels.end()),
-                           occupiedChannels.end());
+    std::set<uint32_t> distinctChannels(apChannel.begin(), apChannel.end());
+    std::vector<uint32_t> occupiedChannels(distinctChannels.begin(), distinctChannels.end());
     uint32_t nOccupiedChannels = static_cast<uint32_t>(occupiedChannels.size());
 
-    // Each background station's offered load: backgroundMbpsPerSta for every
-    // station when it is given, otherwise one log-normal draw per station,
+    // Each background station's offered load: one log-normal draw per station,
     // capped at kBgLoadCapMbps.
-    std::vector<double> staOfferedMbps(config.nStas, config.backgroundMbpsPerSta);
-    if (config.backgroundMbpsPerSta <= 0.0)
+    std::lognormal_distribution<double> loadDraw(std::log(kBgLoadMedianMbps), kBgLoadSigmaLog);
+    std::vector<double> staOfferedMbps(config.nStas);
+    for (uint32_t sta = 0; sta < config.nStas; ++sta)
     {
-        std::lognormal_distribution<double> loadDraw(std::log(kBgLoadMedianMbps),
-                                                     kBgLoadSigmaLog);
-        for (uint32_t sta = 0; sta < config.nStas; ++sta)
-        {
-            staOfferedMbps[sta] = std::min(kBgLoadCapMbps, loadDraw(rateRng));
-        }
+        staOfferedMbps[sta] = std::min(kBgLoadCapMbps, loadDraw(rateRng));
     }
 
     // One packet-timing generator per background station, seeded from both
@@ -981,7 +938,6 @@ main(int argc, char* argv[])
     // alone (above); the moments its packets leave also change with rngSeed.
     const uint32_t trafficBase =
         (config.topologySeed * 2654435761u) ^ (config.rngSeed * 2246822519u);
-    gTrafficRngs.clear();
     gTrafficRngs.reserve(config.nStas);
     for (uint32_t sta = 0; sta < config.nStas; ++sta)
     {
@@ -1008,6 +964,16 @@ main(int argc, char* argv[])
     allNodes.Add(apNodes);
     allNodes.Add(backgroundNodes);
     allNodes.Add(candidateNode);
+
+    WifiHelper wifi;
+    wifi.SetStandard(WIFI_STANDARD_80211n);
+    wifi.SetRemoteStationManager("ns3::MinstrelHtWifiManager");
+
+    // SpectrumWifiPhy spreads each transmission's power across frequency with
+    // the 802.11 transmit spectral mask, so a transmitter on an adjacent channel
+    // adds power in a receiver's band and can register in its carrier sense.
+    SpectrumWifiPhyHelper wifiPhy;
+    wifiPhy.SetChannel(sharedChannel);
 
     WifiMacHelper wifiMac;
     std::vector<NetDeviceContainer> apGroupDevices(config.nAps);
@@ -1090,17 +1056,14 @@ main(int argc, char* argv[])
     // Now that every node has a mobility model, give the channel the shadowing
     // drawn in BuildTopology, the same values StrongestAp used. SetLoss takes
     // attenuation, so the sign flips: a positive draw means extra received power.
-    if (config.linkShadowingDb > 0.0)
+    for (uint32_t i = 0; i < allNodes.GetN(); ++i)
     {
-        for (uint32_t i = 0; i < allNodes.GetN(); ++i)
+        for (uint32_t j = i + 1; j < allNodes.GetN(); ++j)
         {
-            for (uint32_t j = i + 1; j < allNodes.GetN(); ++j)
-            {
-                shadowingModel->SetLoss(allNodes.Get(i)->GetObject<MobilityModel>(),
-                                        allNodes.Get(j)->GetObject<MobilityModel>(),
-                                        -topology.shadowingDb[i][j],
-                                        true);
-            }
+            shadowingModel->SetLoss(allNodes.Get(i)->GetObject<MobilityModel>(),
+                                    allNodes.Get(j)->GetObject<MobilityModel>(),
+                                    -topology.shadowingDb[i][j],
+                                    true);
         }
     }
 
@@ -1118,21 +1081,20 @@ main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
-    // Uplink traffic and byte accounting.
+    // Uplink traffic.
     //
     // Every background station sends to its own socket on its AP from
     // kBackgroundStartS. The candidate sends to its own socket on targetAP from
     // kCandidateStartS.
     // -----------------------------------------------------------------------
     TypeId udpSocketType = TypeId::LookupByName("ns3::UdpSocketFactory");
-    std::vector<std::vector<std::size_t>> apFlowStats(config.nAps);
 
     for (uint32_t ap = 0; ap < config.nAps; ++ap)
     {
         for (uint32_t localSta = 0; localSta < apStaGlobalIndex[ap].size(); ++localSta)
         {
             Address sinkAddress = InetSocketAddress(apAddress[ap], kBasePort + localSta);
-            apFlowStats[ap].push_back(InstallSink(apNodes.Get(ap), sinkAddress, udpSocketType));
+            InstallSink(apNodes.Get(ap), sinkAddress, udpSocketType);
 
             uint32_t globalSta = apStaGlobalIndex[ap][localSta];
             ScheduleBackgroundTraffic(backgroundNodes.Get(globalSta),
@@ -1147,8 +1109,8 @@ main(int argc, char* argv[])
 
     Address candidateSinkAddress =
         InetSocketAddress(apAddress[config.targetAp], kBasePort + config.nStas);
-    std::size_t candidateFlowIndex =
-        InstallSink(apNodes.Get(config.targetAp), candidateSinkAddress, udpSocketType);
+    InstallSink(apNodes.Get(config.targetAp), candidateSinkAddress, udpSocketType)
+        ->SetRecvCallback(MakeCallback(&ReceiveCandidatePacket));
     ScheduleCandidateTraffic(candidateNode.Get(0),
                              InetSocketAddress(apAddress[config.targetAp],
                                                kBasePort + config.nStas),
@@ -1214,23 +1176,19 @@ main(int argc, char* argv[])
     //
     // throughput_mbps is the candidate's delivered bytes averaged from the
     // moment it associated to kSimulationStopS; nothing it sends before
-    // association is delivered. background_mbps is each AP's background
-    // stations' delivered bytes averaged from kBackgroundStartS to
-    // kSimulationStopS. metadata.json also records the run's parameters and
-    // the deployment.
+    // association is delivered. metadata.json also records the run's
+    // parameters and the deployment.
     // -----------------------------------------------------------------------
     bool candidateAssociated = gAssociation.time >= 0.0;
     double candidateObservedSeconds =
         candidateAssociated ? kSimulationStopS - gAssociation.time : 0.0;
     double candidateMbps =
         candidateAssociated && candidateObservedSeconds > 0.0
-            ? gFlowStats[candidateFlowIndex].bytesTotal * 8.0 / 1e6 /
-                  candidateObservedSeconds
+            ? gCandidateBytes * 8.0 / 1e6 / candidateObservedSeconds
             : 0.0;
 
     std::string associatedAp =
         candidateAssociated ? MacToString(gAssociation.ap) : std::string{};
-    double backgroundObservedSeconds = kSimulationStopS - kBackgroundStartS;
 
     std::ofstream metadata(runDir + "/metadata.json");
     NS_ABORT_MSG_IF(!metadata.is_open(), "could not open metadata.json");
@@ -1246,8 +1204,8 @@ main(int argc, char* argv[])
     metadata << "    \"ap_spacing\": " << kApSpacingM << ",\n";
     metadata << "    \"candidate_start_time\": " << kCandidateStartS << ",\n";
     metadata << "    \"observation_start_time\": " << kObservationStartS << ",\n";
-    // The listening window's length, not its end time: times in observation.csv
-    // and chanbusy.csv count from the window's start.
+    // The end of the listening window on the clock observation.csv and
+    // chanbusy.csv use, which reads 0 when listening begins.
     metadata << "    \"feature_window_end\": " << (kCandidateStartS - kObservationStartS)
              << ",\n";
     metadata << "    \"sim_stop_time\": " << kSimulationStopS << ",\n";
@@ -1259,11 +1217,10 @@ main(int argc, char* argv[])
     {
         bgTotalOffered += rate;
     }
-    metadata << "    \"link_shadowing_db\": " << config.linkShadowingDb << ",\n";
+    metadata << "    \"link_shadowing_db\": " << kLinkShadowingDb << ",\n";
     metadata << "    \"bg_load_median_mbps\": " << kBgLoadMedianMbps << ",\n";
     metadata << "    \"bg_load_sigma_log\": " << kBgLoadSigmaLog << ",\n";
     metadata << "    \"bg_load_cap_mbps\": " << kBgLoadCapMbps << ",\n";
-    metadata << "    \"bg_per_sta_fixed_mbps\": " << config.backgroundMbpsPerSta << ",\n";
     metadata << "    \"bg_mean_per_sta_mbps\": "
              << (config.nStas ? bgTotalOffered / config.nStas : 0.0) << ",\n";
     metadata << "    \"bg_total_offered_mbps\": " << bgTotalOffered << ",\n";
@@ -1295,13 +1252,6 @@ main(int argc, char* argv[])
 
     for (uint32_t ap = 0; ap < config.nAps; ++ap)
     {
-        uint64_t backgroundBytes = 0;
-        for (std::size_t flowIndex : apFlowStats[ap])
-        {
-            backgroundBytes += gFlowStats[flowIndex].bytesTotal;
-        }
-        double backgroundMbps =
-            backgroundBytes * 8.0 / 1e6 / backgroundObservedSeconds;
         std::string mac = MacToString(
             Mac48Address::ConvertFrom(apGroupDevices[ap].Get(0)->GetAddress()));
 
@@ -1311,7 +1261,6 @@ main(int argc, char* argv[])
                  << ", \"position\": {\"x\": " << topology.apPositions[ap].x
                  << ", \"y\": " << topology.apPositions[ap].y
                  << "}, \"sta_count\": " << apStaGlobalIndex[ap].size()
-                 << ", \"background_mbps\": " << backgroundMbps
                  << ", \"offered_mbps\": " << apOfferedMbps[ap]
                  << ", \"candidate_distance\": " << topology.candidateApDistance[ap]
                  << "}" << (ap + 1 < config.nAps ? ",\n" : "\n");
@@ -1339,8 +1288,7 @@ main(int argc, char* argv[])
              << ",\n";
     metadata << "    \"assoc_ap_mac\": \"" << associatedAp << "\",\n";
     metadata << "    \"observed_seconds\": " << candidateObservedSeconds << ",\n";
-    metadata << "    \"bytes_total\": " << gFlowStats[candidateFlowIndex].bytesTotal
-             << ",\n";
+    metadata << "    \"bytes_total\": " << gCandidateBytes << ",\n";
     metadata << "    \"throughput_mbps\": " << candidateMbps << "\n";
     metadata << "  }\n";
     metadata << "}\n";

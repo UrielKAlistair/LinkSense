@@ -46,10 +46,10 @@ def _is_rssi_level(col: str) -> bool:
 
     Excluded are the other columns whose names contain "rssi" but whose
     values are not levels: a standard deviation (never negative), and the
-    margins, differences, ranks and shares that compare one AP against the
-    others in its scan. Filling any of those with the level sentinel
-    would insert a value far outside their real range, which then dominates
-    the standardiser that ranker.py fits.
+    margins, differences and ranks that compare one AP against the others in
+    its scan. Filling any of those with the level sentinel would
+    insert a value far outside their real range, which then dominates any
+    standardiser fitted downstream.
 
     Maintainers adding a feat_*rssi* column must check which side it falls
     on: a new name matching none of the excluded keywords is treated as a
@@ -57,8 +57,7 @@ def _is_rssi_level(col: str) -> bool:
     """
     if "rssi" not in col:
         return False
-    return not any(k in col for k in
-                   ("_std", "margin", "minus", "rank", "share", "_frac"))
+    return not any(k in col for k in ("_std", "margin", "minus", "rank"))
 
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
@@ -83,8 +82,8 @@ def impute_features(df: pd.DataFrame) -> pd.DataFrame:
     Signal levels are filled with MISSING_RSSI_SENTINEL and every other
     feature with 0.0. Tree ensembles accept NaN and the neural models do
     not, so imputing once here means every model is fitted on identical
-    inputs. Callers that skip this step and hand a NaN to ranker.py or
-    temporal.py get NaN scores and a metric that refuses them.
+    inputs. Callers that skip this step and hand a NaN to temporal.py or
+    frames.py get NaN scores and a metric that refuses them.
     """
     df = df.copy()
     feats = feature_columns(df)
@@ -109,7 +108,15 @@ def split_by_topology(df: pd.DataFrame, val_frac: float = 0.2, test_frac: float 
         raise ValueError(
             f"dataset has no {TOPOLOGY_COL} column, so it cannot be split without "
             "risking repeated seeds of one deployment landing in two parts")
-    topology_frame = df.groupby(TOPOLOGY_COL, sort=True).first().reset_index()
+    missing = int(df[TOPOLOGY_COL].isna().sum())
+    if missing:
+        # groupby drops NaN keys, so these rows would reach none of the three
+        # parts and vanish from the split without a word.
+        raise ValueError(f"{missing} rows have no {TOPOLOGY_COL}; they would be "
+                         "dropped from every part rather than assigned to one")
+    columns = [TOPOLOGY_COL] + (["gt_n_aps"] if "gt_n_aps" in df.columns else [])
+    topology_frame = (df[columns].groupby(TOPOLOGY_COL, sort=True)
+                      .first().reset_index())
     topologies = topology_frame[TOPOLOGY_COL].to_numpy()
     if len(topologies) < MIN_TOPOLOGIES:
         raise ValueError(
@@ -118,7 +125,7 @@ def split_by_topology(df: pd.DataFrame, val_frac: float = 0.2, test_frac: float 
     strata = (topology_frame["gt_n_aps"].to_numpy()
               if "gt_n_aps" in topology_frame else None)
     parts = partition_ids(topologies, strata, val_frac, test_frac, seed)
-    _assert_disjoint(parts)
+    _assert_partition(parts, topologies)
     return tuple(df[df[TOPOLOGY_COL].isin(set(part))].reset_index(drop=True)
                  for part in parts)
 
@@ -146,18 +153,19 @@ def split_rows_by_topology(topology_ids: np.ndarray, strata: np.ndarray | None,
         first_group = [np.flatnonzero(topology_ids == t)[0] for t in topologies]
         per_topology_strata = strata[first_group]
     parts = partition_ids(topologies, per_topology_strata, val_frac, test_frac, seed)
-    _assert_disjoint(parts)
+    _assert_partition(parts, topologies)
     return tuple(np.flatnonzero(np.isin(topology_ids, part)) for part in parts)
 
 
-def _assert_disjoint(parts: tuple[np.ndarray, ...]) -> None:
-    """Fail if any identifier reached two parts.
+def _assert_partition(parts: tuple[np.ndarray, ...], ids: np.ndarray) -> None:
+    """Fail unless the parts are a true partition of `ids`.
 
-    partition_ids builds disjoint parts by construction, so this only fires
-    if that function is changed incorrectly - which is the one bug in this
-    file that would not show up as an error anywhere, only as scores that
-    are too good. Kept as a real check rather than an assert so that running
-    under python -O cannot switch it off.
+    Two things can go wrong and only one of them is visible. Overlap inflates
+    scores silently; a gap silently shrinks the corpus. partition_ids slices
+    one permutation, so overlap cannot happen by construction and coverage
+    can - which is why both are checked here rather than only the first.
+
+    A real check rather than an assert, so python -O cannot switch it off.
     """
     names = ("train", "val", "test")
     for i in range(len(parts)):
@@ -167,6 +175,12 @@ def _assert_disjoint(parts: tuple[np.ndarray, ...]) -> None:
                 raise AssertionError(
                     f"{names[i]} and {names[j]} share {len(shared)} identifiers: "
                     f"{sorted(shared)[:5]}")
+    missing = set(np.asarray(ids).tolist()) - set().union(
+        *(set(part.tolist()) for part in parts))
+    if missing:
+        raise AssertionError(
+            f"{len(missing)} identifiers reached no part at all: "
+            f"{sorted(missing)[:5]}")
 
 
 def partition_ids(ids: np.ndarray, strata: np.ndarray | None,

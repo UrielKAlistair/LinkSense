@@ -7,17 +7,12 @@ joined anything, and - for every access point it heard - the throughput it
 would have got had it joined that one. The job is to score the options so the
 best one comes top.
 
-Two transformers are trained on that corpus, sharing one architecture that
-first reads each option's time sequence and then compares the options to each
-other. They differ only in what they are asked to output:
+A transformer is trained on that corpus with an architecture that first reads
+each option's time sequence and then compares the options to each other. It
+predicts log1p of each option's throughput, so its scores read back as Mbps
+estimates.
 
-  regression  predicts log1p of each option's throughput, so its scores can be
-              read back as Mbps estimates.
-  ranking     predicts a distribution over the options, weighted so that
-              options close to the best one are near-ties. It orders the set
-              without claiming its scores mean anything in Mbps.
-
-Both are reported against a linear model over the same flattened sequence and
+It is reported against a linear model over the same flattened sequence and
 against the heuristics a real client could run instead - strongest signal,
 least busy channel, and signal traded off against channel occupancy. A model
 that cannot beat those has not earned its complexity.
@@ -27,8 +22,8 @@ deployment are near-copies, so letting them straddle a split inflates every
 number reported here.
 
 Run:
-  .venv/bin/python3 scripts/train/train_temporal.py data/v3_temporal.npz \
-      --out-dir results_v3/tx_10ms
+  .venv/bin/python3 scripts/train/train_temporal.py data/binned.npz \
+      --out-dir results/tx_10ms
 """
 
 from __future__ import annotations
@@ -45,10 +40,10 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from models.evaluate import (baseline_predictions, regression_metrics,  # noqa: E402
-                             random_selection_metrics, selection_metrics,
+from scripts.models.evaluate import (baseline_predictions, regression_metrics,  # noqa: E402
+                             selection_metrics,
                              validation_selection_key)
-from models.temporal import (MaskedStandardizer, TemporalCorpus,  # noqa: E402
+from scripts.models.temporal import (MaskedStandardizer, TemporalCorpus,  # noqa: E402
                              TemporalSetTransformer)
 
 
@@ -62,11 +57,9 @@ def corpus_observables(corpus: TemporalCorpus) -> dict[str, np.ndarray]:
     Signal averages only the bins that carried a reading, since a bin with no
     reading has no level to average. Occupancy averages every valid bin,
     because an idle bin is a genuine zero.
-
-    A maintainer who drops either key from the returned dict silently sends the
-    baselines back to corpus.static, which holds the feature table built by a
-    different scan schedule.
     """
+    # TODO: train_frames.py rebuilds the same heuristic inputs in observables().
+    # Decide where heuristic inputs should come from.
     names = list(corpus.temporal_features)
 
     def column(*candidates):
@@ -77,8 +70,8 @@ def corpus_observables(corpus: TemporalCorpus) -> dict[str, np.ndarray]:
 
     rssi_i = column("option_rssi_mean")
     seen_i = column("option_observed")
-    frames_i = column("option_frames_log1p")
-    busy_i = column("cca_busy_fraction", "own_cca_busy_fraction")
+    beacons_i = column("option_beacons_log1p")
+    busy_i = column("cca_busy_fraction")
     # cca_busy_fraction describes whichever channel the radio was tuned to at a
     # given step, so it carries the same value for every option at that step.
     # is_option_channel marks the steps that were on this option's own channel,
@@ -92,11 +85,10 @@ def corpus_observables(corpus: TemporalCorpus) -> dict[str, np.ndarray]:
     if rssi_i is not None:
         rssi = corpus.temporal[:, :, :, rssi_i]
         live = valid & (corpus.temporal[:, :, :, seen_i] > 0.5) if seen_i is not None else valid
-        # Each bin's reading is itself a mean over the frames that arrived in
-        # it, so bins are weighted by that count. Averaging the per-bin means
-        # unweighted lets a bin holding one frame outvote a bin holding ten.
-        weight = (np.expm1(corpus.temporal[:, :, :, frames_i])
-                  if frames_i is not None else np.ones_like(rssi))
+        # Each bin's reading is itself a mean over the beacons that arrived in
+        # it, so bins are weighted by that count.
+        weight = (np.expm1(corpus.temporal[:, :, :, beacons_i])
+                  if beacons_i is not None else np.ones_like(rssi))
         weight = np.where(live, weight, 0.0)
         total = (np.where(live, rssi, 0.0) * weight).sum(axis=2)
         heard = weight.sum(axis=2)
@@ -126,14 +118,9 @@ def _flat_frame(corpus: TemporalCorpus, indices: np.ndarray) -> pd.DataFrame:
                 "label_throughput_mbps": float(corpus.labels[group_index, option]),
                 "gt_n_aps": int(corpus.configured_n_aps[group_index]),
                 "gt_n_hotspots": int(corpus.n_hotspots[group_index]),
-                "gt_candidate_stratum": str(corpus.candidate_strata[group_index]),
                 "discovery": ("full" if corpus.option_mask[group_index].sum() ==
                               corpus.configured_n_aps[group_index] else "partial"),
             }
-            row.update(zip(corpus.static_features,
-                           corpus.static[group_index, option].astype(float)))
-            # overwrite the two columns the heuristics key on, so a baseline is
-            # computed from the same observation the model was given
             for name, values in observables.items():
                 row[name] = float(values[group_index, option])
             rows.append(row)
@@ -157,10 +144,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # variation; reuse a split seed here and the two can no longer be told apart.
 INIT_SEED = 9000
 
-# Mbps scale over which two options count as near-ties in the ranking target.
-# Fixed, not tuned: nothing in this script searches over it.
-RANK_TEMPERATURE = 5.0
-
 # Fixed so that re-running --shuffle-time reproduces the same permutation.
 TIME_SHUFFLE_SEED = 20260908
 
@@ -170,7 +153,7 @@ def to_device(a):
     return torch.from_numpy(a).to(DEVICE)
 
 
-def _predict(model, temporal, option_mask, time_mask, static, indices, batch_size=32):
+def _predict(model, temporal, option_mask, time_mask, indices, batch_size=32):
     model.eval()
     predictions = []
     with torch.no_grad():
@@ -180,7 +163,6 @@ def _predict(model, temporal, option_mask, time_mask, static, indices, batch_siz
                 to_device(temporal[idx]),
                 to_device(option_mask[idx]),
                 to_device(time_mask[idx]),
-                to_device(static[idx]),
             ).cpu().numpy())
     return np.concatenate(predictions)
 
@@ -247,26 +229,20 @@ def fit_temporal_ridge(corpus: TemporalCorpus, train_idx: np.ndarray,
     }
 
 
-def _loss(scores, labels, mask, objective: str, rank_temperature: float):
-    if objective == "regression":
-        target = torch.log1p(labels)
-        loss = F.smooth_l1_loss(scores, target, reduction="none")
-        per_group = (loss.masked_fill(~mask, 0.0).sum(dim=1) /
-                     mask.sum(dim=1).clamp(min=1))
-        return per_group.mean()
+def _loss(scores, labels, mask):
+    """Smooth L1 against log1p(throughput), averaged per scan then per batch.
 
-    neg = torch.finfo(scores.dtype).min
-    best = labels.masked_fill(~mask, neg).max(dim=1, keepdim=True).values
-    target = torch.softmax(((labels - best) / rank_temperature).masked_fill(~mask, neg), dim=1)
-    log_prob = torch.log_softmax(scores.masked_fill(~mask, neg), dim=1)
-    return -(target * log_prob).masked_fill(~mask, 0.0).sum(dim=1).mean()
+    Averaging within a scan first stops an eight-option scan counting four times
+    as much as a two-option one.
+    """
+    loss = F.smooth_l1_loss(scores, torch.log1p(labels), reduction="none")
+    per_scan = loss.masked_fill(~mask, 0.0).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    return per_scan.mean()
 
 
 def train_one(corpus: TemporalCorpus, train_idx: np.ndarray, val_idx: np.ndarray,
-              objective: str, seed: int, epochs: int, patience: int,
-              rank_temperature: float, batch_size: int, use_static: bool = True
-              ) -> tuple[TemporalSetTransformer, MaskedStandardizer,
-                         MaskedStandardizer | None, dict]:
+              seed: int, epochs: int, patience: int, batch_size: int
+              ) -> tuple[TemporalSetTransformer, MaskedStandardizer, dict]:
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -276,19 +252,9 @@ def train_one(corpus: TemporalCorpus, train_idx: np.ndarray, val_idx: np.ndarray
     # is already baked into that array; permuting a local copy here would leave
     # the ridge comparator and the test-time rebuild reading ordered data.
     temporal = scaler(corpus.temporal)
-    if use_static:
-        static_scaler = MaskedStandardizer(
-            corpus.static[train_idx], corpus.option_mask[train_idx])
-        static = static_scaler(corpus.static)
-    else:
-        # A zero-width static block: the model gets no hand-built features, and
-        # every call site below still passes a correctly shaped array.
-        static_scaler = None
-        static = np.zeros(corpus.static.shape[:2] + (0,), dtype=np.float32)
 
     model = TemporalSetTransformer(
-        temporal.shape[-1], temporal.shape[-2], n_static_features=static.shape[-1],
-        model_dim=48, heads=4,
+        temporal.shape[-1], temporal.shape[-2], model_dim=48, heads=4,
         temporal_layers=2, set_layers=2, dropout=0.1).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-3)
     rng = np.random.default_rng(seed)
@@ -308,26 +274,21 @@ def train_one(corpus: TemporalCorpus, train_idx: np.ndarray, val_idx: np.ndarray
                 to_device(temporal[idx]),
                 to_device(corpus.option_mask[idx]),
                 to_device(corpus.time_mask[idx]),
-                to_device(static[idx]),
             )
             loss = _loss(scores, to_device(corpus.labels[idx]),
-                         to_device(corpus.option_mask[idx]), objective,
-                         rank_temperature)
+                         to_device(corpus.option_mask[idx]))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             losses.append(loss.item())
 
         val_scores = _predict(model, temporal, corpus.option_mask, corpus.time_mask,
-                              static, val_idx, batch_size)
+                              val_idx, batch_size)
         flat = _flatten_scores(corpus, val_idx, val_scores)
-        decision_scores = np.expm1(np.clip(flat, -5, 12)) \
-            if objective == "regression" else flat
-        metrics = selection_metrics(val_frame, decision_scores)
+        metrics = selection_metrics(val_frame, np.expm1(np.clip(flat, -5, 12)))
         val_loss = _loss(
             to_device(val_scores), to_device(corpus.labels[val_idx]),
-            to_device(corpus.option_mask[val_idx]), objective,
-            rank_temperature).item()
+            to_device(corpus.option_mask[val_idx])).item()
         regret = metrics.get("topology_mean_regret_mbps",
                              metrics["mean_regret_mbps"])
         key = (regret, val_loss)
@@ -340,22 +301,19 @@ def train_one(corpus: TemporalCorpus, train_idx: np.ndarray, val_idx: np.ndarray
         else:
             stale += 1
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"    {objective:<10} epoch={epoch + 1:3d} "
+            print(f"    epoch={epoch + 1:3d} "
                   f"train_loss={np.mean(losses):.4f} val_regret={key[0]:.3f}")
         if stale >= patience:
             break
 
     assert best_state is not None
     model.load_state_dict(best_state)
-    return model, scaler, static_scaler, {
+    return model, scaler, {
         "epochs": epoch + 1,
         "val_topology_regret_mbps": best_key[0],
         "val_loss": best_key[1],
-        "uses_static_features": use_static,
         "temporal_mean": scaler.mean.tolist(),
         "temporal_std": scaler.std.tolist(),
-        "static_mean": static_scaler.mean.tolist() if static_scaler else [],
-        "static_std": static_scaler.std.tolist() if static_scaler else [],
     }
 
 
@@ -372,16 +330,7 @@ def parse_args():
                         help="permute each option's bins in time, destroying order while "
                              "preserving the multiset of observations. If accuracy holds, "
                              "the model is aggregating, not tracking dynamics.")
-    parser.add_argument("--no-static", action="store_true",
-                        help="withhold the hand-built feat_* vector so the model must "
-                             "learn its representation from the raw binned scan alone")
-    args = parser.parse_args()
-    if args.shuffle_time and not args.no_static:
-        parser.error("--shuffle-time requires --no-static: the hand-built feat_* "
-                     "block is an order-free summary of the same observation, so "
-                     "leaving it in guarantees the ablation shows no degradation "
-                     "whether or not order matters")
-    return args
+    return parser.parse_args()
 
 
 def shuffle_time_bins(corpus: TemporalCorpus) -> None:
@@ -412,16 +361,13 @@ def shuffle_time_bins(corpus: TemporalCorpus) -> None:
           f"{corpus.temporal.shape[2]} steps, time_fraction held in order")
 
 
-def save_checkpoint(path: Path, model, scaler, static_scaler,
-                    corpus: TemporalCorpus, objective: str, no_static: bool) -> None:
+def save_checkpoint(path: Path, model, scaler, corpus: TemporalCorpus) -> None:
     """Write one trained model plus everything needed to score with it again."""
     torch.save({
         "state_dict": model.state_dict(),
-        "objective": objective,
         "model": {
             "n_temporal_features": corpus.temporal.shape[-1],
             "max_steps": corpus.temporal.shape[-2],
-            "n_static_features": 0 if no_static else corpus.static.shape[-1],
             "model_dim": 48,
             "heads": 4,
             "temporal_layers": 2,
@@ -429,15 +375,10 @@ def save_checkpoint(path: Path, model, scaler, static_scaler,
             "dropout": 0.1,
         },
         "temporal_features": corpus.temporal_features,
-        "static_features": corpus.static_features,
         # Tensors keep the checkpoint loadable under torch.load's safe
         # weights_only=True default; NumPy arrays would need unrestricted pickle.
         "scaler_mean": torch.from_numpy(scaler.mean.copy()),
         "scaler_std": torch.from_numpy(scaler.std.copy()),
-        "static_scaler_mean": torch.from_numpy(
-            static_scaler.mean.copy() if static_scaler else np.zeros(0, np.float32)),
-        "static_scaler_std": torch.from_numpy(
-            static_scaler.std.copy() if static_scaler else np.zeros(0, np.float32)),
     }, path)
 
 
@@ -455,36 +396,28 @@ def train_split(corpus: TemporalCorpus, repeat: int, args, training: dict):
     predictions = {"temporal_ridge": ridge_prediction}
     training[f"split_{repeat}_temporal_ridge"] = ridge_info
 
-    for objective in ("regression", "ranking"):
-        model, scaler, static_scaler, info = train_one(
-            corpus, train_idx, val_idx, objective, INIT_SEED, args.epochs,
-            args.patience, RANK_TEMPERATURE, args.batch_size,
-            use_static=not args.no_static)
-        temporal = scaler(corpus.temporal)
-        static = (static_scaler(corpus.static) if static_scaler is not None
-                  else np.zeros(corpus.static.shape[:2] + (0,), dtype=np.float32))
-        scores = _predict(model, temporal, corpus.option_mask, corpus.time_mask,
-                          static, test_idx, args.batch_size)
-        flat = _flatten_scores(corpus, test_idx, scores)
-        name = f"temporal_transformer_{objective}"
-        predictions[name] = (np.expm1(np.clip(flat, -5, 12))
-                             if objective == "regression" else flat)
-        info["init_seed"] = INIT_SEED
-        training[f"split_{repeat}_{objective}"] = info
-        save_checkpoint(args.out_dir / f"{name}_split{repeat}.pt", model, scaler,
-                        static_scaler, corpus, objective, args.no_static)
+    model, scaler, info = train_one(
+        corpus, train_idx, val_idx, INIT_SEED, args.epochs, args.patience,
+        args.batch_size)
+    temporal = scaler(corpus.temporal)
+    scores = _predict(model, temporal, corpus.option_mask, corpus.time_mask,
+                      test_idx, args.batch_size)
+    flat = _flatten_scores(corpus, test_idx, scores)
+    predictions["temporal_transformer"] = np.expm1(np.clip(flat, -5, 12))
+    info["init_seed"] = INIT_SEED
+    training[f"split_{repeat}"] = info
+    save_checkpoint(args.out_dir / f"temporal_transformer_split{repeat}.pt",
+                    model, scaler, corpus)
     return predictions, test_frame, train_frame
 
 
 def score_split(all_predictions: dict, test_frame, repeat: int, args):
     """Headline and stratified metric rows for one split."""
-    provenance = {"split_seed": repeat, "time_shuffled": args.shuffle_time,
-                  "uses_static": not args.no_static}
+    provenance = {"split_seed": repeat, "time_shuffled": args.shuffle_time}
     results, stratified = [], []
     for name, pred in all_predictions.items():
         row = {**provenance, "model": name}
-        row.update(random_selection_metrics(test_frame) if name == "random"
-                   else selection_metrics(test_frame, pred))
+        row.update(selection_metrics(test_frame, pred))
         if name.startswith(("temporal_ridge", "temporal_transformer_regression")):
             row.update(regression_metrics(
                 test_frame["label_throughput_mbps"].to_numpy(), pred))
@@ -496,11 +429,9 @@ def score_split(all_predictions: dict, test_frame, repeat: int, args):
 
         scored = test_frame.copy()
         scored["prediction"] = pred
-        for dimension in ("gt_n_aps", "gt_n_hotspots",
-                          "gt_candidate_stratum", "discovery"):
+        for dimension in ("gt_n_aps", "gt_n_hotspots", "discovery"):
             for value, subset in scored.groupby(dimension):
-                metrics = (random_selection_metrics(subset) if name == "random" else
-                           selection_metrics(subset, subset["prediction"].to_numpy()))
+                metrics = selection_metrics(subset, subset["prediction"].to_numpy())
                 stratified.append({**provenance, "model": name,
                                    "dimension": dimension, "value": value, **metrics})
     return results, stratified
@@ -529,7 +460,7 @@ def main() -> int:
         stratified_rows += stratified
 
         keep = ["topology_id", "scan_id", "ap_index", "label_throughput_mbps",
-                "gt_n_aps", "gt_n_hotspots", "gt_candidate_stratum", "discovery"]
+                "gt_n_aps", "gt_n_hotspots", "discovery"]
         pred_frame = test_frame[keep].copy()
         pred_frame["split_seed"] = repeat
         for name, pred in all_predictions.items():

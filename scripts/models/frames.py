@@ -5,6 +5,14 @@ it, which decides in advance what time resolution matters. This module does
 not: the input is the list of decoded frames as they arrived, and the only
 aggregation is the one attention learns.
 
+READ THIS BEFORE TREATING THIS AS A SEQUENCE MODEL. There is no positional
+encoding over the frame axis and cross-attention is permutation invariant, so
+permuting the frames leaves every score unchanged. Time reaches the model only
+as two ordinary feature columns - `time_fraction` and `gap_since_previous`,
+both set in build_frame_corpus.py - which the network sees exactly as it sees
+signal strength. This is a bag of timestamped frames, not a trajectory, and a
+shuffled-order ablation against it is a no-op by construction.
+
 Two constraints shape the architecture.
 
 Frames are many and options are few. A rotating radio decodes thousands of
@@ -31,9 +39,8 @@ import torch
 import torch.nn as nn
 
 from .data import split_rows_by_topology
-from .temporal import MaskedStandardizer
 
-FRAME_SCHEMA_VERSION = 1
+FRAME_SCHEMA_VERSION = 3
 
 # How one frame relates to one option, as independent bits combined into a
 # single code per (frame, option) pair. scripts/dataset/build_frame_corpus.py
@@ -42,7 +49,9 @@ FRAME_SCHEMA_VERSION = 1
 REL_ON_CHANNEL = 1      # the frame was on the channel this option's AP uses
 REL_SAME_BSS = 2        # the frame came from a device in this option's BSS
 REL_FROM_AP = 4         # the frame was sent by this option's AP itself
-# Three independent bits, so codes run 0..7 and the embedding needs 8 rows.
+# The bits are nested, not independent: a frame from this option's AP is also
+# from its BSS and on its channel, so only codes 0, 1, 3 and 7 ever occur.
+# 8 is still the right indexing bound - four of its rows simply stay unused.
 N_RELATIONS = 8
 
 
@@ -57,7 +66,6 @@ class FrameCorpus:
     frames: np.ndarray          # (G, N, F) per-frame measurements
     relations: np.ndarray       # (G, O, N) uint8, one relation code per option
     frame_mask: np.ndarray      # (G, N) which frame slots are real
-    static: np.ndarray          # (G, O, S) per-option summary features
     labels: np.ndarray          # (G, O) measured throughput
     option_indices: np.ndarray
     option_mask: np.ndarray     # (G, O) which option slots are real
@@ -65,9 +73,8 @@ class FrameCorpus:
     topology_ids: np.ndarray
     configured_n_aps: np.ndarray
     n_hotspots: np.ndarray
-    candidate_strata: np.ndarray
+    window_s: np.ndarray        # (G,) listening window length in seconds
     frame_features: list[str]
-    static_features: list[str]
 
     @classmethod
     def load(cls, path: Path) -> "FrameCorpus":
@@ -79,13 +86,12 @@ class FrameCorpus:
                     "rebuild it with scripts/dataset/build_frame_corpus.py")
             return cls(
                 frames=d["frames"], relations=d["relations"],
-                frame_mask=d["frame_mask"], static=d["static"], labels=d["labels"],
+                frame_mask=d["frame_mask"], labels=d["labels"],
                 option_indices=d["option_indices"], option_mask=d["option_mask"],
                 scan_ids=d["scan_ids"], topology_ids=d["topology_ids"],
                 configured_n_aps=d["configured_n_aps"], n_hotspots=d["n_hotspots"],
-                candidate_strata=d["candidate_strata"],
-                frame_features=d["frame_features"].tolist(),
-                static_features=d["static_features"].tolist())
+                window_s=d["window_s"],
+                frame_features=d["frame_features"].tolist())
 
     def split(self, seed: int = 0, val_frac: float = 0.2, test_frac: float = 0.2):
         """Group positions for train, val and test, split by whole topology.
@@ -109,8 +115,8 @@ class FrameSetTransformer(nn.Module):
     options are listed in.
     """
 
-    def __init__(self, n_frame_features: int, n_static_features: int = 0,
-                 model_dim: int = 48, heads: int = 4, latents: int = 4,
+    def __init__(self, n_frame_features: int, model_dim: int = 48,
+                 heads: int = 4, latents: int = 4,
                  cross_layers: int = 2, set_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.model_dim = model_dim
@@ -131,9 +137,6 @@ class FrameSetTransformer(nn.Module):
                           nn.GELU(), nn.Dropout(dropout), nn.Linear(model_dim * 3, model_dim))
             for _ in range(cross_layers)])
 
-        self.static = (nn.Sequential(nn.Linear(n_static_features, model_dim),
-                                     nn.GELU(), nn.LayerNorm(model_dim))
-                       if n_static_features else None)
         set_layer = nn.TransformerEncoderLayer(
             model_dim, heads, dim_feedforward=model_dim * 3, dropout=dropout,
             batch_first=True, norm_first=True)
@@ -145,8 +148,7 @@ class FrameSetTransformer(nn.Module):
             nn.Linear(model_dim, 1))
 
     def forward(self, frames: torch.Tensor, relations: torch.Tensor,
-                frame_mask: torch.Tensor, option_mask: torch.Tensor,
-                static: torch.Tensor | None = None) -> torch.Tensor:
+                frame_mask: torch.Tensor, option_mask: torch.Tensor) -> torch.Tensor:
         batch, n_options = option_mask.shape
         n_frames = frames.shape[1]
 
@@ -156,9 +158,9 @@ class FrameSetTransformer(nn.Module):
         tokens = tokens.reshape(batch * n_options, n_frames, self.model_dim)
         padding = ~frame_mask[:, None, :].expand(batch, n_options, n_frames)
         padding = padding.reshape(batch * n_options, n_frames)
-        # A group with no frames at all would make every key invalid, which is
-        # undefined for softmax attention; let such rows attend to slot 0 and
-        # rely on the option mask to discard them downstream.
+        # A scan with no frames at all leaves every key masked. Let those rows
+        # attend to slot 0, whose token is zeroed padding, so the encoder sees
+        # a defined query rather than an empty one.
         empty = padding.all(dim=1)
         if empty.any():
             padding[empty, 0] = False
@@ -173,15 +175,6 @@ class FrameSetTransformer(nn.Module):
             q = q + ff(q)
 
         pooled = q.mean(dim=1).reshape(batch, n_options, self.model_dim)
-        if self.static is not None:
-            if static is None:
-                raise ValueError("static option features are required by this model")
-            pooled = pooled + self.static(static)
         compared = self.options(pooled, src_key_padding_mask=~option_mask)
         return self.score(self.norm(compared)).squeeze(-1)
 
-
-# A frame trace and a binned scan need identical scaling behaviour - fit on
-# the unpadded entries, leave flat features alone - so they share one
-# implementation. train_frames.py imports it under this name.
-FrameStandardizer = MaskedStandardizer

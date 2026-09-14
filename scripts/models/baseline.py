@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Gradient-boosted and random-forest regressors over the scan.
 
-Each row is scored independently and the argmax within a scan is the
-chosen AP. That is a pointwise ranking approach: simple, and a sensible
-default for a few hundred scans of tabular features, where boosting is
-hard to beat. models/ranker.py adds a set-context alternative that optimises
-pairwise ordering directly.
+Each row is scored independently and the argmax within a scan is the chosen
+AP - simple, and a sensible default for a few hundred scans of tabular
+features, where boosting is hard to beat.
 
-Run:  python -m models.baseline data/dataset.csv
+Run:  python -m scripts.models.baseline data/aggregate.csv
+
+TODO: this overlaps scripts/train/train_eval.py, which fits the same tree
+models. Nothing imports this file; it differs only in scoring on validation and
+adding permutation importance. One of the two is to be deleted.
 """
 
 from __future__ import annotations
@@ -19,8 +21,8 @@ import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.inspection import permutation_importance
 
-from .data import (LABEL_COL, assert_no_leakage, feature_columns, scan_sample_weights,
-                   impute_features, load_dataset, split_by_topology, to_xy)
+from .data import (feature_columns, impute_features, load_dataset,
+                   scan_sample_weights, split_by_topology, to_xy)
 from .evaluate import evaluate_all, label_spread, selection_metrics
 
 
@@ -47,7 +49,6 @@ def main():
 
     df = impute_features(load_dataset(args.dataset))
     feats = feature_columns(df)
-    assert_no_leakage(feats)
     train, val, test = split_by_topology(df, seed=args.seed)
 
     X_tr, y_tr = to_xy(train, feats)
@@ -70,6 +71,10 @@ def main():
         preds[name] = np.expm1(p) if args.log_target else p
         fitted[name] = model
 
+    # VALIDATION, not test: this script exists for feature importance, and
+    # scoring test here would spend it on a run that selects nothing.
+    # scripts/train/train_eval.py reports the held-out numbers.
+    print("\n=== VALIDATION (test is held out; see scripts/train/train_eval.py) ===")
     print(evaluate_all(val, preds, train).to_string(index=False))
 
     best = min(preds, key=lambda n: selection_metrics(val, preds[n])["mean_regret_mbps"])

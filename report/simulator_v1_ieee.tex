@@ -6,6 +6,7 @@
 \usepackage{microtype}
 \usepackage{tabularx}
 \usepackage{url}
+\usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 
 % IEEEtran leaves a lot of air above a subsection heading. Tighten it while
@@ -19,6 +20,7 @@
 \makeatother
 
 \newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{TODO:} #1}}
 \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
 \renewcommand{\arraystretch}{1.05}
 
@@ -150,6 +152,10 @@ the non-overlapping set in its residential one
 
 \subsection{Count, Topology of background STAs}
 
+\todo{Rewrite this subsection. The placement description is verbose, and the
+rationale for mixing uniform and hotspot regimes is neither obvious nor
+established.}
+
 A base count of 3, 4, or 5 is drawn independently for each AP and the draws
 are summed. That sum is the deployment's station total, not an allocation: how
 many stations an AP ends up serving follows from where they are placed and
@@ -188,9 +194,8 @@ high-definition video.
 
 \subsection{Placement of candidate STA}
 
-The position where the candidate station is placed is drawn such that the
-decision is often non-trivial: 70\% lands near a boundary between neighboring
-APs, and 30\% at 3--9 m from a single AP. 
+The candidate station is placed uniformly at random over the same area as the
+background stations: the AP footprint plus a 10 m border.
 
 \subsection{Data Capture}
 
@@ -200,17 +205,13 @@ over one mean interval. Without that phase, stations sharing an AP and a rate
 would transmit in lockstep for the whole run. The non-full-buffer models in the
 TGax set randomize phase for the same reason \cite{tgax2016scenarios}.
 
-Passive recording runs from $t=2$ s to $t=7.5$ s, covering 5.5 s of loaded
+Passive recording runs from $t=2$ s to $t=8$ s, covering 6 s of loaded
 traffic. It starts 1.5 s after the traffic because Minstrel-HT needs about that
 long to converge, and until it does every scenario carries the same opening
 burst of retransmissions. This burst is a property of when the run started, not
 of the deployment being observed.
 
-The candidate associates at $t=8$ s, 0.5 s after recording ends. The gap is a
-guard: ns-3 performs target-dependent polling shortly before a join, and
-without it the scanners would capture that exchange. The recorded features
-would then depend on which AP is being evaluated, leaking the label into the
-observation.
+The candidate starts joining at $t=8$ s, the moment recording ends.
 
 After joining, the candidate offers 100 Mbit/s in 1250-byte packets until the
 run ends at $t=20$ s. That rate keeps it backlogged, so its measured throughput
@@ -253,7 +254,7 @@ Hotspot count & $1\ldots\lceil N_{\mathrm{AP}}/3\rceil$, fewer more likely \\
 Hotspot field & $4\times$ station density inside a 10 m disc \\
 Station load & log-normal, median 2.25 Mbit/s, shape 0.9, cap 25 \\
 Association & strongest received power $+\;\mathcal{N}(0,5^2)$ dB \\
-Candidate position & boundary with prob.\ $0.7$, else 3--9 m from one AP \\
+Candidate position & uniform over the station area \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -271,13 +272,15 @@ this complete record down to what a single scan would see.
 Specifically, the candidate STA carries one receive-only scanner PHY per
 occupied channel, plus a separate PHY reserved for association. The scanner
 PHYs never transmit and never associate; the association PHY is parked on
-unused channel 149 until the decision time. At $t=7.5$ s the scanner PHYs move to
+unused channel 149 until the decision time. At $t=8$ s the scanner PHYs move to
 the parking channel as well.
 
 Two traces are recorded. The monitor-sniffer trace holds every frame a scanner
-decodes, with time, frequency, BSSID, transmitter, frame category, beacon and
-retry flags, length, RSSI, noise, airtime, and PHY rate. The PHY-state trace
-gives the fraction of each 102.4 ms beacon interval in which carrier sense
+decodes, with the start and end of the transmission carrying it, frequency,
+BSSID, transmitter, frame category, beacon and retry flags, length, RSSI,
+airtime, and PHY rate. Frames aggregated into one transmission share its start
+and end. The PHY-state trace
+gives the fraction of each 1 ms interval in which carrier sense
 marked the channel busy. This clear-channel-assessment (CCA) measurement
 registers energy a frame-only view misses: interference, and transmissions too
 distant to decode. Both thresholds are left at the ns-3 defaults: $-62$ dBm of
@@ -290,8 +293,9 @@ The projection onto one passive radio is done as follows:
 One radio is assumed to rotate through the occupied channels in random order, 
 dwelling 110 ms on each with 0.15 ms to retune, and repeats the cycle 
 for as much of the window as it fits, so every channel is revisited many 
-times before the decision. Frames and CCA intervals falling outside a 
-dwell are discarded. A 110 ms dwell spans just over one 102.4~ms beacon 
+times before the decision. A frame is kept only if its whole transmission
+falls inside a dwell after retuning: a radio that misses the preamble decodes
+nothing. CCA intervals outside a dwell are discarded. A 110 ms dwell spans just over one 102.4~ms beacon 
 interval, so each visit yields about one beacon from every AP on that channel. 
 RSSI is then perturbed by uniform error within $\pm3$ dB and quantized to 1 dB. 
 Both steps run after ns-3 from a recorded scan seed, so scan policy and 

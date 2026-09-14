@@ -14,8 +14,8 @@ Three encodings, in increasing faithfulness to the raw sequence:
   flat   the whole sequence flattened, order preserved and nothing aggregated
 
 Run:
-  python scripts/train/aggregate_baseline.py data/v3_temporal.npz \
-      --out-dir results_v3/aggregate
+  python scripts/train/aggregate_baseline.py data/binned.npz \
+      --out-dir results/aggregate
 """
 
 from __future__ import annotations
@@ -26,15 +26,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from models.evaluate import (baseline_predictions, random_selection_metrics,  # noqa: E402
+from scripts.models.evaluate import (baseline_predictions,  # noqa: E402
                              regression_metrics, selection_metrics)
-from models.ranker import SetRanker, train as train_ranker  # noqa: E402
-from models.temporal import MaskedStandardizer, TemporalCorpus  # noqa: E402
-from scripts.train.train_temporal import _flat_frame, _flatten_scores  # noqa: E402
+from scripts.models.temporal import MaskedStandardizer, TemporalCorpus  # noqa: E402
+from scripts.train.train_temporal import _flat_frame  # noqa: E402
 
 
 def build_inputs(corpus: TemporalCorpus, encoding: str) -> np.ndarray:
@@ -130,31 +128,11 @@ def fit_trees(X, y, mask, train_idx, val_idx, test_idx, val_frame, seed):
     return (np.expm1(np.clip(pred, -5, 12)) if log_target else pred)
 
 
-def fit_mlp(X, y, mask, train_idx, val_idx, test_idx, seed, epochs, patience):
-    """The same SetRanker used on feat_*, now fed the continuous observation."""
-    def pack(indices):
-        return (torch.from_numpy(X[indices]), torch.from_numpy(y[indices]),
-                torch.from_numpy(mask[indices]),
-                torch.from_numpy(np.zeros(mask[indices].shape, dtype=np.int64)))
-
-    model = SetRanker(X.shape[-1], dropout=0.1)
-    model = train_ranker(model, pack(train_idx), pack(val_idx), epochs, 3e-3, 1e-3,
-                         alpha=0.7, temperature=5.0, seed=seed, verbose=False,
-                         batch_size=32, patience=patience)
-    model.eval()
-    with torch.no_grad():
-        scores = model(torch.from_numpy(X[test_idx]),
-                       torch.from_numpy(mask[test_idx])).numpy()
-    return np.expm1(np.clip(scores, -5, 10))
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path)
     parser.add_argument("--out-dir", type=Path, default=Path("results/aggregate"))
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--encodings", nargs="+", default=["mean", "rich", "flat"])
     parser.add_argument("--contrast", action="store_true",
                         help="append peer-mean and deviation-from-peer-mean features")
@@ -184,19 +162,6 @@ def main() -> int:
         for name, X_raw in encoded.items():
             scaler = MaskedStandardizer(X_raw[train_idx], corpus.option_mask[train_idx])
             X = scaler(X_raw)
-            for label, pred_full in (
-                    ("mlp", fit_mlp(X, corpus.labels, corpus.option_mask,
-                                    train_idx, val_idx, test_idx, seed,
-                                    args.epochs, args.patience)),
-            ):
-                pred = _flatten_scores(corpus, test_idx, pred_full)
-                row = {"split_seed": seed, "model": f"{label}_{name}"}
-                row.update(regression_metrics(y_test, pred))
-                row.update(selection_metrics(test_frame, pred))
-                rows.append(row)
-                print(f"    {label}_{name:5s} top1={row['top1_accuracy']:.3f} "
-                      f"regret={row['mean_regret_mbps']:.3f} r2={row['r2']:.3f}")
-
             pred = fit_trees(X, corpus.labels, corpus.option_mask,
                              train_idx, val_idx, test_idx, val_frame, seed)
             row = {"split_seed": seed, "model": f"gbr_{name}"}
@@ -208,8 +173,7 @@ def main() -> int:
 
         for name, pred in baseline_predictions(test_frame, _flat_frame(corpus, train_idx)).items():
             row = {"split_seed": seed, "model": name}
-            row.update(random_selection_metrics(test_frame) if name == "random"
-                       else selection_metrics(test_frame, pred))
+            row.update(selection_metrics(test_frame, pred))
             rows.append(row)
 
     out = pd.DataFrame(rows)

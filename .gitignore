@@ -9,10 +9,12 @@ data/
 runs/
 results*/
 logs/
-# Everything in report/ is scratch EXCEPT the paper source and its PDF.
+# Everything in report/ is scratch EXCEPT the paper source, its PDF and the
+# design choices record.
 # Note this must be `report/*`, not `report/`: a trailing slash tells git not
 # to descend into the directory at all, and negations below would never be
 # consulted.
 report/*
 !report/*.tex
 !report/*.pdf
+!report/design_choices.md

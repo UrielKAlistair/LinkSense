@@ -18,9 +18,10 @@ numbers are decision metrics computed within each scan:
                  averaged - does the model order the whole set sensibly,
                  not just the top of it.
 
-Each metric is also reported averaged per topology, because one topology
-contributes several scans and the plain mean would let the topologies
-that were simulated more often speak louder.
+top1_accuracy and mean_regret_mbps are also reported averaged per topology,
+because one topology contributes several scans and the plain mean would let
+the topologies that were scanned more often speak louder. The remaining
+metrics are per-scan only.
 
 The same file supplies the reference rules in baseline_predictions(), the most
 important of which is strongest_rssi: it is what a commodity client actually
@@ -29,16 +30,14 @@ does, and a learned model that cannot beat it has not earned its complexity.
 
 from __future__ import annotations
 
-import hashlib
 
 import numpy as np
 import pandas as pd
 
 from .data import SCAN_COL, LABEL_COL, MISSING_RSSI_SENTINEL
 
-# Throughput difference below which two options count as equally good. Used
-# for top-1 credit here and for discarding uninformative pairs in
-# ranker.ranking_loss, which imports it so the two cannot drift apart.
+# Throughput difference below which two options count as equally good, so a
+# model gets top-1 credit for any pick within this much of the best.
 TIE_TOL_MBPS = 0.5
 
 
@@ -133,37 +132,6 @@ def selection_metrics(df: pd.DataFrame, pred: np.ndarray,
     return metrics
 
 
-def random_selection_metrics(df: pd.DataFrame, tie_tol: float = TIE_TOL_MBPS) -> dict:
-    """The same metrics for a client that picks uniformly at random.
-
-    Computed as an exact expectation over the options rather than by drawing
-    one option per scan, because a single draw on a few hundred test
-    sets is noisy enough to make random choice look materially good or bad by
-    luck alone. Every expectation needed is available from the labels.
-    """
-    top1, expected_regret, expected_regret_frac, topology = [], [], [], []
-    has_topology = "topology_id" in df
-    for _, scan in df.groupby(SCAN_COL):
-        y = scan[LABEL_COL].to_numpy()
-        best = y.max()
-        regret = best - y
-        top1.append(float(np.mean(y >= best - tie_tol)))
-        expected_regret.append(float(regret.mean()))
-        expected_regret_frac.append(float(regret.mean() / best) if best > 0 else 0.0)
-        topology.append(scan["topology_id"].iloc[0] if has_topology else None)
-    metrics = {
-        "scans": len(top1),
-        "top1_accuracy": float(np.mean(top1)),
-        "mean_regret_mbps": float(np.mean(expected_regret)),
-        "median_regret_mbps": float(np.median(expected_regret)),
-        "mean_regret_frac": float(np.mean(expected_regret_frac)),
-        # A random ordering is uncorrelated with the labels in expectation.
-        "mean_spearman": 0.0,
-    }
-    metrics.update(_per_topology_metrics(topology, top1, expected_regret))
-    return metrics
-
-
 def validation_selection_key(frame: pd.DataFrame, pred: np.ndarray) -> tuple[float, float]:
     """Score one candidate configuration on validation; smaller sorts better.
 
@@ -201,6 +169,10 @@ def regression_metrics(y: np.ndarray, pred: np.ndarray) -> dict:
         raise ValueError(f"label shape {y.shape} does not match prediction shape {pred.shape}")
     if not np.isfinite(pred).all():
         raise ValueError("predictions contain NaN or infinite values")
+    if not np.isfinite(y).all():
+        # without this the four metrics come back as silent NaNs, while the
+        # same defect in `pred` one line above raises
+        raise ValueError("labels contain NaN or infinite values")
     resid = y - pred
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     ly, lp = np.log1p(np.clip(y, 0, None)), np.log1p(np.clip(pred, 0, None))
@@ -219,7 +191,7 @@ def regression_metrics(y: np.ndarray, pred: np.ndarray) -> dict:
 # to strongest_rssi, up to a point well past where adding more occupancy
 # penalty starts hurting. A fitted k landing on either end means the optimum
 # has moved outside these bounds and the range needs widening.
-RSSI_BUSY_K_GRID = tuple(float(k) for k in range(0, 121, 5))
+RSSI_BUSY_K_GRID = tuple(float(k) for k in range(0, 81, 5))
 
 
 def fit_rssi_busy_k(train_df: pd.DataFrame, busy_column: str,
@@ -227,9 +199,10 @@ def fit_rssi_busy_k(train_df: pd.DataFrame, busy_column: str,
     """Choose k for the `RSSI - k*busy` rule on TRAINING rows only.
 
     The heuristic is the bar every learned model has to clear, so it gets its
-    one free parameter chosen the same way a model's hyperparameters are:
-    by regret, on data the model being compared against never sees scored.
-    Raises rather than falling back to a fixed k, because a silently unfitted
+    one free parameter fitted rather than guessed - by mean regret over the
+    training rows. That is not the split or the statistic a model's
+    hyperparameters are chosen by; it only keeps the rule off the rows it is
+    scored on. Raises rather than falling back to a fixed k, because a silently unfitted
     heuristic in one experiment and a fitted one in another would make the
     two experiments' baseline rows incomparable.
     """
@@ -270,15 +243,10 @@ def baseline_predictions(df: pd.DataFrame,
     is left out of the returned dict rather than faked.
     """
     preds = {}
-    # One fixed pseudo-random score per option, derived from its identity so
-    # that reordering the rows cannot change it. Only the exported per-row
-    # prediction table uses this; headline numbers for random choice come
-    # from random_selection_metrics(), which is exact rather than one draw.
-    preds["random"] = np.array([
-        int.from_bytes(hashlib.blake2b(
-            f"{scan}:{option}".encode(), digest_size=8).digest(), "big")
-        for scan, option in zip(df[SCAN_COL], df.get("ap_index", df.index))
-    ], dtype=np.uint64)
+    # A flat score, so every option in a scan ties. selection_metrics averages
+    # credit and regret across a tie, which makes this the exact expectation
+    # for a uniform pick rather than one noisy draw from it.
+    preds["random"] = np.zeros(len(df))
     busy_column = busy_column_name(df)
     if "feat_ap_rssi_mean" in df:
         preds["strongest_rssi"] = (
@@ -300,10 +268,12 @@ def evaluate_all(df: pd.DataFrame, model_preds: dict[str, np.ndarray],
     requirement: training rows, disjoint from `df`.
     """
     y = df[LABEL_COL].to_numpy()
-    rows = [{"model": "random", **random_selection_metrics(df)}]
+    clash = set(model_preds) & set(baseline_predictions(df, fit_frame))
+    if clash:
+        raise ValueError(f"model name(s) {sorted(clash)} collide with a reference "
+                         "rule; the rule would win and the model be discarded")
+    rows = []
     for name, pred in {**baseline_predictions(df, fit_frame), **model_preds}.items():
-        if name == "random":
-            continue
         row = {"model": name}
         # The reference rules emit scores on arbitrary scales, not throughput
         # estimates, so an r2 for them would be meaningless.
