@@ -51,6 +51,10 @@ LISTEN_PER_DWELL_S = (DWELL_MS - RETUNE_MS) / 1000.0
 # Combined with each scan's ID to seed its channel order.
 SEED = 20250817
 
+# Signal level recorded where there is no level to report: below the simulated
+# noise floor of about -94 dBm, so it reads as weaker than anything heard.
+MISSING_RSSI_DBM = -100.0
+
 
 def channel_of_freq(freq_mhz: int) -> int:
     return (freq_mhz - 5000) // 5

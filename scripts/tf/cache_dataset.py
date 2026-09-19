@@ -46,7 +46,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from scripts.common.projection import (DWELL_MS, DWELL_S,  # noqa: E402
+from scripts.common.projection import (DWELL_MS, DWELL_S, MISSING_RSSI_DBM,  # noqa: E402
                                        TYPE_DATA, TYPE_MGMT, ProjectedScan,
                                        describe, dwell_bounds, dwell_of, project)
 from scripts.common.parse_scans import Scan, ValidAP, find_scans, find_valid_aps  # noqa: E402
@@ -58,10 +58,6 @@ N_CATEGORIES = 3
 # Milliseconds of carrier sense a dwell yields: the projection drops the first,
 # which the radio spent retuning. 
 CCA_SAMPLES = int(DWELL_MS) - 1
-
-# Signal level recorded where there is no level to report: below the simulated
-# noise floor of about -94 dBm, so it reads as weaker than anything heard.
-MISSING_RSSI_DBM = -100.0
 
 FRAME_FEATURES = (
     "offset_in_dwell",      # where in the 110 ms the transmission started, 0-1
