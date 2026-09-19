@@ -439,7 +439,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("runs_dir", type=Path)
-    parser.add_argument("--out", type=Path, default=Path("data/cells"))
+    parser.add_argument("--out", type=Path, default=Path("data/cache"))
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
 
