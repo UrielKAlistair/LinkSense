@@ -18,3 +18,5 @@ report/*
 !report/*.tex
 !report/*.pdf
 !report/design_choices.md
+# the Android rule waits on BSS Load; keep it out of the tree for now
+scripts/baselines/android_throughput.py
