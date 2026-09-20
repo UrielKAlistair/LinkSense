@@ -7,18 +7,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 
-from scripts.models.data import (scan_sample_weights, split_by_topology,
-                         split_rows_by_topology)
-from scripts.models.evaluate import (baseline_predictions, fit_rssi_busy_k,
-                             selection_metrics)
-from scripts.models.frames import FrameCorpus
-from scripts.models.temporal import (TemporalCorpus, TemporalSetTransformer,
-                             load_temporal_checkpoint)
+from scripts.common.splits import N_FOLDS, split_by_topology, split_rows_by_topology
+from scripts.common.evaluate import selection_metrics
+from scripts.baselines.train import fit_rssi_busy_k, heuristic_predictions
 from scripts.simulate.run_sweep import Run, already_done
-from scripts.train.learning_curve import subset_topologies
-from scripts.train.train_eval import choose_by_validation_regret, stratified_report
+from scripts.baselines.train import (choose_by_validation_regret, scan_sample_weights,
+                                 stratified_report, subset_topologies)
 
 
 class ScanSplitTests(unittest.TestCase):
@@ -31,10 +26,11 @@ class ScanSplitTests(unittest.TestCase):
                         "topology_id": f"g{topology:02d}",
                         "scan_id": f"g{topology:02d}__s{seed:02d}",
                         "ap_index": ap,
+                        "gt_n_aps": 2,
                         "label_throughput_mbps": float(ap),
                     })
         frame = pd.DataFrame(rows)
-        train, val, test = split_by_topology(frame, seed=7)
+        train, val, test = split_by_topology(frame, test_fold=3)
         topology_sets = [set(part.topology_id) for part in (train, val, test)]
         self.assertTrue(topology_sets[0].isdisjoint(topology_sets[1]))
         self.assertTrue(topology_sets[0].isdisjoint(topology_sets[2]))
@@ -45,9 +41,20 @@ class ScanSplitTests(unittest.TestCase):
             "topology_id": ["a", "a", "b", "b"],
             "scan_id": ["a", "a", "b", "b"],
             "ap_index": [0, 1, 0, 1],
+            "gt_n_aps": [2, 2, 2, 2],
             "label_throughput_mbps": [1.0, 0.0, 1.0, 0.0],
         })
-        with self.assertRaisesRegex(ValueError, "at least 5 independent"):
+        with self.assertRaisesRegex(ValueError, "every AP count needs at least 5"):
+            split_by_topology(frame)
+
+    def test_a_frame_without_ap_counts_fails_clearly(self):
+        frame = pd.DataFrame({
+            "topology_id": [f"g{i:02d}" for i in range(10)],
+            "scan_id": [f"g{i:02d}" for i in range(10)],
+            "ap_index": [0] * 10,
+            "label_throughput_mbps": [1.0] * 10,
+        })
+        with self.assertRaisesRegex(ValueError, "no gt_n_aps column"):
             split_by_topology(frame)
 
     def test_sample_weights_give_each_scan_equal_mass(self):
@@ -72,7 +79,7 @@ class ScanSplitTests(unittest.TestCase):
                         "gt_n_aps": n_aps,
                         "label_throughput_mbps": float(ap),
                     })
-        train, val, test = split_by_topology(pd.DataFrame(rows), seed=4)
+        train, val, test = split_by_topology(pd.DataFrame(rows), test_fold=4)
         for part in (train, val, test):
             self.assertEqual(set(part.gt_n_aps), {2, 3, 4, 6, 8})
 
@@ -134,17 +141,16 @@ class SweepResumeTests(unittest.TestCase):
 
 
 class EvaluationTests(unittest.TestCase):
-    def test_validation_selection_uses_equal_topology_weight(self):
+    def test_validation_selection_prefers_the_lower_regret_candidate(self):
         frame = pd.DataFrame({
-            "topology_id": ["a", "a", "a", "a", "b", "b"],
             "scan_id": ["a0", "a0", "a1", "a1", "b0", "b0"],
             "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0, 14.0, 0.0],
         })
-        topology_fair = np.array([0, 1, 0, 1, 1, 0])
-        group_fair = np.array([1, 0, 1, 0, 0, 1])
+        two_of_three = np.array([1, 0, 1, 0, 0, 1])
+        one_of_three = np.array([0, 1, 0, 1, 1, 0])
         _, selected = choose_by_validation_regret(
-            [("topology_fair", topology_fair), ("group_fair", group_fair)], frame)
-        self.assertEqual(selected, "topology_fair")
+            [("one_of_three", one_of_three), ("two_of_three", two_of_three)], frame)
+        self.assertEqual(selected, "two_of_three")
 
     def test_equal_scores_use_order_invariant_expected_tie_break(self):
         frame = pd.DataFrame({
@@ -153,20 +159,8 @@ class EvaluationTests(unittest.TestCase):
         })
         metrics = selection_metrics(frame, np.array([1.0, 1.0]))
         shuffled = selection_metrics(frame.iloc[::-1], np.array([1.0, 1.0]))
-        self.assertAlmostEqual(metrics["top1_accuracy"], 0.5)
         self.assertAlmostEqual(metrics["mean_regret_mbps"], 5.0)
         self.assertEqual(metrics, shuffled)
-
-    def test_topology_regret_does_not_overweight_extra_seed_groups(self):
-        frame = pd.DataFrame({
-            "topology_id": ["a", "a", "a", "a", "b", "b"],
-            "scan_id": ["a0", "a0", "a1", "a1", "b0", "b0"],
-            "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0, 10.0, 0.0],
-        })
-        metrics = selection_metrics(frame, np.array([0, 1, 0, 1, 1, 0]))
-        self.assertAlmostEqual(metrics["mean_regret_mbps"], 20.0 / 3.0)
-        self.assertAlmostEqual(metrics["topology_mean_regret_mbps"], 5.0)
-        self.assertEqual(metrics["topologies"], 2)
 
     def test_busy_baselines_prefer_cca_over_decoded_airtime(self):
         frame = pd.DataFrame({
@@ -177,7 +171,7 @@ class EvaluationTests(unittest.TestCase):
             "feat_chan_busy_frac": [0.1, 0.9],
             "feat_chan_cca_busy_frac": [0.8, 0.2],
         })
-        predictions = baseline_predictions(frame, fit_frame=frame)
+        predictions = heuristic_predictions(frame, fit_frame=frame)
         self.assertGreater(predictions["least_busy_channel"][1],
                            predictions["least_busy_channel"][0])
         self.assertGreater(predictions["rssi_minus_busy"][1],
@@ -197,24 +191,26 @@ class EvaluationTests(unittest.TestCase):
             "ap_index": [0, 1, 0, 1, 2],
             "label_throughput_mbps": [10.0, 0.0, 9.0, 6.0, 0.0],
         })
-        flat = baseline_predictions(frame, frame)["random"]
+        flat = heuristic_predictions(frame, frame)["random"]
         metrics = selection_metrics(frame, flat)
-        # a flat score ties every option, so regret is the mean over the set
+        # a flat score ties every AP, so regret is the mean over the set
         self.assertAlmostEqual(metrics["mean_regret_mbps"], (5.0 + 4.0) / 2)
         shuffled = frame.sample(frac=1.0, random_state=2)
         self.assertEqual(metrics, selection_metrics(
-            shuffled, baseline_predictions(shuffled, shuffled)["random"]))
+            shuffled, heuristic_predictions(shuffled, shuffled)["random"]))
 
         original = dict(zip(zip(frame.scan_id, frame.ap_index),
-                            baseline_predictions(frame, frame)["random"]))
+                            heuristic_predictions(frame, frame)["random"]))
         reordered = dict(zip(zip(shuffled.scan_id, shuffled.ap_index),
-                             baseline_predictions(shuffled, shuffled)["random"]))
+                             heuristic_predictions(shuffled, shuffled)["random"]))
         self.assertEqual(original, reordered)
 
-    def test_pooled_strata_keep_repeated_split_scans_separate(self):
+    def test_pooled_strata_count_each_fold_scan_once(self):
+        # The folds are disjoint, so the pooled frame holds a scan once per
+        # fold it belongs to, and a stratum's scan count is its scans.
         frame = pd.DataFrame({
-            "split_seed": [0, 0, 1, 1],
-            "scan_id": ["g", "g", "g", "g"],
+            "fold": [0, 0, 1, 1],
+            "scan_id": ["g", "g", "h", "h"],
             "stratum": ["x", "x", "x", "x"],
             "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0],
             "pred_model": [1.0, 0.0, 0.0, 1.0],
@@ -225,71 +221,8 @@ class EvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(float(report.loc[0, "model"]), 5.0)
 
 
-class TemporalTransformerTests(unittest.TestCase):
-    def test_checkpoint_loads_through_safe_weights_only_path(self):
-        model = TemporalSetTransformer(3, 4, model_dim=8, heads=2,
-                                       temporal_layers=1, set_layers=1)
-        payload = {
-            "state_dict": model.state_dict(),
-            "objective": "regression",
-            "model": {
-                "n_temporal_features": 3,
-                "max_steps": 4,
-                "model_dim": 8,
-                "heads": 2,
-                "temporal_layers": 1,
-                "set_layers": 1,
-                "dropout": 0.1,
-            },
-            "temporal_features": ["a", "b", "c"],
-            "scaler_mean": torch.zeros(3),
-            "scaler_std": torch.ones(3),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "model.pt"
-            torch.save(payload, path)
-            loaded, metadata = load_temporal_checkpoint(path)
-        self.assertIsInstance(loaded, TemporalSetTransformer)
-        self.assertEqual(metadata["objective"], "regression")
-
-    def setUp(self):
-        torch.manual_seed(3)
-        self.model = TemporalSetTransformer(
-            n_temporal_features=6, max_steps=5, model_dim=16, heads=4,
-            temporal_layers=1, set_layers=1, dropout=0.0)
-        self.model.eval()
-        self.temporal = torch.randn(2, 4, 5, 6)
-        self.option_mask = torch.tensor([
-            [True, True, True, False],
-            [True, True, True, True],
-        ])
-        self.time_mask = torch.tensor([
-            [True, True, True, False, False],
-            [True, True, True, True, True],
-        ])
-
-    def test_option_permutation_equivariance(self):
-        permutation = torch.tensor([2, 0, 3, 1])
-        with torch.no_grad():
-            original = self.model(self.temporal, self.option_mask, self.time_mask)
-            permuted = self.model(self.temporal[:, permutation],
-                                  self.option_mask[:, permutation], self.time_mask)
-        np.testing.assert_allclose(
-            permuted.numpy(), original[:, permutation].numpy(), rtol=1e-5, atol=1e-6)
-
-    def test_masked_values_cannot_change_real_scores(self):
-        changed = self.temporal.clone()
-        changed[0, 3] = 1e6
-        changed[0, :3, 3:] = -1e6
-        with torch.no_grad():
-            original = self.model(self.temporal, self.option_mask, self.time_mask)
-            altered = self.model(changed, self.option_mask, self.time_mask)
-        np.testing.assert_allclose(
-            altered[0, :3].numpy(), original[0, :3].numpy(), rtol=1e-5, atol=1e-6)
-
-
 class CorpusSplitTests(unittest.TestCase):
-    """The array corpora split by the same rule as the flat dataframe."""
+    """Row positions split by the same rule as the flat dataframe."""
 
     @staticmethod
     def _ids(n_topologies=10, seeds_per_topology=3):
@@ -304,64 +237,83 @@ class CorpusSplitTests(unittest.TestCase):
 
     def test_every_group_lands_in_exactly_one_part(self):
         topology_ids, configured = self._ids()
-        parts = split_rows_by_topology(topology_ids, configured, seed=1)
+        parts = split_rows_by_topology(topology_ids, configured, test_fold=1)
         covered = np.concatenate(parts)
         self.assertEqual(sorted(covered.tolist()), list(range(len(topology_ids))))
 
     def test_repeated_seeds_of_a_topology_never_cross_parts(self):
         topology_ids, configured = self._ids()
-        for seed in range(4):
-            parts = split_rows_by_topology(topology_ids, configured, seed=seed)
+        for fold in range(N_FOLDS):
+            parts = split_rows_by_topology(topology_ids, configured, test_fold=fold)
             seen = [set(topology_ids[part]) for part in parts]
             self.assertTrue(seen[0].isdisjoint(seen[1]))
             self.assertTrue(seen[0].isdisjoint(seen[2]))
             self.assertTrue(seen[1].isdisjoint(seen[2]))
 
+    def test_every_topology_is_tested_exactly_once_over_a_rotation(self):
+        topology_ids, configured = self._ids()
+        tested = []
+        for fold in range(N_FOLDS):
+            _, _, test = split_rows_by_topology(topology_ids, configured, test_fold=fold)
+            tested.extend(np.unique(topology_ids[test]).tolist())
+        self.assertEqual(sorted(tested), sorted(np.unique(topology_ids).tolist()))
+
+    def test_a_topology_never_validates_and_tests_in_the_same_fold(self):
+        topology_ids, configured = self._ids()
+        for fold in range(N_FOLDS):
+            _, val, test = split_rows_by_topology(topology_ids, configured, test_fold=fold)
+            self.assertTrue(set(topology_ids[val]).isdisjoint(set(topology_ids[test])))
+
+    def test_the_deal_does_not_depend_on_the_order_the_ids_arrive_in(self):
+        topology_ids, configured = self._ids()
+        order = np.argsort(topology_ids[::-1], kind="stable")
+        shuffled, shuffled_n_aps = topology_ids[::-1][order], configured[::-1][order]
+        _, _, test = split_rows_by_topology(topology_ids, configured, test_fold=0)
+        _, _, other = split_rows_by_topology(shuffled, shuffled_n_aps, test_fold=0)
+        self.assertEqual(set(topology_ids[test]), set(shuffled[other]))
+
+    def test_too_few_folds_to_leave_a_training_part_fails_clearly(self):
+        topology_ids, configured = self._ids()
+        with self.assertRaisesRegex(ValueError, "at least 3 folds"):
+            split_rows_by_topology(topology_ids, configured, test_fold=0, n_folds=2)
+
+    def test_a_fold_outside_the_rotation_fails_clearly(self):
+        topology_ids, configured = self._ids()
+        with self.assertRaisesRegex(ValueError, "not one of the"):
+            split_rows_by_topology(topology_ids, configured, test_fold=N_FOLDS)
+
     def test_too_few_topologies_fails_clearly(self):
         topology_ids = np.array(["a", "b", "c"])
-        with self.assertRaisesRegex(ValueError, "at least 5 independent"):
-            split_rows_by_topology(topology_ids, None)
+        with self.assertRaisesRegex(ValueError, "every AP count needs at least 5"):
+            split_rows_by_topology(topology_ids, np.array([2, 2, 4]))
 
-    def _temporal_corpus(self):
+    def test_an_ap_count_too_rare_to_reach_every_fold_fails_clearly(self):
+        # ten topologies pass any check on the total, but five AP counts of two
+        # each leave three of the five folds with nothing in them
+        topology_ids = np.array([f"t{t:02d}" for t in range(10)])
+        n_aps = np.array([2, 2, 3, 3, 4, 4, 6, 6, 8, 8])
+        with self.assertRaisesRegex(ValueError, "the rarest has 2"):
+            split_rows_by_topology(topology_ids, n_aps)
+
+    def test_a_nan_ap_count_fails_clearly_rather_than_dropping_a_topology(self):
         topology_ids, configured = self._ids()
-        n = len(topology_ids)
-        return TemporalCorpus(
-            temporal=np.zeros((n, 2, 3, 4), np.float32),
-            labels=np.zeros((n, 2), np.float32),
-            option_indices=np.zeros((n, 2), np.int16),
-            option_mask=np.ones((n, 2), bool),
-            time_mask=np.ones((n, 3), bool),
-            scan_ids=np.array([f"g{i}" for i in range(n)]),
-            topology_ids=topology_ids, configured_n_aps=configured,
-            n_hotspots=np.zeros(n, np.int16),
-            temporal_features=["a", "b", "c", "d"])
+        n_aps = configured.astype(float)
+        n_aps[0] = np.nan
+        with self.assertRaisesRegex(ValueError, "AP count is NaN"):
+            split_rows_by_topology(topology_ids, n_aps)
 
-    def _frame_corpus(self):
+    def test_the_frame_and_array_splits_cut_topologies_the_same_way(self):
         topology_ids, configured = self._ids()
-        n = len(topology_ids)
-        return FrameCorpus(
-            frames=np.zeros((n, 5, 2), np.float32),
-            relations=np.zeros((n, 2, 5), np.uint8),
-            frame_mask=np.ones((n, 5), bool),
-            labels=np.zeros((n, 2), np.float32),
-            option_indices=np.zeros((n, 2), np.int16),
-            option_mask=np.ones((n, 2), bool),
-            scan_ids=np.array([f"g{i}" for i in range(n)]),
-            topology_ids=topology_ids, configured_n_aps=configured,
-            n_hotspots=np.zeros(n, np.int16), window_s=np.full(n, 6.0, np.float32),
-            frame_features=["a", "b"])
+        frame = pd.DataFrame({"topology_id": topology_ids, "gt_n_aps": configured})
+        by_frame = split_by_topology(frame, test_fold=3)
+        by_rows = split_rows_by_topology(topology_ids, configured, test_fold=3)
+        for part_frame, part_rows in zip(by_frame, by_rows):
+            self.assertEqual(set(part_frame["topology_id"]), set(topology_ids[part_rows]))
 
-    def test_binned_and_frame_corpora_split_identically(self):
-        temporal, frames = self._temporal_corpus(), self._frame_corpus()
-        for seed in range(3):
-            for from_temporal, from_frames in zip(temporal.split(seed=seed),
-                                                  frames.split(seed=seed)):
-                np.testing.assert_array_equal(from_temporal, from_frames)
-
-    def test_corpus_split_keeps_both_ap_counts_in_every_part(self):
-        corpus = self._temporal_corpus()
-        for part in corpus.split(seed=2):
-            self.assertEqual(set(corpus.configured_n_aps[part].tolist()), {2, 4})
+    def test_every_part_keeps_both_ap_counts(self):
+        topology_ids, configured = self._ids()
+        for part in split_rows_by_topology(topology_ids, configured, test_fold=2):
+            self.assertEqual(set(configured[part].tolist()), {2, 4})
 
 
 class SpearmanTests(unittest.TestCase):
