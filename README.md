@@ -14,3 +14,7 @@ joining one AP.
 
 The problem, the simulator and the results are described in
 [the report](report/simulator_v1_ieee.pdf).
+
+---
+
+As of 21 September 2026: Claude has read 1,041,541,224 input tokens (most of which is reloaded context) and written 5,324,677 output tokens for this project, which comes to $868 at the global per-million-token API rates. Yikes!

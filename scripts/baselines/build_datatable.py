@@ -10,13 +10,6 @@ INPUT
   cache_dir, written by tf/cache_dataset.py: <scan_id>.npz per scan, and
   _index.npz.
 
-PROCESS, per scan
-  1. Undo the log1p the cache stored airtime, length and rate under.
-  2. Summarise the frames heard on each channel a valid AP occupies.
-  3. Summarise each valid AP's own BSS, taking from its window descriptor the
-     beacon levels, the airtime fraction and the client count.
-  4. Compare each valid AP with the others of its scan.
-
 OUTPUT: a CSV with one row per (scan, valid AP)
   topology_id, scan_id, ap_index   identifiers; ap_index counts the valid APs
   feat_chan_*  the AP's channel
@@ -24,6 +17,17 @@ OUTPUT: a CSV with one row per (scan, valid AP)
   feat_rel_*   the AP against the other valid APs of its scan
   label_*      throughput after joining the AP
   gt_*         the deployment's AP and hotspot counts, for slicing; never input
+
+PROCESS, per scan
+  1. Undo the log1p the cache stored airtime, length and rate under.
+  2. Summarise the frames heard on each channel a valid AP occupies.
+  3. Summarise each valid AP's own BSS, taking from its window descriptor the
+     beacon levels, the airtime fraction and the client count.
+  4. Compare each valid AP with the others of its scan.
+
+Run:
+  .venv/bin/python3 scripts/baselines/build_datatable.py data/cache \
+      --out data/aggregate.csv
 """
 
 from __future__ import annotations

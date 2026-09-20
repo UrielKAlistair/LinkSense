@@ -75,3 +75,21 @@
 - **Sweep passes:** as many as the 6 s window fits. It might be worth examining in the future, how the models perform with just <1 second of data. Claude decided for some reason that this should be the default and allowed only one single pass over all the channels, which silently broke my V0 results.
 
 - **BSS Load:** not simulated and not used; still deferred.
+
+- **Splits:** the topology, not the scan, is the unit kept whole, because the
+  scans of one topology hear the same deployment and splitting them would
+  reward memorising it. Five folds dealt under a fixed seed, each AP count
+  dealt separately so every fold carries the same mix of deployment sizes; a
+  run tests on fold f and validates on f+1, giving 60/20/20 with every topology
+  tested exactly once over the rotation. The seed lives in `splits.py` rather
+  than being passed in, so every model trained from this repo is tested on the
+  same folds.
+
+- **Android as a reference rule:** AOSP's `ThroughputScorer` and
+  `ThroughputPredictor` are reproduced in `baselines/android_throughput.py`, but
+  nothing imports that file and no Android number is reported. The rule needs the
+  AP's own channel utilization from the BSS Load element, which the corpus does
+  not simulate. Substituting the client's measured busy fraction was tried and
+  rejected: it is the medium as the client hears it rather than as the AP hears
+  it, and it is already an input to our own models, so it would compare a feature
+  rather than compare Android. The file waits on BSS Load.
