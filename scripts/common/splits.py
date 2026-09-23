@@ -11,7 +11,7 @@ share of the large deployments.
 
 PROCESS, for one value of test_fold
   1. Reduce the rows to one entry per topology, each paired with its AP count.
-     split_by_topology() takes the aggregate table, one row per valid AP;
+     split_by_topology() takes the aggregate table, one row per discovered AP;
      split_rows_by_topology() takes the cell cache's per-scan arrays.
   2. Deal those topologies into n_folds parts under one fixed permutation, each
      AP count dealt separately.
@@ -52,7 +52,7 @@ DEAL_SEED = 0
 
 def split_by_topology(df: pd.DataFrame, test_fold: int = 0, n_folds: int = N_FOLDS
                       ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """The three parts of the aggregate table, one row per valid AP.
+    """The three parts of the aggregate table, one row per discovered AP.
 
     Every row of a topology lands in exactly one part.
     """
@@ -68,7 +68,7 @@ def split_by_topology(df: pd.DataFrame, test_fold: int = 0, n_folds: int = N_FOL
         raise ValueError(f"{missing} rows have no {TOPOLOGY_COL}; they would be "
                          "dropped from every part rather than assigned to one")
 
-    # partition_ids splits topologies, and df holds one row per valid AP, so a
+    # partition_ids splits topologies, and df holds one row per discovered AP, so a
     # topology appears once per AP per scan. Sorted because the deal is
     # positional: the parts must not follow the order the rows arrived in.
     topologies = (df[[TOPOLOGY_COL, N_APS_COL]].drop_duplicates(TOPOLOGY_COL)

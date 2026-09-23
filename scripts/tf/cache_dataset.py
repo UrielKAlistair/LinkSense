@@ -13,14 +13,14 @@ PROCESS, per scan
   1. Project the recording onto one radio (common.projection), and cut what it
      heard into its dwells.
   2. Put every frame of every dwell into one frame table, tagged with its dwell
-     and with the AP number of the valid AP whose BSSID it carries.
-  3. For every dwell, emit one "channel" cell, and one for each valid AP on that channel.
-     Every channel is visited num_passes times, as is every valid AP
+     and with the AP number of the discovered AP whose BSSID it carries.
+  3. For every dwell, emit one "channel" cell, and one for each discovered AP on
+     that channel. Every channel is visited num_passes times, as is every discovered AP
      (an AP whose beacon was decoded at least once in the projected recording).
-     A scan thus has num_passes x (num_channels + num_valid_APs) cells.
+     A scan thus has num_passes x (num_channels + num_discovered_APs) cells.
      Each cell is built with its frames, aggregate statistics over all of them, and, for channel
      cells, that dwell's 109 carrier-sense milliseconds.
-  4. Summarise each valid AP over the whole window into a descriptor.
+  4. Summarise each discovered AP over the whole window into a descriptor.
 
 
 Each frame is stored once, in the order the radio heard it. A cell stores no
@@ -49,9 +49,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from scripts.common.projection import (DWELL_MS, DWELL_S, MISSING_RSSI_DBM,  # noqa: E402
                                        TYPE_DATA, TYPE_MGMT, ProjectedScan,
                                        describe, dwell_bounds, dwell_of, project)
-from scripts.common.parse_scans import Scan, ValidAP, find_scans, find_valid_aps  # noqa: E402
+from scripts.common.parse_scans import (DiscoveredAP, Scan, find_discovered_aps,  # noqa: E402
+                                        find_scans)
 
-CHANNEL_CELL, AP_CELL = 0, 1
 NO_AP = -1
 N_CATEGORIES = 3
 
@@ -69,7 +69,7 @@ FRAME_FEATURES = (
     "is_beacon",
     "is_retry",
     "from_ap",              # the BSSID itself sent it, not one of its stations
-    "of_valid_ap",          # carries a valid AP's BSSID
+    "of_discovered_ap",     # carries a discovered AP's BSSID
 )
 
 CELL_AGGREGATES = (
@@ -100,8 +100,8 @@ DESCRIPTOR_FEATURES = (
     "beacons_log1p",
     "bss_airtime_fraction",   # its BSS's summed airtime, over the time listened on its channel
     "bss_transmitters_log1p", # distinct stations heard sending in its BSS
-    "cochannel_valid_aps",    # other valid APs on its channel
-    "n_valid_aps",
+    "cochannel_discovered_aps",  # other discovered APs on its channel
+    "n_discovered_aps",
 )
 
 
@@ -109,23 +109,23 @@ def build_scan(scan: Scan, out_dir: Path) -> dict | None:
     """Write one scan's .npz cache, and return what the index and the closing
     summary need to know about it.
 
-    None when the scan offers no choice, which find_valid_aps already reports.
+    None when the scan offers no choice, which find_discovered_aps already reports.
     """
     # 1. Project onto one radio, and cut what it heard into dwells.
     projected = project(scan.recording, scan.scan_id, all_channels=False)
-    valid_aps = find_valid_aps(scan, projected)
-    if valid_aps is None:
+    discovered_aps = find_discovered_aps(scan, projected)
+    if discovered_aps is None:
         return None
     dwells = split_into_dwells(projected)
 
     # 2. Put every frame into the frame table.
-    table = FrameTable(dwells, valid_aps)
+    table = FrameTable(dwells, discovered_aps)
 
     # 3. Emit the cells, each with its frames, aggregate statistics and carrier sense.
-    cells = emit_cells(table, dwells, valid_aps)
+    cells = emit_cells(table, dwells, discovered_aps)
 
-    # 4. Summarise each valid AP over the whole window.
-    descriptors = DescriptorTable(table, dwells, valid_aps)
+    # 4. Summarise each discovered AP over the whole window.
+    descriptors = DescriptorTable(table, dwells, discovered_aps)
 
     np.savez(
         out_dir / f"{scan.scan_id}.npz",
@@ -134,7 +134,7 @@ def build_scan(scan: Scan, out_dir: Path) -> dict | None:
         frame_dwell=table.dwell_numbers,
         frame_ap=table.ap_numbers,
         cell_dwell=np.array([cell.dwell_number for cell in cells], dtype=np.uint8),
-        cell_kind=np.array([cell.kind for cell in cells], dtype=np.uint8),
+        cell_is_channel=np.array([cell.is_channel for cell in cells], dtype=bool),
         cell_channel=np.array([cell.channel for cell in cells], dtype=np.uint8),
         cell_ap=np.array([cell.ap_number for cell in cells], dtype=np.int8),
         cell_aggregates=np.array([list(cell.aggregates.values()) for cell in cells],
@@ -142,17 +142,17 @@ def build_scan(scan: Scan, out_dir: Path) -> dict | None:
         dwell_channel=np.array([dwell.channel for dwell in dwells], dtype=np.uint8),
         # one channel cell per dwell, in dwell order, so row d is dwell d's
         cca_samples=np.stack([cell.carrier_sense for cell in cells
-                              if cell.kind == CHANNEL_CELL]),
+                              if cell.is_channel]),
         descriptors=descriptors.features,
-        labels=np.array([ap.throughput_mbps for ap in valid_aps], np.float32),
-        ap_indices=np.array([ap.index for ap in valid_aps], np.int16),
-        ap_channels=np.array([ap.channel for ap in valid_aps], np.uint8),
+        labels=np.array([ap.throughput_mbps for ap in discovered_aps], np.float32),
+        ap_indices=np.array([ap.index for ap in discovered_aps], np.int16),
+        ap_channels=np.array([ap.channel for ap in discovered_aps], np.uint8),
     )
-    params = valid_aps[0].metadata["params"]
+    params = discovered_aps[0].metadata["params"]
     return {
         "scan_id": scan.scan_id,
         "topology_id": scan.topology_id,
-        "n_valid_aps": len(valid_aps),
+        "n_discovered_aps": len(discovered_aps),
         "n_aps": int(params["n_aps"]),
         "n_hotspots": int(params["n_hotspots"]),
         "n_cells": len(cells),
@@ -216,12 +216,12 @@ class FrameTable:
     ap_numbers: np.ndarray    # tag: the AP number whose BSSID each frame carries, or NO_AP
     heard: list[dict]         # the frames as read, which the aggregates need; not cached
 
-    def __init__(self, dwells: list[Dwell], valid_aps: list[ValidAP]):
-        ap_number_of = {ap.mac: number for number, ap in enumerate(valid_aps)}
-        valid_bssids = set(ap_number_of)
+    def __init__(self, dwells: list[Dwell], discovered_aps: list[DiscoveredAP]):
+        ap_number_of = {ap.mac: number for number, ap in enumerate(discovered_aps)}
+        discovered_bssids = set(ap_number_of)
         rows, dwell_numbers = [], []
         for dwell in dwells:
-            rows += self.frame_features(dwell, valid_bssids)
+            rows += self.frame_features(dwell, discovered_bssids)
             dwell_numbers += [dwell.number] * len(dwell.frames)
         self.heard = [frame for dwell in dwells for frame in dwell.frames]
         self.features = np.array([list(row.values()) for row in rows], dtype=np.float32)
@@ -232,7 +232,7 @@ class FrameTable:
                                    dtype=np.int8)
 
     @staticmethod
-    def frame_features(dwell: Dwell, valid_bssids: set[str]) -> list[dict[str, float]]:
+    def frame_features(dwell: Dwell, discovered_bssids: set[str]) -> list[dict[str, float]]:
         """FRAME_FEATURES of each frame of one dwell, by name, in the order heard.
 
         The gap is the idle time before the frame: from the end of the latest
@@ -254,7 +254,7 @@ class FrameTable:
                 "is_beacon": float(frame["beacon"]),
                 "is_retry": float(frame["retry"]),
                 "from_ap": float(frame["ta"] is not None and frame["ta"] == frame["bssid"]),
-                "of_valid_ap": float(frame["bssid"] in valid_bssids),
+                "of_discovered_ap": float(frame["bssid"] in discovered_bssids),
             })
             last_end = max(last_end, frame["tx_end"])
         return rows
@@ -269,9 +269,9 @@ class FrameTable:
 # values.
 
 def emit_cells(table: FrameTable, dwells: list[Dwell],
-               valid_aps: list[ValidAP]) -> list[Cell]:
-    """One channel cell for every dwell, and one AP cell for every valid AP on
-    that dwell's channel, in dwell order.
+               discovered_aps: list[DiscoveredAP]) -> list[Cell]:
+    """One channel cell for every dwell, and one AP cell for every discovered AP
+    on that dwell's channel, in dwell order.
 
     An AP cell is emitted whether or not its AP was heard in that dwell: the
     radio was listening for it, so its silence is a reading.
@@ -280,7 +280,7 @@ def emit_cells(table: FrameTable, dwells: list[Dwell],
     for dwell in dwells:
         cells.append(Cell(table, dwell))
         cells += [Cell(table, dwell, number, ap.mac)
-                  for number, ap in enumerate(valid_aps)
+                  for number, ap in enumerate(discovered_aps)
                   if ap.channel == dwell.channel]
     return cells
 
@@ -292,7 +292,7 @@ class Cell:
     but instead a filter map for FrameTable to avoid redundant storage."""
 
     dwell_number: int         # which dwell, 0 to 51
-    kind: int                 # CHANNEL_CELL or AP_CELL
+    is_channel: bool          # a channel cell, else an AP cell
     channel: int              # the channel the radio was tuned to
     ap_number: int            # its AP number; NO_AP on a channel cell
     frames: np.ndarray        # its rows of the frame table
@@ -304,11 +304,11 @@ class Cell:
         """The channel cell of `dwell`, or, given an AP, that AP's cell in it.
         """
         self.dwell_number = dwell.number
-        self.kind = CHANNEL_CELL if ap_number == NO_AP else AP_CELL
+        self.is_channel = ap_number == NO_AP
         self.channel = dwell.channel
         self.ap_number = ap_number
         self.frames = self.find_frames(table)
-        self.carrier_sense = self.pad_carrier_sense(dwell) if self.kind == CHANNEL_CELL else None
+        self.carrier_sense = self.pad_carrier_sense(dwell) if self.is_channel else None
         self.aggregates = self.compute_aggregates(table, dwell, ap_mac)
 
     def find_frames(self, table: FrameTable) -> np.ndarray:
@@ -347,10 +347,10 @@ class Cell:
         busy, gaps = self.air_time(frames, dwell.listen_start, dwell.end)
         count = len(frames) or 1
         rssis = [f["rssi"] for f in frames]
-        beacons = [f["rssi"] for f in frames if f["beacon"]] if self.kind == AP_CELL else []
+        beacons = [f["rssi"] for f in frames if f["beacon"]] if not self.is_channel else []
         data_rates = [f["rate"] for f in frames if f["cat"] == TYPE_DATA]
         stations = {f["ta"] for f in frames if f["ta"] and f["ta"] != ap_mac}
-        cca = dwell.cca if self.kind == CHANNEL_CELL else []
+        cca = dwell.cca if self.is_channel else []
         return {
             "frames_log1p": math.log1p(len(frames)),
             "bytes_log1p": math.log1p(sum(f["len"] for f in frames)),
@@ -388,31 +388,33 @@ class Cell:
 
 
 # ---------------------------------------------------------------------------
-# 4. Summarise each valid AP over the whole window
+# 4. Summarise each discovered AP over the whole window
 # ---------------------------------------------------------------------------
 
 class DescriptorTable:
-    """Every valid AP of the scan once, in AP-number order, each summarised over
-    the frames of the frame table that carry its BSSID."""
+    """Every discovered AP of the scan once, in AP-number order, each summarised
+    over the frames of the frame table that carry its BSSID."""
 
-    features: np.ndarray      # its DESCRIPTOR_FEATURES, one row per valid AP
+    features: np.ndarray      # its DESCRIPTOR_FEATURES, one row per discovered AP
     feature_names: list[str]  # the name of each column of features
 
-    def __init__(self, table: FrameTable, dwells: list[Dwell], valid_aps: list[ValidAP]):
+    def __init__(self, table: FrameTable, dwells: list[Dwell],
+                 discovered_aps: list[DiscoveredAP]):
         rows = []
-        for number, ap in enumerate(valid_aps):
+        for number, ap in enumerate(discovered_aps):
             frames = [table.heard[i] for i in np.flatnonzero(table.ap_numbers == number)]
             listen_s = sum(dwell.end - dwell.listen_start
                            for dwell in dwells if dwell.channel == ap.channel)
-            cochannel = sum(other.channel == ap.channel for other in valid_aps) - 1
-            rows.append(self.ap_descriptor(ap, frames, listen_s, cochannel, len(valid_aps)))
+            cochannel = sum(other.channel == ap.channel for other in discovered_aps) - 1
+            rows.append(self.ap_descriptor(ap, frames, listen_s, cochannel,
+                                           len(discovered_aps)))
         self.features = np.array([list(row.values()) for row in rows], dtype=np.float32)
         self.feature_names = list(rows[0])
 
     @staticmethod
-    def ap_descriptor(ap: ValidAP, frames: list[dict], listen_s: float,
-                      cochannel: int, n_valid_aps: int) -> dict[str, float]:
-        """DESCRIPTOR_FEATURES: one valid AP summarised over the whole window.
+    def ap_descriptor(ap: DiscoveredAP, frames: list[dict], listen_s: float,
+                      cochannel: int, n_discovered_aps: int) -> dict[str, float]:
+        """DESCRIPTOR_FEATURES: one discovered AP summarised over the whole window.
         """
         beacons = sorted((f for f in frames if f["beacon"]), key=lambda f: f["tx_start"])
         levels = [f["rssi"] for f in beacons]
@@ -426,8 +428,8 @@ class DescriptorTable:
             "beacons_log1p": math.log1p(len(levels)),
             "bss_airtime_fraction": sum(f["dur"] for f in frames) / (listen_s * 1e6),
             "bss_transmitters_log1p": math.log1p(len(stations)),
-            "cochannel_valid_aps": float(cochannel),
-            "n_valid_aps": float(n_valid_aps),
+            "cochannel_discovered_aps": float(cochannel),
+            "n_discovered_aps": float(n_discovered_aps),
         }
 
 
@@ -468,7 +470,7 @@ def main() -> int:
         args.out / "_index.npz",
         scan_ids=np.array([row["scan_id"] for row in index]),
         topology_ids=np.array([row["topology_id"] for row in index]),
-        n_valid_aps=np.array([row["n_valid_aps"] for row in index], np.int16),
+        n_discovered_aps=np.array([row["n_discovered_aps"] for row in index], np.int16),
         configured_n_aps=np.array([row["n_aps"] for row in index], np.int16),
         n_hotspots=np.array([row["n_hotspots"] for row in index], np.int16),
         frame_features=np.array(frame_names),

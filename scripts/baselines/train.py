@@ -274,7 +274,7 @@ def prediction_rows(test, predictions, fold):
         rows[f"pred_{name}"] = p
 
     # A scan is fully discovered when it heard a beacon from every AP the
-    # deployment placed; where it heard fewer, some option was never on offer.
+    # deployment placed; where it heard fewer, some AP was never discovered.
     group_sizes = rows.groupby("scan_id")["scan_id"].transform("size")
     rows["discovery"] = np.where(group_sizes == rows["gt_n_aps"], "full", "partial")
     return rows
@@ -317,7 +317,7 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c.startswith("feat_")]
 
 
-# build_datatable.py emits one row per (scan, valid AP). Only the feat_* columns
+# build_datatable.py emits one row per (scan, discovered AP). Only the feat_* columns
 # of that row are observable before joining; the label, the identifiers and the
 # gt_* deployment sizes exist to score and slice, and never reach a model.
 

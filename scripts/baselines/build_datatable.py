@@ -10,20 +10,20 @@ INPUT
   cache_dir, written by tf/cache_dataset.py: <scan_id>.npz per scan, and
   _index.npz.
 
-OUTPUT: a CSV with one row per (scan, valid AP)
-  topology_id, scan_id, ap_index   identifiers; ap_index counts the valid APs
+OUTPUT: a CSV with one row per (scan, discovered AP)
+  topology_id, scan_id, ap_index   identifiers; ap_index counts the discovered APs
   feat_chan_*  the AP's channel
   feat_ap_*    the AP's own BSS
-  feat_rel_*   the AP against the other valid APs of its scan
+  feat_rel_*   the AP against the other discovered APs of its scan
   label_*      throughput after joining the AP
   gt_*         the deployment's AP and hotspot counts, for slicing; never input
 
 PROCESS, per scan
   1. Undo the log1p the cache stored airtime, length and rate under.
-  2. Summarise the frames heard on each channel a valid AP occupies.
-  3. Summarise each valid AP's own BSS, taking from its window descriptor the
+  2. Summarise the frames heard on each channel a discovered AP occupies.
+  3. Summarise each discovered AP's own BSS, taking from its window descriptor the
      beacon levels, the airtime fraction and the client count.
-  4. Compare each valid AP with the others of its scan.
+  4. Compare each discovered AP with the others of its scan.
 
 Run:
   .venv/bin/python3 scripts/baselines/build_datatable.py data/cache \
@@ -47,7 +47,7 @@ from scripts.common.projection import (DWELL_S, LISTEN_PER_DWELL_S,  # noqa: E40
 
 def scan_rows(path: Path, scan_id: str, topology_id: str, ground_truth: dict,
               names: dict[str, list[str]]) -> list[dict]:
-    """The rows of one cached scan, one per valid AP."""
+    """The rows of one cached scan, one per discovered AP."""
     with np.load(path) as file:
         cached = {key: file[key] for key in file.files}
     scan = CachedScan(cached, names)
@@ -95,7 +95,7 @@ class CachedScan:
         self.listen_s = len(self.dwell_channel) // len(SCAN_CHANNELS) * LISTEN_PER_DWELL_S
         self.descriptors = {name: cached["descriptors"][:, i]
                             for i, name in enumerate(names["descriptors"])}
-        self.n_valid_aps = len(cached["ap_channels"])
+        self.n_discovered_aps = len(cached["ap_channels"])
 
     def channel_features(self, channel: int) -> dict:
         """feat_chan_*: everything heard on one channel over the window."""
@@ -118,7 +118,7 @@ class CachedScan:
         }
 
     def ap_features(self, number: int) -> dict:
-        """feat_ap_*: one valid AP's own BSS over the window.
+        """feat_ap_*: one discovered AP's own BSS over the window.
 
         The beacon levels, the airtime fraction and the client count are the
         window descriptor's, which is what the cell models read; the rest come
@@ -153,11 +153,11 @@ class CachedScan:
         }
 
     def relative_features(self, number: int) -> dict:
-        """feat_rel_*: one valid AP against the others of its scan.
+        """feat_rel_*: one discovered AP against the others of its scan.
 
         The airtime share divides by the airtime of every BSS heard, which is
         every frame that names one: only control frames name none. The client
-        share divides by the scan's valid APs alone, since the clients of a BSS
+        share divides by the scan's discovered APs alone, since the clients of a BSS
         whose beacons never decoded are not in the cache.
         """
         levels = self.descriptors["beacon_rssi_mean"]
@@ -167,8 +167,8 @@ class CachedScan:
         all_airtime = float(self.airtime_us[named_bss].sum()) / (self.listen_s * 1e6)
         clients = np.round(np.expm1(self.descriptors["bss_transmitters_log1p"]))
         return {
-            "feat_rel_n_options": float(self.n_valid_aps),
-            # options STRICTLY stronger, so options tied in whole dBm share a rank
+            "feat_rel_n_discovered_aps": float(self.n_discovered_aps),
+            # APs STRICTLY stronger, so APs tied in whole dBm share a rank
             "feat_rel_rssi_rank": float((levels > mine).sum()),
             "feat_rel_rssi_margin_best_other": mine - float(others.max()) if len(others) else 0.0,
             "feat_rel_rssi_minus_mean": mine - float(levels.mean()),

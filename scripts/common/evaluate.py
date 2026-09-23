@@ -24,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# Columns of the per-AP frame these metrics score, one row per valid AP.
+# Columns of the per-AP frame these metrics score, one row per discovered AP.
 LABEL_COL = "label_throughput_mbps"
 SCAN_COL = "scan_id"
 

@@ -9,10 +9,10 @@ recording serves the whole scan and each run adds the label of its AP.
   find_scans()    groups the run directories into scans, and raises if a scan
                   lacks the run for one of its APs or a run directory is not in
                   the manifest.
-  find_valid_aps()  given a scan's projected recording, returns its valid
-                    APs: those with a decoded beacon, which the client could
-                    join, each with its channel and the label of the run that
-                    joined it.
+  find_discovered_aps()  given a scan's projected recording, returns its
+                         discovered APs: those with a decoded beacon, which the
+                         client could join, each with its channel and the label
+                         of the run that joined it.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ def find_scans(runs_dir: Path) -> list[Scan]:
 
 
 @dataclasses.dataclass(frozen=True)
-class ValidAP:
+class DiscoveredAP:
     """An AP whose beacon the client decoded, so it could join it, and what
     joining it gave."""
 
@@ -81,13 +81,13 @@ class ValidAP:
     metadata: dict            # metadata.json of the run that joined it
 
 
-def find_valid_aps(scan: Scan, projected: ProjectedScan) -> list[ValidAP] | None:
+def find_discovered_aps(scan: Scan, projected: ProjectedScan) -> list[DiscoveredAP] | None:
     """The APs with a decoded beacon, in AP index order.
 
     None when fewer than two APs qualify, since the scan then offers no choice.
     """
     channel_of = beacon_channels(projected.frames)
-    valid_aps = []
+    discovered_aps = []
     for index, run in scan.runs.items():
         metadata = json.loads((run / "metadata.json").read_text())
         if metadata["candidate"]["target_ap"] != index:
@@ -95,14 +95,15 @@ def find_valid_aps(scan: Scan, projected: ProjectedScan) -> list[ValidAP] | None
                              f"{metadata['candidate']['target_ap']}")
         mac = next(ap["mac"] for ap in metadata["aps"] if ap["index"] == index).lower()
         if mac in channel_of:
-            valid_aps.append(ValidAP(index, mac, channel_of[mac],
-                                  float(metadata["candidate"]["throughput_mbps"]),
-                                  bool(metadata["candidate"]["associated"]), metadata))
-    if len(valid_aps) < 2:
-        print(f"WARN: scan {scan.scan_id} heard only {len(valid_aps)} AP(s); skipping",
+            discovered_aps.append(
+                DiscoveredAP(index, mac, channel_of[mac],
+                             float(metadata["candidate"]["throughput_mbps"]),
+                             bool(metadata["candidate"]["associated"]), metadata))
+    if len(discovered_aps) < 2:
+        print(f"WARN: scan {scan.scan_id} heard only {len(discovered_aps)} AP(s); skipping",
               file=sys.stderr)
         return None
-    return valid_aps
+    return discovered_aps
 
 
 def beacon_channels(frames: list[dict]) -> dict[str, int]:
