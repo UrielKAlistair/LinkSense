@@ -12,8 +12,7 @@ from scripts.common.splits import N_FOLDS, split_by_topology, split_rows_by_topo
 from scripts.common.evaluate import selection_metrics
 from scripts.baselines.train import fit_rssi_busy_k, heuristic_predictions
 from scripts.simulate.run_sweep import Run, already_done
-from scripts.baselines.train import (choose_by_validation_regret, scan_sample_weights,
-                                 stratified_report, subset_topologies)
+from scripts.baselines.train import choose_by_validation_regret, subset_topologies
 
 
 class ScanSplitTests(unittest.TestCase):
@@ -56,15 +55,6 @@ class ScanSplitTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "no gt_n_aps column"):
             split_by_topology(frame)
-
-    def test_sample_weights_give_each_scan_equal_mass(self):
-        frame = pd.DataFrame({
-            "scan_id": ["a", "a", "b", "b", "b", "b"],
-        })
-        frame["weight"] = scan_sample_weights(frame)
-        totals = frame.groupby("scan_id").weight.sum()
-        self.assertAlmostEqual(float(totals["a"]), float(totals["b"]))
-        self.assertAlmostEqual(float(frame.weight.mean()), 1.0)
 
     def test_large_dataset_stratifies_every_ap_count(self):
         rows = []
@@ -204,21 +194,6 @@ class EvaluationTests(unittest.TestCase):
         reordered = dict(zip(zip(shuffled.scan_id, shuffled.ap_index),
                              heuristic_predictions(shuffled, shuffled)["random"]))
         self.assertEqual(original, reordered)
-
-    def test_pooled_strata_count_each_fold_scan_once(self):
-        # The folds are disjoint, so the pooled frame holds a scan once per
-        # fold it belongs to, and a stratum's scan count is its scans.
-        frame = pd.DataFrame({
-            "fold": [0, 0, 1, 1],
-            "scan_id": ["g", "g", "h", "h"],
-            "stratum": ["x", "x", "x", "x"],
-            "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0],
-            "pred_model": [1.0, 0.0, 0.0, 1.0],
-            "pred_strongest_rssi": [1.0, 0.0, 1.0, 0.0],
-        })
-        report = stratified_report(frame, ["model"])
-        self.assertEqual(int(report.loc[0, "scans"]), 2)
-        self.assertAlmostEqual(float(report.loc[0, "model"]), 5.0)
 
 
 class CorpusSplitTests(unittest.TestCase):

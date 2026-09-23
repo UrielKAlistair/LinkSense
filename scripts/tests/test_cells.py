@@ -7,13 +7,12 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.tf.cache_dataset import (AP_CELL, CCA_SAMPLES, CHANNEL_CELL,
-                                         NO_AP, Cell, DescriptorTable, Dwell, FrameTable,
-                                         build_scan)
+from scripts.tf.cache_dataset import (CCA_SAMPLES, NO_AP, Cell, DescriptorTable,
+                                         Dwell, FrameTable, build_scan)
 from scripts.common.projection import (DWELL_S, MISSING_RSSI_DBM, TYPE_CTRL, TYPE_DATA,
                                        TYPE_MGMT, dwell_bounds, dwell_of, sweep_rng,
                                        sweep_schedule)
-from scripts.common.parse_scans import Scan, ValidAP
+from scripts.common.parse_scans import Scan, DiscoveredAP
 
 AP_ONE, AP_TWO, STATION = "00:00:00:00:00:01", "00:00:00:00:00:02", "00:00:00:00:00:09"
 
@@ -31,7 +30,7 @@ def cell(frames, cca=(), ap_mac=None):
     """A cell of a one-dwell scan that listened from 0 to 0.1 s: its channel
     cell, or, given AP_ONE, that AP's cell."""
     dwell = Dwell(0, 36, 0.0, 0.0, 0.1, list(frames), list(cca))
-    table = FrameTable([dwell], [ValidAP(0, AP_ONE, 36, 12.0, True, {})])
+    table = FrameTable([dwell], [DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})])
     return Cell(table, dwell) if ap_mac is None else Cell(table, dwell, 0, ap_mac)
 
 
@@ -110,10 +109,10 @@ class FrameRowTests(unittest.TestCase):
                   frame(0.282, 0.2821, bssid=None, ta=None, cat=TYPE_CTRL),
                   frame(0.283, 0.2831, bssid=AP_TWO)]
         dwell = Dwell(0, 36, 0.28, 0.28015, 0.39, frames, [])
-        flags = [(row["from_ap"], row["of_valid_ap"])
+        flags = [(row["from_ap"], row["of_discovered_ap"])
                  for row in FrameTable.frame_features(dwell, {AP_ONE})]
         self.assertEqual(flags, [(1.0, 1.0), (0.0, 0.0), (0.0, 0.0)])
-        table = FrameTable([dwell], [ValidAP(0, AP_ONE, 36, 12.0, True, {})])
+        table = FrameTable([dwell], [DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})])
         self.assertEqual(table.categories.tolist(), [TYPE_MGMT, TYPE_CTRL, TYPE_DATA])
 
     def test_the_gap_is_idle_time_since_the_last_transmission_ended(self):
@@ -134,20 +133,21 @@ class FrameRowTests(unittest.TestCase):
 
 class DescriptorTests(unittest.TestCase):
     def test_levels_come_from_beacons_not_from_the_stations_of_the_bss(self):
-        ap = ValidAP(0, AP_ONE, 36, 12.0, True, {})
+        ap = DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})
         frames = ([frame(0.3, 0.31, ta=AP_ONE, beacon=True, cat=TYPE_MGMT, rssi=-50.0),
                    frame(0.4, 0.41, ta=AP_ONE, beacon=True, cat=TYPE_MGMT, rssi=-52.0)]
                   + [frame(0.5 + i / 100, 0.51 + i / 100, rssi=-80.0) for i in range(10)])
-        row = DescriptorTable.ap_descriptor(ap, frames, 1.428, cochannel=1, n_valid_aps=3)
+        row = DescriptorTable.ap_descriptor(ap, frames, 1.428, cochannel=1, n_discovered_aps=3)
         self.assertAlmostEqual(row["beacon_rssi_mean"], -51.0)
         self.assertAlmostEqual(row["beacon_rssi_last"], -52.0)
         self.assertAlmostEqual(row["beacons_log1p"], float(np.log1p(2)))
         self.assertAlmostEqual(row["bss_transmitters_log1p"], float(np.log1p(1)))
 
     def test_one_beacon_gives_a_level_and_no_spread(self):
-        ap = ValidAP(0, AP_ONE, 36, 12.0, True, {})
+        ap = DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})
         beacon = frame(0.3, 0.31, ta=AP_ONE, beacon=True, cat=TYPE_MGMT, rssi=-50.0)
-        row = DescriptorTable.ap_descriptor(ap, [beacon], 1.428, cochannel=0, n_valid_aps=2)
+        row = DescriptorTable.ap_descriptor(ap, [beacon], 1.428, cochannel=0,
+                                            n_discovered_aps=2)
         self.assertEqual(row["beacon_rssi_last"], -50.0)
         self.assertEqual(row["beacon_rssi_std"], 0.0)
 
@@ -172,7 +172,7 @@ class BuildScanTests(unittest.TestCase):
             }))
 
         # One beacon per AP, in the first dwell on its own channel, plus one
-        # station frame there, so both APs are valid.
+        # station frame there, so both APs are discovered.
         lines = ["tx_start,tx_end,freq_mhz,bssid,ta,cat,is_beacon,retry,len,"
                  "signal_dbm,duration_us,rate_mbps"]
         for mac, channel in channels.items():
@@ -201,13 +201,14 @@ class BuildScanTests(unittest.TestCase):
             out.mkdir()
             row = build_scan(scan, out)
 
-            self.assertEqual(row["n_valid_aps"], 2)
+            self.assertEqual(row["n_discovered_aps"], 2)
             cached = np.load(out / "t00000__c00.npz", allow_pickle=False)
             dwells = len(cached["dwell_channel"])
             self.assertEqual(row["n_cells"], dwells + 13 * 2)
-            self.assertEqual(len(cached["cell_kind"]), dwells + 13 * 2)
+            self.assertEqual(len(cached["cell_is_channel"]), dwells + 13 * 2)
 
-            kind, dwell, ap = cached["cell_kind"], cached["cell_dwell"], cached["cell_ap"]
+            is_channel = cached["cell_is_channel"]
+            dwell, ap = cached["cell_dwell"], cached["cell_ap"]
             dwell_numbers, ap_numbers = cached["frame_dwell"], cached["frame_ap"]
 
             def frames_of(dwell_number, ap_number):
@@ -217,13 +218,13 @@ class BuildScanTests(unittest.TestCase):
                 return np.flatnonzero(mine)
 
             # every frame sits in exactly one channel cell
-            owned = sorted(int(m) for i in np.flatnonzero(kind == CHANNEL_CELL)
+            owned = sorted(int(m) for i in np.flatnonzero(is_channel)
                            for m in frames_of(dwell[i], NO_AP))
             self.assertEqual(owned, list(range(len(cached["frames"]))))
             # each AP heard its beacon and one station frame in a single dwell,
             # so exactly one of its 13 cells holds frames, and it holds both
             for number in range(2):
-                mine = np.flatnonzero((kind == AP_CELL) & (ap == number))
+                mine = np.flatnonzero(~is_channel & (ap == number))
                 self.assertEqual(len(mine), 13)
                 held = [len(frames_of(dwell[i], number)) for i in mine]
                 self.assertEqual(sorted(held), [0] * 12 + [2])

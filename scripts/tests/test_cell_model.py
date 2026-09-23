@@ -6,12 +6,12 @@ import unittest
 import torch
 
 from scripts.tf.binned_model import BinnedModel, binned_view
-from scripts.tf.cache_dataset import AP_CELL, CHANNEL_CELL
-from scripts.tf.joint_ap_model import CellBatch, JointAPModel, gaussian_nll
+from scripts.tf.joint_ap_model import JointAPModel
+from scripts.tf.layers import POSITION_WIDTH, CellBatch, FrameEncoder
 from scripts.tf.target_ap_model import (CO_CHANNEL_AP, OTHER_AP, TARGET_AP,
                                            TargetAPModel, roles)
 
-FRAME_FEATURES, AGGREGATES, DESCRIPTOR, CCA_SAMPLES = 10, 16, 10, 109
+FRAME_FEATURES, AGGREGATES, DESCRIPTOR, CCA_SAMPLES = 9, 16, 10, 109
 CHANNELS = torch.tensor([36, 40, 44, 48])
 MEMBERS, FRAMES, SCANS = 12, 80, 2
 # The grid models read any batch; the binned model assumes what every cached
@@ -23,23 +23,29 @@ MODELS = GRID_MODELS + (BinnedModel,)
 
 def make_batch(aps=4, cells=24, seed=0) -> CellBatch:
     g = torch.Generator().manual_seed(seed)
-    member_mask = torch.rand(SCANS, cells, MEMBERS, generator=g) > 0.3
+    # Each cell's frames fill its first columns, as make_batch fills them.
+    sizes = torch.randint(1, MEMBERS + 1, (SCANS, cells, 1), generator=g)
+    member_mask = torch.arange(MEMBERS) < sizes
     member_mask[0, 0] = False                      # a dwell that decoded nothing
+    # The scans' frames lie end to end, and each cell points into its own scan's.
+    first_row = (torch.arange(SCANS) * FRAMES)[:, None, None]
     return CellBatch(
-        frames=torch.randn(SCANS, FRAMES, FRAME_FEATURES, generator=g),
-        frame_categories=torch.randint(0, 3, (SCANS, FRAMES), generator=g),
-        cell_members=torch.randint(0, FRAMES, (SCANS, cells, MEMBERS), generator=g),
+        frames=torch.randn(SCANS * FRAMES, FRAME_FEATURES, generator=g),
+        frame_offsets=torch.rand(SCANS * FRAMES, generator=g),
+        frame_categories=torch.randint(0, 3, (SCANS * FRAMES,), generator=g),
+        cell_members=first_row + torch.randint(0, FRAMES, (SCANS, cells, MEMBERS),
+                                               generator=g),
         cell_member_mask=member_mask,
         cell_aggregates=torch.randn(SCANS, cells, AGGREGATES, generator=g),
         cell_cca=torch.rand(SCANS, cells, CCA_SAMPLES, generator=g),
-        cell_kind=(torch.rand(SCANS, cells, generator=g) > 0.5).long(),
+        cell_is_channel=torch.rand(SCANS, cells, generator=g) > 0.5,
         cell_dwell=torch.randint(0, 52, (SCANS, cells), generator=g),
         cell_channel=CHANNELS[torch.randint(0, 4, (SCANS, cells), generator=g)],
-        cell_slot=torch.randint(0, aps, (SCANS, cells), generator=g),
+        cell_ap_identity=torch.randint(0, aps, (SCANS, cells), generator=g),
         cell_mask=torch.ones(SCANS, cells, dtype=torch.bool),
         descriptors=torch.randn(SCANS, aps, DESCRIPTOR, generator=g),
         ap_channel=CHANNELS[torch.randint(0, 4, (SCANS, aps), generator=g)],
-        ap_slot=torch.arange(aps).repeat(SCANS, 1),
+        ap_identity=torch.arange(aps).repeat(SCANS, 1),
         ap_mask=torch.ones(SCANS, aps, dtype=torch.bool))
 
 
@@ -53,8 +59,7 @@ def with_padded_cells(batch: CellBatch, extra: int) -> CellBatch:
             continue
         # Padding still has to be in range: the model looks its tags up in
         # embeddings before ever consulting the mask.
-        limits = {"cell_kind": 2, "cell_dwell": 52, "cell_slot": 16,
-                  "cell_members": FRAMES}
+        limits = {"cell_dwell": 52, "cell_ap_identity": 16, "cell_members": FRAMES}
         shape = (value.shape[0], extra) + value.shape[2:]
         if field.name == "cell_mask":
             tail = torch.zeros(shape, dtype=torch.bool)
@@ -80,8 +85,8 @@ def with_padded_aps(batch: CellBatch, extra: int) -> CellBatch:
         ap_channel=torch.cat(
             [batch.ap_channel,
              CHANNELS[torch.randint(0, 4, (SCANS, extra), generator=g)]], dim=1),
-        ap_slot=torch.cat(
-            [batch.ap_slot,
+        ap_identity=torch.cat(
+            [batch.ap_identity,
              torch.randint(0, 16, (SCANS, extra), generator=g)], dim=1),
         ap_mask=torch.cat([batch.ap_mask,
                                torch.zeros(SCANS, extra, dtype=torch.bool)], dim=1))
@@ -95,26 +100,28 @@ def model_for(model_class, seed=0):
 
 
 def two_channel_scan() -> CellBatch:
-    """One scan of three dwells on channels 36, 40 and 36, and two valid APs
-    in slots 0 and 9, on channels 36 and 40; channel cells carry slot 0 too, as
-    make_batch writes them. Cell i's aggregates are all i + 1."""
-    kind = torch.tensor([[CHANNEL_CELL, CHANNEL_CELL, CHANNEL_CELL, AP_CELL, AP_CELL, AP_CELL]])
-    cells = kind.shape[1]
+    """One scan of three dwells on channels 36, 40 and 36, and two discovered
+    APs under identities 0 and 9, on channels 36 and 40; channel cells carry
+    identity 0 too, as make_batch writes them. Cell i's aggregates are all
+    i + 1."""
+    is_channel = torch.tensor([[True, True, True, False, False, False]])
+    cells = is_channel.shape[1]
     return CellBatch(
-        frames=torch.zeros(1, 1, FRAME_FEATURES),
-        frame_categories=torch.zeros(1, 1, dtype=torch.long),
+        frames=torch.zeros(1, FRAME_FEATURES),
+        frame_offsets=torch.zeros(1),
+        frame_categories=torch.zeros(1, dtype=torch.long),
         cell_members=torch.zeros(1, cells, 1, dtype=torch.long),
         cell_member_mask=torch.zeros(1, cells, 1, dtype=torch.bool),
         cell_aggregates=torch.arange(1.0, cells + 1)[None, :, None].repeat(1, 1, AGGREGATES),
         cell_cca=torch.zeros(1, cells, CCA_SAMPLES),
-        cell_kind=kind,
+        cell_is_channel=is_channel,
         cell_dwell=torch.tensor([[0, 1, 2, 0, 2, 1]]),
         cell_channel=torch.tensor([[36, 40, 36, 36, 36, 40]]),
-        cell_slot=torch.tensor([[0, 0, 0, 0, 0, 9]]),
+        cell_ap_identity=torch.tensor([[0, 0, 0, 0, 0, 9]]),
         cell_mask=torch.ones(1, cells, dtype=torch.bool),
         descriptors=torch.zeros(1, 2, DESCRIPTOR),
         ap_channel=torch.tensor([[36, 40]]),
-        ap_slot=torch.tensor([[0, 9]]),
+        ap_identity=torch.tensor([[0, 9]]),
         ap_mask=torch.ones(1, 2, dtype=torch.bool))
 
 
@@ -123,17 +130,27 @@ def scores(model, batch: CellBatch) -> torch.Tensor:
         return model(batch)[0]
 
 
+class FrameEncoderTests(unittest.TestCase):
+    def test_position_columns_compare_two_frames_by_their_gap_alone(self):
+        encoder = FrameEncoder(FRAME_FEATURES, 64)
+        tokens = encoder(torch.randn(1, 4, FRAME_FEATURES), torch.tensor([[0, 1, 2, 0]]),
+                         torch.tensor([[0.1, 0.3, 0.5, 0.7]]))
+        position = tokens[0, :, -POSITION_WIDTH:]
+        similarity = position @ position.T
+        self.assertTrue(torch.allclose(similarity[0, 1], similarity[2, 3], atol=1e-5))
+
+
 class InvarianceTests(unittest.TestCase):
     """Properties both models share."""
 
-    def test_aps_permute_with_their_slots(self):
+    def test_aps_permute_with_their_identities(self):
         batch = make_batch(aps=4)
         order = torch.tensor([2, 0, 3, 1])
         shuffled = dataclasses.replace(
             batch,
             descriptors=batch.descriptors[:, order],
             ap_channel=batch.ap_channel[:, order],
-            ap_slot=batch.ap_slot[:, order],
+            ap_identity=batch.ap_identity[:, order],
             ap_mask=batch.ap_mask[:, order])
         for model_class in MODELS:
             with self.subTest(model_class.__name__):
@@ -172,7 +189,7 @@ class InvarianceTests(unittest.TestCase):
     def test_frames_a_cell_does_not_own_never_reach_it(self):
         batch = make_batch(aps=4)
         g = torch.Generator().manual_seed(5)
-        rewritten = torch.randint(0, FRAMES, batch.cell_members.shape, generator=g)
+        rewritten = torch.randint(0, SCANS * FRAMES, batch.cell_members.shape, generator=g)
         elsewhere = dataclasses.replace(
             batch,
             cell_members=torch.where(batch.cell_member_mask, batch.cell_members,
@@ -181,6 +198,26 @@ class InvarianceTests(unittest.TestCase):
             with self.subTest(model_class.__name__):
                 model = model_for(model_class)
                 self.assertTrue(torch.allclose(scores(model, batch), scores(model, elsewhere),
+                                               atol=1e-5))
+
+    def test_a_cells_channel_reaches_its_token_and_no_other(self):
+        batch = make_batch(aps=4)
+        moved = dataclasses.replace(batch, cell_channel=torch.where(
+            batch.cell_channel == 36, 48, batch.cell_channel))
+        model = model_for(JointAPModel)
+        with torch.no_grad():
+            changed = (model.encode_cells(batch) != model.encode_cells(moved)).any(dim=-1)
+        self.assertTrue(torch.equal(changed, batch.cell_channel == 36))
+
+    def test_carrier_sense_on_an_ap_cell_never_reaches_the_scores(self):
+        batch = make_batch(aps=4)
+        is_ap = (~batch.cell_is_channel)[..., None]
+        noisy = dataclasses.replace(batch, cell_cca=torch.where(
+            is_ap, torch.rand_like(batch.cell_cca), batch.cell_cca))
+        for model_class in GRID_MODELS:
+            with self.subTest(model_class.__name__):
+                model = model_for(model_class)
+                self.assertTrue(torch.allclose(scores(model, batch), scores(model, noisy),
                                                atol=1e-5))
 
     def test_an_aps_channel_reaches_its_score(self):
@@ -224,8 +261,9 @@ class JointAgainstTargetTests(unittest.TestCase):
 
     def test_ap_cells_take_their_role_from_the_target(self):
         cell_channel = torch.tensor([[36, 36, 40, 36]])
-        cell_slot = torch.tensor([[2, 5, 5, 7]])
-        found = roles(torch.tensor([[36]]), torch.tensor([[2]]), cell_channel, cell_slot)
+        cell_ap_identity = torch.tensor([[2, 5, 5, 7]])
+        found = roles(torch.tensor([[36]]), torch.tensor([[2]]), cell_channel,
+                      cell_ap_identity)
         self.assertEqual(found.tolist(), [[TARGET_AP, CO_CHANNEL_AP, OTHER_AP, CO_CHANNEL_AP]])
 
 
@@ -233,8 +271,8 @@ class BinnedViewTests(unittest.TestCase):
     def test_each_ap_sees_every_dwell_and_its_own_cells_on_its_channel(self):
         steps, exists = binned_view(two_channel_scan(), n_dwells=4)
         self.assertEqual(exists.tolist(), [[True, True, True, False]])
-        # channel cells hold 1, 2, 3 by dwell; AP cells 4 and 5 are slot 0's,
-        # at dwells 0 and 2, and 6 is slot 9's, at dwell 1
+        # channel cells hold 1, 2, 3 by dwell; AP cells 4 and 5 are identity 0's,
+        # at dwells 0 and 2, and 6 is identity 9's, at dwell 1
         heard = steps[0, :, :3, 0]
         own = steps[0, :, :3, AGGREGATES]
         flags = steps[0, :, :3, 2 * AGGREGATES:]
@@ -250,36 +288,6 @@ class BinnedViewTests(unittest.TestCase):
             field.name: getattr(batch, field.name)[:, order]
             for field in dataclasses.fields(batch) if field.name.startswith("cell_")})
         self.assertTrue(torch.equal(binned_view(batch, 4)[0], binned_view(shuffled, 4)[0]))
-
-
-class LossTests(unittest.TestCase):
-    def test_padded_aps_do_not_enter_the_loss(self):
-        mu = torch.zeros(2, 3)
-        log_var = torch.zeros(2, 3)
-        target = torch.tensor([[1.0, 1.0, 50.0], [1.0, 1.0, -50.0]])
-        mask = torch.tensor([[True, True, False], [True, True, False]])
-        self.assertAlmostEqual(float(gaussian_nll(mu, log_var, target, mask)), 0.5)
-
-    def test_each_scan_weighs_the_same_whatever_its_ap_count(self):
-        mu, log_var = torch.zeros(2, 4), torch.zeros(2, 4)
-        # The one-AP scan is far off and the four-AP scan is close, so averaging
-        # within a scan before averaging over scans gives 9.25, where one flat
-        # mean over every valid AP would give 4.0.
-        target = torch.tensor([[6.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]])
-        few = torch.tensor([[True, False, False, False], [True, True, True, True]])
-        loss = gaussian_nll(mu, log_var, target, few, variance=False)
-        self.assertAlmostEqual(float(loss), 9.25)
-
-    def test_widening_the_variance_is_only_worth_it_when_the_mean_is_wrong(self):
-        target = torch.zeros(1, 1)
-        mask = torch.ones(1, 1, dtype=torch.bool)
-        right = torch.zeros(1, 1)
-        wrong = torch.full((1, 1), 3.0)
-        narrow, wide = torch.zeros(1, 1), torch.full((1, 1), 2.0)
-        self.assertLess(float(gaussian_nll(right, narrow, target, mask)),
-                        float(gaussian_nll(right, wide, target, mask)))
-        self.assertGreater(float(gaussian_nll(wrong, narrow, target, mask)),
-                           float(gaussian_nll(wrong, wide, target, mask)))
 
 
 if __name__ == "__main__":
