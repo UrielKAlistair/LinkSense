@@ -1,0 +1,72 @@
+% archstyle.tex -- shared style for the architecture figures.
+% Load after \usepackage{tikz}:   \input{archstyle}
+
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds,calc,decorations.pathreplacing}
+
+% ---- Rename the central block in every figure by editing this one line ----
+\providecommand{\backbonename}{Backbone}
+
+% ---- Palette: every colour in every figure comes from these five lines ----
+\definecolor{embedC}{HTML}{29749a}  % embedding stage (cell encoder, projections)
+\definecolor{backC}{HTML}{5F6368}   % backbone stage (interchangeable)
+\definecolor{readC}{HTML}{C0562A}   % readout stage (queries, readout token, head)
+\definecolor{tagC}{HTML}{2E8B57}    % tags added to tokens
+\definecolor{exactC}{HTML}{ad7d35}  % exact, non-learned computation
+\definecolor{opC}{HTML}{C0562A}     % attention, and the layer that mixes lanes
+\definecolor{meanC}{HTML}{E8B923}   % the exact mean
+
+\tikzset{
+  arch/.style={font=\footnotesize, line width=0.5pt,
+               >={Stealth[length=3.5pt,width=3.2pt]}},
+  % blocks
+  blk/.style={draw=black, rounded corners=3pt, align=center, inner sep=2.5pt,
+              minimum height=6.5mm, line width=0.5pt},
+  data/.style={blk, fill=white},
+  embed/.style={blk, fill=embedC!12},
+  % ---- one knob per box of the cell encoder, so any can move alone ----
+  framemlp/.style={blk, fill=opC!18},
+  selfattn/.style={blk, fill=embedC!12},
+  poolquery/.style={blk, fill=embedC!12},
+  meanbox/.style={blk, fill=meanC!55},
+  aggbox/.style={blk, fill=meanC!55},
+  ccaconv/.style={blk, fill=opC!18},
+  mixmlp/.style={blk, fill=opC!18},
+  vector/.style={blk, fill=embedC!12},
+  tokenout/.style={blk, fill=exactC!15},
+  % ---- the other figures ----
+  exact/.style={blk, fill=exactC!15},
+  back/.style={blk, fill=backC!8},
+  frozen/.style={blk, fill=backC!28},
+  read/.style={blk, fill=readC!14},
+  tagbox/.style={blk, fill=tagC!14},
+  % ---- the deployment map ----
+  apdot/.style={circle, draw=black, line width=0.5pt, fill=tagC!55,
+                minimum size=5mm, inner sep=0pt, font=\tiny},
+  stadot/.style={circle, draw=black, line width=0.5pt, fill=meanC!55,
+                 minimum size=2.2mm, inner sep=0pt},
+  canddot/.style={circle, draw=black, line width=0.5pt, fill=readC!55,
+                  minimum size=3mm, inner sep=0pt},
+  maplbl/.style={font=\scriptsize, text=black!70, inner sep=1pt},
+  maprect/.style={draw=black!45, dotted, line width=0.5pt,
+                  rounded corners=2pt, inner sep=1.8mm},
+  optional/.style={dashed},
+  % small squares standing for one token / cell
+  tokAP/.style={draw=embedC, fill=embedC!14, minimum width=6.4mm,
+                minimum height=3.8mm, inner sep=0pt},
+  tokM/.style={draw=embedC, fill=embedC!42, minimum width=6.4mm,
+               minimum height=3.8mm, inner sep=0pt},
+  tokEnc/.style={draw=backC, fill=backC!18, minimum width=3.6mm,
+                 minimum height=3.6mm, inner sep=0pt},
+  tokRead/.style={draw=readC, fill=readC!45, minimum width=3.6mm,
+                  minimum height=3.6mm, inner sep=0pt},
+  % joins: concatenation and addition, as small circles on the wire
+  op/.style={draw=black, circle, inner sep=0pt, minimum size=4mm,
+             font=\scriptsize, line width=0.5pt, fill=white},
+  % arrows and labels
+  flow/.style={->},
+  dimlbl/.style={font=\scriptsize, text=black!65, inner sep=1.5pt},
+  note/.style={font=\scriptsize, text=black!65, align=center, inner sep=1pt},
+  tagnote/.style={font=\scriptsize, text=tagC!80!black, align=center, inner sep=1pt},
+  brc/.style={decorate, decoration={brace, amplitude=3pt}, line width=0.4pt},
+  panel/.style={font=\footnotesize\bfseries, align=center},
+}

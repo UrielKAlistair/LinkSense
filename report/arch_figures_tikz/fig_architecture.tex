@@ -1,0 +1,126 @@
+% fig_architecture.tex -- the whole path, with the embedding layer drawn out.
+% The embedding layer's two-column horizontal variant is in fig_cellencoder_wide.tex.
+%
+% Geometry lives in the two blocks below: three x positions, then one y per row.
+% Every gap further down is written as "below=Nmm of <node>", edge to edge.
+\begin{tikzpicture}[arch, font=\scriptsize]
+  % ---- the three columns ----
+  \def\cmid{32mm}     % centre line
+  \def\clft{13mm}     % left branch
+  \def\crgt{51mm}     % right branch
+  \def\ctag{53mm}     % the identity-tag box, beside the addition
+
+  % ---- one y per row, down to the summaries; below that the rows are relative.
+  % A fork leaves the box above, drops \stub, jogs sideways, and only then runs
+  % down into its branch. So the arrow a branch is drawn with is equal above and
+  % below only when the branch sits midway between that jog and the join line --
+  % \yForkA is the mean of \yFrames minus half its box minus \stub, and \yJoinA.
+  % Both branches of a fork must also be the same height, or their arrows differ.
+  \def\yCapture{28mm}
+  \def\yPrep{16mm}
+  \def\yFrames{0mm}
+  \def\stub{2mm}       % drop before a fork jogs sideways
+  \def\yForkA{-12.5mm}
+  \def\yJoinA{-19.75mm}
+  \def\yAtt{-30.5mm}
+  \def\yForkB{-43mm}
+  \def\yJoinB{-50.25mm}
+  \def\ySummaries{-54.25mm}   % top edge of both summary boxes, not their centres
+
+  % ---- what reaches the embedding layer ----
+  \node[data, text width=26mm] (capture) at (\cmid, \yCapture) {Capture frames + CCA};
+  \node[exact, text width=26mm] (prep) at (\cmid, \yPrep) {Preprocessing: binning};
+
+  % ---- frames: content and time embedded on separate paths ----
+  \node[data, text width=26mm] (frames) at (\cmid, \yFrames) {Frames in cell (0 to 512)};
+  \node[framemlp, text width=21mm] (mlp) at (\clft, \yForkA) {Frame MLP};
+  \node[circle, draw=black, fill=exactC!15, minimum size=6.5mm, inner sep=0pt,
+        line width=0.5pt] (sin) at (\crgt, \yForkA) {};
+  \draw[black, line width=0.5pt] ([xshift=-2.4mm]sin.center)
+        sin ([xshift=-1.2mm, yshift=1.1mm]sin.center)
+        cos ([xshift=0mm]sin.center)
+        sin ([xshift=1.2mm, yshift=-1.1mm]sin.center)
+        cos ([xshift=2.4mm]sin.center);
+  \node[note, left=1mm of sin, text width=14mm, align=right] (sinlbl)
+       {positional encoding of time};
+  \node[op] (c1) at (\cmid, \yJoinA) {$\|$};
+  \node[selfattn, text width=32mm] (att) at (\cmid, \yAtt) {Self-attention over the frames};
+
+  \draw[flow] (capture) -- (prep);
+  \draw[flow] (prep) -- node[dimlbl, right] {cells} (frames);
+  \draw[flow] (frames.south) -- ++(0,-\stub) -| (mlp.north);
+  \draw[flow] (frames.south) -- ++(0,-\stub) -| (sin.north);
+  \draw[flow] (mlp.south) |- (c1.west);
+  \draw[flow] (sin.south) |- (c1.east);
+  \draw[flow] (c1) -- node[dimlbl, right] {64} (att);
+  % centred in the gap each one spans, not along the elbow's total length
+\node[dimlbl, above] at ($(c1.center)+(-0.9cm,0)$) {48};
+\node[dimlbl, above] at ($(c1.center)+( 0.9cm,0)$) {16};
+
+  % ---- pooling: two reductions, rejoined ----
+  \node[meanbox, text width=21mm] (mean) at (\clft, \yForkB) {Mean};
+  \node[poolquery, text width=21mm] (query) at (\crgt, \yForkB) {Learned query};
+  \node[op] (c2) at (\cmid, \yJoinB) {$\|$};
+
+  \draw[flow] (att.south) -- ++(0,-\stub) -| (mean.north);
+  \draw[flow] (att.south) -- ++(0,-\stub) -| (query.north);
+  \draw[flow] (mean.south) |- (c2.west);
+  \draw[flow] (query.south) |- (c2.east);
+
+  % ---- the two exact summaries: tops aligned, heights left to the text ----
+  \node[aggbox, text width=21mm, anchor=north] (agg) at (\clft, \ySummaries)
+       {16 aggregates over every frame};
+  \node[data, text width=21mm, anchor=north] (cca) at (\crgt, \ySummaries)
+       {Carrier sense 109 samples (channel cells only)};
+  \node[ccaconv, text width=21mm, below=4.5mm of cca] (conv) {Strided convolution};
+
+  \coordinate (mid) at (\cmid, 0);
+  \coordinate (tagx) at (\ctag, 0);
+  \coordinate (yjoinc) at ($(conv.south)+(0,-4.75mm)$);
+  \node[op] (c3) at (mid |- yjoinc) {$\|$};
+  \node[mixmlp, text width=21mm, below=3.75mm of c3] (out) {MLP};
+  \node[vector, text width=21mm, below=5mm of out] (cell) {Cell vector};
+  \node[op, below=5mm of cell] (c4) {$+$};
+  \node[tagbox, text width=23mm] (tags) at (tagx |- c4)
+       {Identity tags\\is\_channel, dwell,\\channel, AP};
+
+  \draw[flow] (c2) -- node[dimlbl, right, pos=0.12] {128} (c3);
+  \draw[flow] (agg.south) |- (c3.west);
+  \draw[flow] (cca) -- (conv);
+  \draw[flow] (conv.south) |- (c3.east);
+  \draw[flow] (c3) -- (out);
+  \draw[flow] (out) -- node[dimlbl, right] {64} (cell);
+  \draw[flow] (cell) -- (c4);
+  \draw[flow] (tags) -- (c4);
+
+  % ---- everything above is one reusable unit ----
+  \begin{scope}[on background layer]
+    \node[draw=black!55, dashed, rounded corners=3pt, inner sep=3mm,
+          fit=(frames)(mlp)(sin)(sinlbl)(att)(mean)(query)(agg)(cca)(conv)(out)
+              (cell)(c4)(tags)] (unit) {};
+  \end{scope}
+  \node[note, anchor=north west, font=\scriptsize\itshape]
+       at ([shift={(1mm,-1mm)}]unit.north west) {Embedding};
+
+  % ---- what the tokens go on to ----
+  % the dashed fork: \optdx across, \optdy up and down, so each line leaves the
+  % backbone at atan(\optdy/\optdx) -- 38 degrees as drawn.
+  \def\optdx{10mm}
+  \def\optdy{6.5mm}
+  \node[back, text width=18mm, minimum height=11mm, below=11.5mm of c4] (backbone)
+       {Backbone};
+  \node[back, font=\scriptsize, text width=24mm, anchor=west]
+       (opt1) at ($(backbone.east)+(\optdx,\optdy)$) {Pretrained LLM + LoRA};
+  \node[back, font=\scriptsize, text width=24mm, anchor=west]
+       (opt2) at ($(backbone.east)+(\optdx,-\optdy)$) {Native transformer encoder};
+  \node[read, text width=26mm, below=8.25mm of backbone] (readout) {Readout};
+  \node[data, text width=26mm, below=4.5mm of readout] (mu) {$(\mu, \sigma)$ per AP};
+
+  \draw[flow] (c4) -- node[dimlbl, left, pos=0.75] {Embedded cell tokens} (backbone);
+  \draw[dashed, backC] (backbone.east) -- (opt1.west);
+  \draw[dashed, backC] (backbone.east) -- (opt2.west);
+  \draw[flow] (backbone) -- (readout);
+  \draw[flow] (readout) -- (mu);
+
+  \node[note, below=3mm of mu] {$\|$ concatenate \qquad $+$ add};
+\end{tikzpicture}

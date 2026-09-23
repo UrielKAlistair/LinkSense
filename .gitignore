@@ -7,16 +7,23 @@ __pycache__/
 .venv/
 data/
 runs/
+dump/
 results*/
 logs/
-# Everything in report/ is scratch EXCEPT the paper source, its PDF and the
-# design choices record.
+# Everything in report/ is scratch EXCEPT the paper source, its PDF, the design
+# choices record, the class file it is built with, and the figures it \inputs.
 # Note this must be `report/*`, not `report/`: a trailing slash tells git not
 # to descend into the directory at all, and negations below would never be
-# consulted.
+# consulted. The same applies to the figure directory one level down.
 report/*
 !report/*.tex
 !report/*.pdf
 !report/design_choices.md
+!report/IEEEtran.cls
+!report/arch_figures_tikz/
+report/arch_figures_tikz/*
+!report/arch_figures_tikz/archstyle.tex
+!report/arch_figures_tikz/fig_architecture.tex
+!report/arch_figures_tikz/fig_deployment.tex
 # the Android rule waits on BSS Load; keep it out of the tree for now
 scripts/baselines/android_throughput.py

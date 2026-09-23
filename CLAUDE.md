@@ -15,8 +15,7 @@ version, the documentation always reflects one snapshot of time: the current rep
   - For files centered on one process, state PROCESS as numbered steps.
   - For files that are meant to be invoked, end the docstring with a `Run:` block holding the literal command, with the flags actually used. 
 
-- Files with parts are split it into them with banner comments. Under each
-banner, two or three lines say what happens in that section. 
+- Files with parts are split it into them with banner comments. Under each banner, a few lines give the idea the section carries out: what its concepts are and how its pieces fit together, never what the docstrings below already say. State each fact once, where the reader first needs it.
 
 - The thing that drives the file comes first, right after the docstring, and its
 numbered steps name the whole story within one screen. The sections that follow
@@ -29,7 +28,7 @@ chunk does, if and only if it is not immediately obvious what the code does.
 debate constant values or argue for and against design choices by providing citations. 
 If such information comes up, add it to design-choices.md.
 
-- Name variables for maximal narrative clarity. 
+- Name variables for maximal narrative clarity. Bools may begin with 'is_'. Collections have plural names.
 
 ## 2. Modularise but only if necessariy
 
