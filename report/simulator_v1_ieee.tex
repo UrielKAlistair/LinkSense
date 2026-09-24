@@ -14,12 +14,12 @@
 % IEEEtran leaves a lot of air above a subsection heading. Tighten it while
 % keeping the class's lettered numbering and italic style. The following
 % paragraph keeps the full text width -- it is not indented like a list item.
-\makeatletter
-\renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
-  {0.9ex \@plus 0.3ex \@minus 0.2ex}%
-  {0.4ex \@plus 0.2ex}%
-  {\normalfont\normalsize\itshape}}
-\makeatother
+% \makeatletter
+% \renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
+%   {0.9ex \@plus 0.3ex \@minus 0.2ex}%
+%   {0.4ex \@plus 0.2ex}%
+%   {\normalfont\normalsize\itshape}}
+% \makeatother
 
 \newcommand{\code}[1]{\texttt{\small #1}}
 \newcommand{\todo}[1]{\textcolor{red}{\textbf{TODO:} #1}}
@@ -272,7 +272,44 @@ measurement noise can be varied without repeating a simulation.
 
 \subsection{Training Data}
 
-The Dataset used in this project comprised of 1000 
+The candidate is placed at five positions in each of the 1{,}000 deployments.
+Seven of the resulting 5{,}000 scans heard beacons from fewer than two APs and
+were dropped, having no choice to offer; each of the rest contributes one row
+per discovered AP.
+
+\begin{table}[ht]
+\caption{The corpus, after projection onto one radio.}
+\label{tab:corpus}
+\centering
+\footnotesize
+\begin{tabularx}{\columnwidth}{@{}Xr@{}}
+\toprule
+Deployments & 1{,}000 \\
+Scans, of 5{,}000 drawn & 4{,}993 \\
+Simulated runs & 22{,}925 \\
+Rows, one per (scan, discovered AP) & 21{,}235 \\
+\addlinespace
+Discovered APs per scan & 2 to 8 \\
+Scans hearing every AP placed & 77.4\% \\
+\addlinespace
+Throughput label & 0 to 59.0\,Mbit/s \\
+\quad median, mean & 5.3, 11.3\,Mbit/s \\
+\quad exactly zero & 14.0\% of rows \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The label is right-skewed, its mean at twice its median, and the zero rows are
+APs that were heard but could not usefully be joined from that position.
+
+Training splits are drawn by topology rather than by scan. 
+The five scans of a deployment differ only in where the candidate stands: 
+the APs, their channels, the background stations and the traffic they offer 
+are identical across them, so testing on a scan whose deployment also appears 
+in training would score the model on something close to what it was fitted on. 
+Deployments are dealt 60\% to training, 20\% to validation and 20\% to test, 
+each AP count dealt separately so that no part draws more than its share of the 
+larger deployments.
 
 % The figure is declared here, before the section, because a float cannot land
 % on the page it is declared on: from here it reaches the page the section
@@ -354,97 +391,225 @@ cells alone: the 109 carrier-sense samples of the dwell, one per millisecond,
 read by a strided one-dimensional convolution. (One CCA sample is lost to 
 radio retune)
 
-A final MLP takes the concatenation to the 64 numbers that leave the encoder
-(Figure~\ref{fig:arch}). Both kinds of cell share the frame embedding and
-the self-attention, but each keeps its own pooling query and its own output MLP,
-since only a channel cell carries carrier sense and an aggregate such as beacon
-level does not mean the same thing on the two. A cell that heard nothing has
-nothing to pool and takes a learned vector in place of both reductions.
+A final MLP maps the concatenation of the summaries and the pooled vector 
+to a single 64 dimensional vector leaving the encoder. (Figure~\ref{fig:arch}). 
+Both an AP and a channel cell share the frame embedding and the self-attention,
+but each keeps its own pooling query and its own output MLP, since only 
+channel cells carry CCA signals, and an aggregate such as beacon
+level does not mean the same thing on the two and should not afforded the same 
+mapping. A cell that heard nothing has nothing to pool and takes a learned 
+vector in place of both reductions.
 
-Nothing in the cell vector so far says which cell it is. It is built from
-content alone, so two cells that heard similar traffic come out alike whether
-they are one AP on two passes of the sweep or two different APs on different
-channels. Everything the attention layers do next depends on telling those
-apart: the thirteen cells an AP accumulates over the sweep have to find one
-another, an AP cell has to find the channel cell of the dwell it sits in, and
-the readout has to be able to ask for one AP in particular.
-
-Identity is therefore added to the finished vector rather than mixed into it, as
-learned vectors for the kind of cell, for the dwell it covers and for the
-channel it was heard on. Every AP cell also carries a slot: an arbitrary index
-standing for the AP it belongs to, drawn afresh for each sample. The slot is
-what ties an AP's cells to each other and to the query that scores it, while
-keeping any address the model might memorise out of its reach. How the slot
-enters the token is the one part of this that differs between the two models,
-and is described with them. The tagged cells, 91 per scan at the median, are
-what the backbone reads.
-
-\section{Results}
-\label{sec:results}
-
-\subsection{Baselines}
-
-Three passive baselines are evaluated alongside random selection:
+The resulting cell vector, although containing a summary of all its frames, mostly 
+lacks identifiers to distinguish itself or relate to other cells. Three learned 
+embeddings are added to every cell vector: the channel it was heard on, 
+a bool for whether it is an AP cell or a channel cell and the dwell
+it covers as an index into the sweep. This leaves just the AP identity to be 
+embedded and we take two approaches at this juncture:
 
 \begin{itemize}
-\item \emph{Strongest RSSI} ranks options by mean beacon level.
-\item \emph{Least busy channel} ranks them by the clear-channel-assessment busy
-  fraction of the channel each occupies, so options sharing a channel are
-  indistinguishable to it; tied options are scored at their mean throughput.
-\item \emph{RSSI minus busy} maps RSSI from $-100$ to $-60$\,dBm onto the unit
-  interval and subtracts the busy fraction from it.
+  \item Declare one AP as the target AP whose throughput we are interested in.
+  We now embed the identity relative to this AP: \code{TARGET\_AP} for the target's
+  own cells, \code{CO\_CHANNEL\_AP} for an AP sharing its channel, and
+  \code{OTHER\_AP} for the rest. This means that inference is effectively 
+  run once per target AP, with a different set of identities added onto the 
+  cell embeddings.
+
+  \item  Directly embed the AP's numerical identity. This needs one hot encoding 
+  of the AP's number and then mapping it to a vector space, so it fixes the maximum
+  number of APs the model handles at once. However, this model can predict the
+  throughputs of all the APs in one inference, since the embedding is absolute and 
+  not relative.
 \end{itemize}
 
+\subsection{Backbone}
+\label{sec:backbone}
 
-\begin{table}[!ht]
-\caption{Top-1 accuracy, mean and standard deviation over five partitions}
-\label{tab:results}
-\centering
-\footnotesize
-\begin{tabularx}{\columnwidth}{@{}Ylr@{}}
-\toprule
-\textbf{Model} & \textbf{Obj.} & \textbf{Top-1} \\
-\midrule
-\multicolumn{3}{@{}l}{\textit{Heuristics}} \\
-Random choice & --- & 0.282\,$\pm$\,0.002 \\
-Least busy channel & --- & 0.442\,$\pm$\,0.072 \\
-Strongest RSSI & --- & 0.647\,$\pm$\,0.042 \\
-RSSI minus busy & --- & 0.867\,$\pm$\,0.038 \\
-\addlinespace
-\multicolumn{3}{@{}l}{\textit{Frame trace}} \\
-Transformer$^{\dagger}$ & reg. & 0.888\,$\pm$\,0.039 \\
-Transformer$^{\dagger}$ & rank & 0.897\,$\pm$\,0.028 \\
-\addlinespace
-\multicolumn{3}{@{}l}{\textit{Binned sequence}} \\
-Ridge, all bins & reg. & 0.768\,$\pm$\,0.030 \\
-MLP, bin statistics & rank & 0.821\,$\pm$\,0.035 \\
-GBM, bin statistics & reg. & 0.842\,$\pm$\,0.029 \\
-GBM, all bins & reg. & 0.845\,$\pm$\,0.020 \\
-MLP, all bins & rank & 0.847\,$\pm$\,0.032 \\
-Transformer & reg. & 0.873\,$\pm$\,0.026 \\
-Transformer & rank & 0.873\,$\pm$\,0.037 \\
-\addlinespace
-\multicolumn{3}{@{}l}{\textit{Binned sequence, averaged over time}} \\
-MLP & rank & 0.767\,$\pm$\,0.039 \\
-GBM & reg. & 0.803\,$\pm$\,0.059 \\
-\addlinespace
-\multicolumn{3}{@{}l}{\textit{Vector: 35 hand-built features}} \\
-Ridge & reg. & 0.881\,$\pm$\,0.045 \\
-MLP, pointwise & rank & 0.897\,$\pm$\,0.024 \\
-Set ranker & rank & 0.909\,$\pm$\,0.030 \\
-Random forest & reg. & 0.925\,$\pm$\,0.019 \\
-Gradient boosting & reg. & \textbf{0.934\,$\pm$\,0.020} \\
-\addlinespace
-\multicolumn{3}{@{}l}{\textit{Vector and binned sequence}} \\
-Transformer & reg. & 0.919\,$\pm$\,0.021 \\
-Transformer & rank & 0.931\,$\pm$\,0.030 \\
-\bottomrule
-\end{tabularx}
-\end{table}
+The tagged cell vectors attend across the scan so that a cell describing one
+AP can incorporate the activity of other APs and channels. We consider two
+backbones for this step.
 
+The first is a transformer encoder trained from scratch, with two blocks of
+four-head self-attention at width 64. Each block normalises its input before
+attention, adds the attended values to the input, then applies a feed-forward
+MLP with another normalisation and residual connection. Every cell can attend
+to every observed cell; dwell order is supplied by the tags.
 
-\section{Interpretation and Next Steps}
-\label{sec:next}
+The second follows the adaptation of a pretrained language model described
+above. Linear projections map the cell vectors from 64 to 2048 dimensions,
+then back after Llama-3.2-1B has processed them. The backbone weights remain
+frozen, with rank-8 LoRA adapters on the query and value projections. Its
+attention mask permits cells to attend within their own dwell and to earlier
+dwells. Cells in the same dwell receive the same rotary position, since their
+order within that dwell carries no meaning~\cite{su2024roformer}.
+
+The target-AP model runs the backbone separately for each AP, because changing
+the target changes the role tags on its input. The joint-AP model runs it once
+for the scan. AP identity codes in this model are assigned randomly within each
+sample and shared between an AP's cells and its readout; they provide a way to
+match observations without identifying an AP across deployments.
+
+\subsection{Decoder}
+\label{sec:decoder}
+
+The backbone returns one vector per cell, while we need one prediction per AP.
+To obtain it, we construct a query row from the AP's window descriptors
+(Table~\ref{tab:inputs}). A two-layer MLP projects them to 64 dimensions, to
+which we add a learned query vector and the AP's channel tag. In the joint
+model, the row also receives the identity tag carried by that AP's cells.
+
+These rows pass through two decoder blocks. Each block lets the rows attend
+to the backbone's cell vectors, using the rows as queries and the cells as keys
+and values, then applies a feed-forward MLP. Both operations have normalisation
+and residual connections. In the joint model, self-attention between AP rows
+precedes cross-attention, allowing each prediction to use what the other rows
+have learned. The target model has one row per backbone pass and omits this step.
+
+A final MLP maps each row to a mean and log variance of standardised
+$\log(1+y_i)$, where $y_i$ is throughput in Mbit/s. Training begins with squared
+error on the mean and then uses Gaussian negative log likelihood to fit both
+outputs. The predicted means order the APs for selection.
+
+\section{Architecture Choices}
+\label{sec:choices}
+
+\subsection{Adding or Concatenating Identity}
+
+The embedding above concatenates time with frame content, but adds identity
+to cell content. Both choices use a total width of 64. Concatenation reserves
+coordinates for each component; addition lets both use the full width, at the
+cost of superposing them~\cite{vaswani2017}.
+
+For cells, reserving 16 dimensions for tags and projecting content into the
+remaining 48 performed worse in the ablations than adding the tags to a
+64-dimensional content vector. This supports addition at the cell level.
+Compressing a cell's frame and aggregate summaries into 48 dimensions may
+lose useful information. The comparison also changes the width available to
+the tags and how they meet the content, so it does not isolate that explanation.
+
+The separation also lasts only as long as subsequent layers preserve it.
+The value and output projections can write attended content into any
+coordinate, as can the feed-forward layers. After the first residual update,
+the reserved coordinates may contain both identity and content.
+
+The sinusoidal argument at the frame level needs a similar qualification.
+For a time encoding $p(\tau)$ with sine-cosine pairs at frequencies $\omega_k$,
+\begin{equation}
+ p(\tau_i)^\top p(\tau_j)
+ = \sum_k \cos\!\left(\omega_k(\tau_i-\tau_j)\right).
+\end{equation}
+This dot product depends only on the time difference. Attention, however,
+compares projected queries and keys. Writing their maps from the positional
+coordinates as $U_Q$ and $U_K$, the positional term is
+$p(\tau_i)^\top U_Q^\top U_K p(\tau_j)$, which need not retain that property.
+Concatenation alone neither constrains these projections nor removes the
+content--position cross terms. TUPE~\cite{ke2021tupe} treats content and position
+with separate attention terms; reserving input coordinates does not implement
+that separation.
+
+Addition offers a different allocation of the same width: all 64 coordinates
+can represent frame content, and time can use 32 sine-cosine pairs rather than
+8. More pairs sample the chosen frequency range more densely, though that
+need not improve the task. In the V1000 fold-0 comparison, additive frame
+position gave mean throughput regret of 0.461\,Mbit/s against 0.481\,Mbit/s for
+concatenation, with additive cell tags in both runs. Regret measures the
+throughput lost by selecting the predicted best AP rather than the true best.
+This single-fold difference does not establish a reliable advantage. We retain
+concatenation in the frame description while this choice remains open.
+
+\subsection{Identity in the Attention Logits}
+
+Two cells' channel tags already say whether they share a channel. We can also
+supply that relationship directly to attention. In the custom encoder, each
+head can learn a scalar for each channel separation, measured in 20\,MHz steps,
+and add it to the scaled query--key score before softmax. The decoder can use
+its own channel-separation table and an additional scalar indicating whether
+the cell belongs to the AP being scored. These are learned preferences rather
+than masks: every observed cell remains available to attention.
+
+T5~\cite{raffel2020t5} and Swin~\cite{liu2021swin} use learned relative-position
+biases in attention, while Graphormer~\cite{ying2021graphormer} supplies graph
+relationships through such biases. Here, however, the relationships are also
+present in the tags. This raises the question of whether the explicit biases
+provide a useful constraint or duplicate something attention can learn.
+
+To see the overlap, write an input as content plus tag, $x_i=c_i+t_i$.
+Let $W_Q$ and $W_K$ be one head's query and key maps. Temporarily omitting
+normalisation, projection biases and the attention scale, set
+$M=W_Q^\top W_K$. Then
+\begin{equation}
+\begin{split}
+ q_i^\top k_j ={}& c_i^\top M c_j + c_i^\top M t_j \\
+                 &+ t_i^\top M c_j + t_i^\top M t_j.
+\end{split}
+\label{eq:tag_attention}
+\end{equation}
+The last term assigns a score to a pair of tags independently of content.
+It can therefore express preferences such as matching identities, which are
+also supplied by an explicit bias. In cross-attention the same expansion
+applies with row content and tags on the query side and cell content and tags
+on the key side.
+
+This overlap does not establish equivalence. A tag-derived table is constrained
+by the tag vectors and the head's projections; an explicit table directly ties
+all pairs with the same relationship to one parameter. Further, our blocks
+normalise content and tags together before projecting them. Their interaction
+therefore depends on the content, and later layers also receive attended
+values. Equation~\ref{eq:tag_attention} motivates the comparison rather than
+proving that either mechanism is redundant.
+
+\subsection{Tag Direction and Magnitude}
+
+In the earlier runs, cell content grew to lengths around 24--25 while the
+small Gaussian-initialised tags remained much smaller. Across the ablations,
+the tags changed little from their initial values. This suggests that their
+initial scale may determine how readily attention uses identity, but does not
+by itself show that their directions need no learning.
+
+We can separate these questions by fixing the directions. Let $u_a$ be a unit
+code for identity $a$, with $u_a^\top u_b=0$ for distinct identities, and write
+$t_a=\alpha u_a$. In the unnormalised expansion, the tag--tag term becomes
+\begin{equation}
+ t_a^\top M t_b = \alpha^2 u_a^\top M u_b.
+\end{equation}
+The cross terms scale linearly with $\alpha$. Thus a small initial magnitude
+can weaken the purely relational contribution more strongly than the mixed
+ones. Its gradient also depends on the learned projections and, in the actual
+model, normalisation. The quadratic term alone does not imply that gradient
+descent cannot increase the magnitude.
+
+For this experiment we hold content at unit L2 length before adding tags.
+LayerNorm with trainable scale and offset does not impose that constraint:
+its output length can change during training. Fixed content length gives the
+tag magnitude a stable reference, while the MLP still learns the content's
+direction.
+
+Cell type, channel and AP identity receive mutually orthonormal codes from
+one fixed basis. Dwell receives a fixed sinusoidal encoding in the remaining
+subspace, preserving a notion of temporal separation. Each of these four
+codebooks has one trainable scalar magnitude shared by its entries, initially
+0.5. The same channel and AP codes are used in the decoder rows, whose content
+is also normalised to unit length. Fixing the codes still leaves the query and
+key projections free to learn which relationships matter.
+
+\subsection{Biases and Tag Learning}
+
+An explicit bias receives a gradient directly from its attention logit.
+Changing a tag magnitude acts through the projections, normalisation and
+several terms of the score. The bias may therefore make useful relationships
+easier to learn. It may also let the model rely on those relationships without
+learning to use the tags. Better performance with a bias and little movement
+in the tags are compatible with either explanation; neither establishes that
+the bias obstructs learning.
+
+We test the fixed-code model in four configurations: no explicit biases,
+encoder bias only, both encoder and decoder biases, and decoder bias only.
+All four use fold 0 of V1000, the same initial seed and training schedule.
+These runs ask whether magnitude learning makes the explicit biases
+unnecessary, and whether their effect differs between cell interaction and AP
+readout. They do not compare fixed directions against learned directions under
+otherwise identical conditions. That comparison, and repetition across folds,
+remain necessary before treating fixed codes as the preferred embedding.
 
 \begin{thebibliography}{00}
 
@@ -505,6 +670,15 @@ A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,
 L. Kaiser, and I. Polosukhin, ``Attention is all you need,'' in \emph{Advances
 in Neural Information Processing Systems}, vol. 30, 2017, pp. 5998--6008.
 
+\bibitem{grattafiori2024llama3}
+A. Grattafiori \emph{et al.}, ``The Llama 3 herd of models,''
+arXiv:2407.21783, 2024.
+
+\bibitem{su2024roformer}
+J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu, ``RoFormer: Enhanced
+transformer with rotary position embedding,'' \emph{Neurocomputing}, vol. 568,
+art. 127063, 2024, doi: 10.1016/j.neucom.2023.127063.
+
 \bibitem{ke2021tupe}
 G. Ke, D. He, and T.-Y. Liu, ``Rethinking positional encoding in language
 pre-training,'' in \emph{Proc. ICLR}, 2021.
@@ -513,6 +687,21 @@ pre-training,'' in \emph{Proc. ICLR}, 2021.
 J. Lee, Y. Lee, J. Kim, A. R. Kosiorek, S. Choi, and Y. W. Teh, ``Set
 Transformer: A framework for attention-based permutation-invariant neural
 networks,'' in \emph{Proc. ICML}, 2019, pp. 3744--3753.
+
+
+\bibitem{raffel2020t5}
+C. Raffel \emph{et al.}, ``Exploring the limits of transfer learning with a
+unified text-to-text transformer,'' \emph{Journal of Machine Learning Research},
+vol. 21, no. 140, pp. 1--67, 2020.
+
+\bibitem{liu2021swin}
+Z. Liu \emph{et al.}, ``Swin Transformer: Hierarchical vision transformer using
+shifted windows,'' in \emph{Proc. IEEE/CVF ICCV}, 2021, pp. 10012--10022.
+
+\bibitem{ying2021graphormer}
+C. Ying \emph{et al.}, ``Do transformers really perform bad for graph
+representation?'' in \emph{Advances in Neural Information Processing Systems},
+vol. 34, pp. 28877--28888, 2021.
 
 \end{thebibliography}
 
