@@ -43,32 +43,18 @@ LOG_VAR_RANGE = (-10.0, 10.0)
 # its own largest cell.
 CELL_GROUPS = 8
 
-# How a token carries its tags. Under "add" the tags are summed into the finished
-# cell vector, which is what the corpus was trained under. "quiet" and "loud"
-# sum them into a normalised one and differ only in the scale the tables start
-# at, which separates the normalising from the scale. The two "concat" modes
-# give the tags TAG_WIDTH
-# dimensions of their own and the content gives up that many; "concat_norm" also
-# normalises the tag block, so neither half can shrink away from the other over
-# training rather than only starting level with it.
-# "add" is neither, "quiet" normalises only, "scale_only" rescales only, and
-# "loud" does both: the four corners of normalising the content against raising
-# the tag scale.
-TAG_MODES = ("add", "quiet", "scale_only", "loud", "concat", "concat_norm", "codes")
+# Cell and question-row tags are added to their raw content. The default uses
+# fixed directions with learned lengths; learned vectors remain an alternative.
+TAG_MODES = ("codes", "learned")
 
-# Under "codes" a tag is a fixed set of directions at a length the model tunes.
-# The flat tags take mutually orthogonal codes, so their values are told apart
-# exactly; the dwell is a time coordinate and takes a sinusoid, laid in the basis
-# the flat codes leave over, so that nearby dwells stay near each other.
+# A fixed tag has one direction per value and a length the model tunes.
+# The flat tags take mutually orthogonal directions, so their values are told
+# apart exactly; the dwell is a time coordinate and takes a sinusoid, laid in the
+# basis the flat tags leave over, so that nearby dwells stay near each other.
 TAG_LENGTH = 4.0
-TAG_WIDTH = 16
 
-# Where in its dwell a frame began, as sine-cosine pairs whose periods fall
-# geometrically from two dwells to 0.2 ms. Under "concat" they take the last
-# POSITION_WIDTH columns of the frame token and the content keeps the rest; under
-# "add" they span the whole width, at twice as many periods, and are summed onto
-# a normalised content that has the whole width to itself.
-FRAME_POSITIONS = ("concat", "add")
+# Where in its dwell a frame began, as sine-cosine pairs appended to the frame
+# content. They occupy the last POSITION_WIDTH columns of the frame token.
 POSITION_WIDTH = 16
 POSITION_PERIODS = (2.0, 0.2 / DWELL_MS)    # in dwells
 
@@ -137,28 +123,18 @@ class FrameEncoder(nn.Module):
     """One vector per decoded frame: what it was, and when in its dwell it began.
 
     What it was passes through an MLP over its features and category. When it
-    began enters as a sinusoidal encoding, either set beside the content in its
-    own columns or, having given the content the whole width and normalised it,
-    summed onto it.
+    began enters as a sinusoidal encoding in the last 16 columns.
     """
 
-    def __init__(self, n_features: int, width: int, position: str = "concat"):
+    def __init__(self, n_features: int, width: int):
         super().__init__()
-        if position not in FRAME_POSITIONS:
-            raise ValueError(f"position must be one of {FRAME_POSITIONS}, not {position!r}")
-        self.position = position
-        content = width if position == "add" else width - POSITION_WIDTH
+        content = width - POSITION_WIDTH
         self.linear = nn.Linear(n_features, content)
         self.category = nn.Embedding(N_CATEGORIES, content)
         nn.init.normal_(self.category.weight, std=0.02)
         self.out = nn.Linear(content, content)
-        # Summed, the content has to be held at a known size, or the sinusoid ends
-        # up where the cell tags were: present and inaudible.
-        self.norm = nn.LayerNorm(content) if position == "add" else None
         longest, shortest = POSITION_PERIODS
-        # Summed, the sinusoid spans the whole width, so it samples the same range
-        # of periods at twice as many of them.
-        pairs = content // 2 if position == "add" else POSITION_WIDTH // 2
+        pairs = POSITION_WIDTH // 2
         periods = torch.logspace(math.log10(longest), math.log10(shortest), pairs)
         self.register_buffer("frequencies", 2 * math.pi / periods, persistent=False)
 
@@ -167,8 +143,6 @@ class FrameEncoder(nn.Module):
         content = self.out(F.gelu(self.linear(frames) + self.category(categories)))
         angles = offsets.unsqueeze(-1) * self.frequencies
         position = torch.cat([angles.sin(), angles.cos()], dim=-1)
-        if self.position == "add":
-            return self.norm(content) + position
         return torch.cat([content, position], dim=-1)
 
 
@@ -176,7 +150,7 @@ class CodeBook(nn.Module):
     """One fixed vector per value of a tag, at a length the model tunes.
 
     The directions are set once and never trained. What a tag has to supply is
-    that its values be told apart, and a fixed code supplies that exactly; the
+    that its values be told apart, and a fixed tag supplies that exactly; the
     one thing left underdetermined is how loud the tag should be beside the
     content it is added to, and that is the parameter.
     """
@@ -190,12 +164,12 @@ class CodeBook(nn.Module):
         return self.length * self.codes[index]
 
 
-def orthogonal_codes(width: int, sizes: list[int], seed: int = 0
+def orthogonal_tags(width: int, sizes: list[int], seed: int = 0
                      ) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """One orthonormal basis carved into a code set per size, and what is left.
+    """One orthonormal basis carved into a tag set per size, and what is left.
 
-    Carving from a single basis makes the tags orthogonal to each other as well
-    as within themselves, so the sum of a cell's tags can be read apart again.
+    Carving from a single basis makes these flat tag directions orthogonal
+    across tag families as well as within them. CodeBook learns their lengths.
     """
     generator = torch.Generator().manual_seed(seed)
     basis, _ = torch.linalg.qr(torch.randn(width, width, generator=generator))
@@ -206,7 +180,7 @@ def orthogonal_codes(width: int, sizes: list[int], seed: int = 0
     return sets, basis[at:].clone()
 
 
-def sinusoid_codes(n_values: int, basis: torch.Tensor) -> torch.Tensor:
+def sinusoid_tags(n_values: int, basis: torch.Tensor) -> torch.Tensor:
     """A time coordinate as sine-cosine pairs, laid in the given basis.
 
     Periods fall geometrically from twice the range, so the slowest pair turns

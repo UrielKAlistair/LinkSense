@@ -63,7 +63,8 @@
   op/.style={draw=black, circle, inner sep=0pt, minimum size=4mm,
              font=\scriptsize, line width=0.5pt, fill=white},
   % arrows and labels
-  flow/.style={->},
+  % Turns are rounded; on the 2mm fork stubs the radius takes the whole leg.
+  flow/.style={->, rounded corners=5pt},
   dimlbl/.style={font=\scriptsize, text=black!65, inner sep=1.5pt},
   note/.style={font=\scriptsize, text=black!65, align=center, inner sep=1pt},
   tagnote/.style={font=\scriptsize, text=tagC!80!black, align=center, inner sep=1pt},

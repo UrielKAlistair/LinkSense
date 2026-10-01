@@ -36,11 +36,11 @@ import torch
 import torch.nn as nn
 
 from scripts.tf.layers import (LOG_VAR_RANGE, MAX_CHANNEL_DISTANCE, N_CHANNELS,
-                               TAG_LENGTH, TAG_MODES, TAG_WIDTH, CellBatch,
+                               TAG_LENGTH, TAG_MODES, CellBatch,
                                CellEncoder, CodeBook, DecoderBlock, FrameEncoder,
                                NativeGridReader, channel_index,
-                               cross_attention_bias, orthogonal_codes, padding_bias,
-                               sinusoid_codes)
+                               cross_attention_bias, orthogonal_tags, padding_bias,
+                               sinusoid_tags)
 
 
 class CellGridModel(nn.Module):
@@ -54,59 +54,39 @@ class CellGridModel(nn.Module):
                  n_dwells: int = 52, width: int = 64, heads: int = 4,
                  cell_heads: int = 2, layers: int = 2, decoder_layers: int = 2,
                  dropout: float = 0.1, readout_bias: bool = True,
-                 encoder_bias: bool = True, tag_mode: str = "add",
-                 tag_scale: float | None = None,
-                 frame_position: str = "concat", grid_reader=None):
+                 encoder_bias: bool = True, tag_mode: str = "codes",
+                 tag_scale: float | None = None, grid_reader=None):
         super().__init__()
         if tag_mode not in TAG_MODES:
             raise ValueError(f"tag_mode must be one of {TAG_MODES}, not {tag_mode!r}")
+        if tag_mode == "learned" and tag_scale is not None:
+            raise ValueError("tag_scale applies only to fixed tags")
         self.heads = heads
-        self.tag_mode = tag_mode
         self.readout_bias = readout_bias
-        # Under the concat modes the tags hold TAG_WIDTH dimensions to themselves
-        # and the content keeps the rest; otherwise both span the full width.
-        concat = tag_mode.startswith("concat")
-        content_width = width - TAG_WIDTH if concat else width
-        tag_width = TAG_WIDTH if concat else width
-
-        self.frames = FrameEncoder(n_frame_features, width, frame_position)
+        self.frames = FrameEncoder(n_frame_features, width)
         self.cells = CellEncoder(n_aggregates, width, cell_heads, dropout,
-                                 out_width=content_width)
-        # "add" and "scale_only" take the cell token at whatever scale the encoder
-        # wrote it. "codes" uses unit L2 length in join; the others use LayerNorm.
-        normed = tag_mode not in ("add", "scale_only", "codes")
-        self.cell_norm = nn.LayerNorm(content_width) if normed else None
-        self.row_norm = nn.LayerNorm(content_width) if normed else None
-        # "concat_norm" holds the tag block at the content's scale for the whole
-        # of training rather than only starting it there.
-        self.tag_norm = nn.LayerNorm(tag_width) if tag_mode == "concat_norm" else None
+                                 out_width=width)
 
         if tag_mode == "codes":
             # Fixed directions, one learnable length each. The flat tags take
-            # mutually orthogonal codes and the dwell the basis they leave over.
-            (flat_is_channel, flat_channel, flat_identity), spare = orthogonal_codes(
-                tag_width, [2, N_CHANNELS, self.identity_size()])
-            # Keep the initial tag/content ratio when content has unit L2 length.
+            # mutually orthogonal directions and the dwell the basis they leave over.
+            (flat_is_channel, flat_channel, flat_identity), spare = orthogonal_tags(
+                width, [2, N_CHANNELS, self.identity_size()])
             length = tag_scale if tag_scale is not None else TAG_LENGTH / width ** 0.5
             self.is_channel = CodeBook(flat_is_channel, length)
             self.channel = CodeBook(flat_channel, length)
-            self.dwell = CodeBook(sinusoid_codes(n_dwells, spare), length)
-            self.make_identity_codes(flat_identity, length)
+            self.dwell = CodeBook(sinusoid_tags(n_dwells, spare), length)
+            self.make_identity_tags(flat_identity, length)
         else:
-            self.is_channel = nn.Embedding(2, tag_width)
-            self.dwell = nn.Embedding(n_dwells, tag_width)
-            self.channel = nn.Embedding(N_CHANNELS, tag_width)
+            self.is_channel = nn.Embedding(2, width)
+            self.dwell = nn.Embedding(n_dwells, width)
+            self.channel = nn.Embedding(N_CHANNELS, width)
             # The subclass's identity tag is made here, so that every table is
             # drawn from one point in the seeded stream whichever model is built.
             tables = [self.is_channel, self.dwell, self.channel,
-                      *self.make_identity_tables(tag_width)]
-            # 0.02 is the usual scale for an embedding that is the token. These
-            # are added to one, and a normalised content carries unit variance
-            # per dimension, so the loud modes draw the tags to sum to that scale.
-            std = tag_scale if tag_scale is not None else (
-                0.02 if tag_mode in ("add", "quiet") else 0.5)
+                      *self.make_identity_tables(width)]
             for table in tables:
-                nn.init.normal_(table.weight, std=std)
+                nn.init.normal_(table.weight, std=0.02)
 
         self.encoder = (NativeGridReader(width, heads, dropout, layers, encoder_bias)
                         if grid_reader is None else grid_reader(width))
@@ -114,11 +94,11 @@ class CellGridModel(nn.Module):
             [DecoderBlock(width, heads, dropout, self.compare)
              for _ in range(decoder_layers)])
 
-        self.question = nn.Parameter(torch.zeros(1, 1, content_width))
+        self.question = nn.Parameter(torch.zeros(1, 1, width))
         nn.init.normal_(self.question, std=0.02)
         self.descriptor = nn.Sequential(
-            nn.Linear(n_descriptor, content_width), nn.GELU(),
-            nn.Linear(content_width, content_width))
+            nn.Linear(n_descriptor, width), nn.GELU(),
+            nn.Linear(width, width))
         # Learned scalars added to the cross-attention logits, per head: one per
         # channel distance, so a question can weigh its own channel against its
         # neighbours', and one for the cells of the question's own AP.
@@ -143,11 +123,11 @@ class CellGridModel(nn.Module):
 
     def identity_size(self) -> int:
         """How many values the subclass's own tag takes, so this class can
-        reserve that many codes for it."""
+        reserve that many tags for it."""
         raise NotImplementedError
 
-    def make_identity_codes(self, codes: torch.Tensor, length: float) -> None:
-        """Assign the subclass's own tag, from the codes reserved for it."""
+    def make_identity_tags(self, tags: torch.Tensor, length: float) -> None:
+        """Assign the subclass's own tag, from the tags reserved for it."""
         raise NotImplementedError
 
     def cell_identity(self, batch: CellBatch) -> torch.Tensor | None:
@@ -165,18 +145,8 @@ class CellGridModel(nn.Module):
     # The stages, shared
     # -----------------------------------------------------------------------
 
-    def join(self, content: torch.Tensor, tags: torch.Tensor,
-             norm: nn.Module | None) -> torch.Tensor:
-        """One token from its content and its tags, by whichever scheme tag_mode
-        names: summed, summed onto a normalised content, or set beside it."""
-        if self.tag_mode == "codes":
-            content = torch.nn.functional.normalize(content, dim=-1)
-        elif norm is not None:
-            content = norm(content)
-        if self.tag_norm is not None:
-            tags = self.tag_norm(tags)
-        if self.tag_mode.startswith("concat"):
-            return torch.cat([content, tags], dim=-1)
+    def join(self, content: torch.Tensor, tags: torch.Tensor) -> torch.Tensor:
+        """Add identity and position tags to the content at its native scale."""
         return content + tags
 
     def cell_parts(self, batch: CellBatch) -> tuple[torch.Tensor, torch.Tensor]:
@@ -196,7 +166,7 @@ class CellGridModel(nn.Module):
         the question."""
         content, tags = self.cell_parts(batch)
         own = self.cell_identity(batch)
-        return self.join(content, tags if own is None else tags + own, self.cell_norm)
+        return self.join(content, tags if own is None else tags + own)
 
     def read_grid(self, tokens: torch.Tensor, cell_dwell: torch.Tensor,
                   cell_channel: torch.Tensor, cell_mask: torch.Tensor) -> torch.Tensor:
@@ -211,8 +181,7 @@ class CellGridModel(nn.Module):
         tags that put a row in the same dimensions as the cells it will read."""
         content = self.question + self.descriptor(descriptors)
         channel = self.channel(channel_index(ap_channel))
-        return self.join(content, channel if tags is None else channel + tags,
-                         self.row_norm)
+        return self.join(content, channel if tags is None else channel + tags)
 
     def readout_mask(self, ap_channel: torch.Tensor, ap_identity: torch.Tensor,
                      cell_channel: torch.Tensor, cell_is_channel: torch.Tensor,

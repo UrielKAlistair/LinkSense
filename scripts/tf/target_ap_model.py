@@ -10,6 +10,8 @@ leaves no rivals to confer with, so rival APs reach the score only through their
 cells.
 
 That is the whole of the difference. Everything else is CellGridModel's.
+The target-relative roles use learned vectors by default, while the cell type,
+channel and dwell tags follow the shared fixed-tag embedding.
 """
 
 from __future__ import annotations
@@ -31,17 +33,26 @@ class TargetAPModel(CellGridModel):
     compare = False
 
     def __init__(self, n_frame_features: int, n_aggregates: int, n_descriptor: int,
-                 role_tag: bool = True, **kwargs):
+                 role_tag: bool = True, fixed_role_codes: bool = False, **kwargs):
         # Set before the base constructor, which calls make_identity_tables while
         # it is still running.
         self.role_tag = role_tag
+        self.fixed_role_codes = fixed_role_codes
+        if fixed_role_codes and kwargs.get("tag_mode", "codes") != "codes":
+            raise ValueError("fixed_role_codes requires fixed common tags")
         super().__init__(n_frame_features, n_aggregates, n_descriptor, **kwargs)
 
     def identity_size(self) -> int:
         return 3 if self.role_tag else 0
 
-    def make_identity_codes(self, codes, length: float) -> None:
-        self.role = CodeBook(codes, length) if self.role_tag else None
+    def make_identity_tags(self, tags, length: float) -> None:
+        if not self.role_tag:
+            self.role = None
+        elif self.fixed_role_codes:
+            self.role = CodeBook(tags, length)
+        else:
+            self.role = nn.Embedding(3, tags.shape[1])
+            nn.init.normal_(self.role.weight, std=0.02)
 
     def make_identity_tables(self, tag_width: int) -> list[nn.Embedding]:
         if not self.role_tag:
@@ -65,7 +76,7 @@ class TargetAPModel(CellGridModel):
             is_ap = (~is_channel).unsqueeze(-1)
             tags = tags + is_ap * self.role(
                 roles(target_channel, target_identity, channel, identity))
-        grid = self.read_grid(self.join(content, tags, self.cell_norm),
+        grid = self.read_grid(self.join(content, tags),
                               batch.cell_dwell[scan], channel, cell_mask)
 
         rows = self.build_rows(batch.descriptors[scan, ap].unsqueeze(1),

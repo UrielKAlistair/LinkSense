@@ -56,7 +56,8 @@ LORA_TARGETS = ("q_proj", "v_proj")
 
 
 def llama_reader(backbone: str | None = None, lora_rank: int = 8,
-                 pretrained: bool = True) -> Callable[[int], nn.Module]:
+                 pretrained: bool = True,
+                 gradient_checkpointing: bool = False) -> Callable[[int], nn.Module]:
     """A grid reader waiting only to be told the model's width.
 
     CellGridModel builds its reader inside its own constructor, so that the
@@ -64,16 +65,19 @@ def llama_reader(backbone: str | None = None, lora_rank: int = 8,
     for. This hands it something it can call with the width and nothing else.
     """
     name = backbone or DEFAULT_BACKBONE
-    return lambda width: LlamaGridReader(width, name, lora_rank, pretrained)
+    return lambda width: LlamaGridReader(width, name, lora_rank, pretrained,
+                                        gradient_checkpointing)
 
 
 class LlamaGridReader(nn.Module):
     """The cells attending to one another inside a frozen language model."""
 
-    def __init__(self, width: int, backbone: str, lora_rank: int, pretrained: bool):
+    def __init__(self, width: int, backbone: str, lora_rank: int,
+                 pretrained: bool, gradient_checkpointing: bool):
         super().__init__()
         config = AutoConfig.from_pretrained(backbone)
-        self.backbone = adapted_backbone(config, backbone, lora_rank, pretrained)
+        self.backbone = adapted_backbone(config, backbone, lora_rank,
+                                         pretrained, gradient_checkpointing)
         self.into_backbone = nn.Linear(width, config.hidden_size)
         self.out_of_backbone = nn.Linear(config.hidden_size, width)
 
@@ -96,7 +100,8 @@ class LlamaGridReader(nn.Module):
         return self.out_of_backbone(read.to(outside)).to(outside)
 
 
-def adapted_backbone(config, name: str, lora_rank: int, pretrained: bool) -> nn.Module:
+def adapted_backbone(config, name: str, lora_rank: int, pretrained: bool,
+                     gradient_checkpointing: bool = False) -> nn.Module:
     """The frozen language model that reads the grid, with adapters attached.
 
     get_peft_model freezes everything it did not add, so the only weights left
@@ -107,6 +112,9 @@ def adapted_backbone(config, name: str, lora_rank: int, pretrained: bool) -> nn.
     """
     backbone = (AutoModel.from_pretrained(name, dtype=BACKBONE_DTYPE) if pretrained
                 else AutoModel.from_config(config).to(BACKBONE_DTYPE))
+    if gradient_checkpointing:
+        backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
     # Nothing here tokenises, so the embedding table is weight that would occupy
     # memory and never be read: inputs_embeds is the path the grid takes in.
     backbone.set_input_embeddings(nn.Identity())

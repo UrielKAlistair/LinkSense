@@ -5,10 +5,10 @@
 % Every gap further down is written as "below=Nmm of <node>", edge to edge.
 \begin{tikzpicture}[arch, font=\scriptsize]
   % ---- the three columns ----
-  \def\cmid{32mm}     % centre line
-  \def\clft{13mm}     % left branch
-  \def\crgt{51mm}     % right branch
-  \def\ctag{53mm}     % the identity-tag box, beside the addition
+  \def\cmid{35mm}     % centre line
+  \def\clft{16mm}     % left branch
+  \def\crgt{54mm}     % right branch
+  \def\ctag{56mm}     % the identity-tag box, beside the addition
 
   % ---- one y per row, down to the summaries; below that the rows are relative.
   % A fork leaves the box above, drops \stub, jogs sideways, and only then runs
@@ -82,7 +82,7 @@
   \node[vector, text width=21mm, below=5mm of out] (cell) {Cell vector};
   \node[op, below=5mm of cell] (c4) {$+$};
   \node[tagbox, text width=23mm] (tags) at (tagx |- c4)
-       {Identity tags\\is\_channel, dwell,\\channel, AP};
+       {Cell tags:\\is\_channel, dwell,\\channel, AP};
 
   \draw[flow] (c2) -- node[dimlbl, right, pos=0.12] {128} (c3);
   \draw[flow] (agg.south) |- (c3.west);
@@ -107,20 +107,99 @@
   % backbone at atan(\optdy/\optdx) -- 38 degrees as drawn.
   \def\optdx{10mm}
   \def\optdy{6.5mm}
-  \node[back, text width=18mm, minimum height=11mm, below=11.5mm of c4] (backbone)
-       {Backbone};
+  % The second lane, beside the embedding rather than below it: stacked in one
+  % column the figure stands 821pt tall against a 672pt page.
+  % The backbone sits above and to the left of what reads it. Its grid steps
+  % across in the clear band beneath it and then descends, so that the readout
+  % below stands at the centre of the right half of the page, with the grid and
+  % the question rows reaching cross-attention equally far either side.
+  % The readout stands \cpad further right than the picture alone would allow.
+  % The float is centred in what it measures, so reserving that same width off
+  % the left edge grows the box evenly and leaves the embedding's place on the
+  % page untouched; the text block bounds the pair, at \cpad of about 8mm.
+  \def\cpad{10.5mm}     % reserved left of the picture, equal to the shift right
+  \def\clane{133mm}    % centre line of the readout, cross-attention and below
+  \def\cback{98mm}     % the backbone
+  \def\cgrid{124mm}    % the grid's descent, once it has stepped across
+  \def\cdesc{142mm}    % the question rows, built beside that descent
+  \def\cqtag{157mm}    % the question row's tag box, beside its addition
+  \coordinate (lane) at (\cback, \yCapture);
+  \coordinate (lanex) at (\clane, 0);
+  \coordinate (gridx) at (\cgrid, 0);
+  \coordinate (descx) at (\cdesc, 0);
+  \coordinate (qtagx) at (\cqtag, 0);
+  \node[back, text width=18mm, minimum height=11mm, anchor=north] (backbone)
+       at (lane) {Backbone};
   \node[back, font=\scriptsize, text width=24mm, anchor=west]
        (opt1) at ($(backbone.east)+(\optdx,\optdy)$) {Pretrained LLM + LoRA};
   \node[back, font=\scriptsize, text width=24mm, anchor=west]
        (opt2) at ($(backbone.east)+(\optdx,-\optdy)$) {Native transformer encoder};
-  \node[read, text width=26mm, below=8.25mm of backbone] (readout) {Readout};
-  \node[data, text width=26mm, below=4.5mm of readout] (mu) {$(\mu, \sigma)$ per AP};
-
-  \draw[flow] (c4) -- node[dimlbl, left, pos=0.75] {Embedded cell tokens} (backbone);
+  % The tokens leave the dashed box at the bottom and carry their label there,
+  % then cross to the second lane above both: the corridor between the two
+  % dashed boxes is the only place a vertical can run without crossing a node.
+  \def\cjog{78mm}     % the crossing, between the embedding and the readout
+  \def\yTop{36mm}     % clear of the tallest box in either lane
+  \coordinate (leave) at ($(c4.south |- unit.south)+(0,-9mm)$);
+  \coordinate (jogx) at (\cjog, 0);
+  \coordinate (jog) at (\cjog, \yTop);
+  \draw[flow] (c4.south) -- (leave) -- (jogx |- leave) -- (jog)
+        -- (backbone.north |- jog) -- (backbone.north);
+  \node[dimlbl, anchor=west]
+       at ($(c4.south |- unit.south)+(1.5mm,-4.5mm)$) {Embedded cell tokens};
   \draw[dashed, backC] (backbone.east) -- (opt1.west);
   \draw[dashed, backC] (backbone.east) -- (opt2.west);
-  \draw[flow] (backbone) -- (readout);
-  \draw[flow] (readout) -- (mu);
 
-  \node[note, below=3mm of mu] {$\|$ concatenate \qquad $+$ add};
+  % ---- the readout: a question row per AP, reading the grid it never changes ----
+  % The grid leaves the backbone to the left and waits there. The rows are built
+  % down the centre from the descriptor, and the two meet at cross-attention.
+  \node[data, text width=24mm, anchor=north]
+       (desc) at ($(backbone.south -| descx)+(0,-15mm)$) {AP descriptor};
+  \node[read, text width=24mm, below=4.5mm of desc] (descmlp) {MLP};
+  \node[op, below=5mm of descmlp] (c5) {$+$};
+  \node[tagbox, text width=20mm] (qtags) at (qtagx |- c5)
+       {Learned query, \\ channel tag,\\ AP tag (joint only)};
+  \node[read, text width=26mm, below=5mm of c5] (qrow) {Question rows, one per AP};
+
+  \node[read, optional, text width=24mm, below=6.5mm of qrow] (dself)
+       {Self-attention among rows (joint model only)};
+  \node[read, text width=31mm, anchor=north]
+       (dcross) at ($(dself.south -| lanex)+(0,-4.5mm)$) {Cross-attention};
+  \node[read, text width=31mm, below=4.5mm of dcross] (dff) {Feed-forward};
+  \node[read, text width=26mm, below=7mm of dff] (head) {Norm and MLP head};
+  \node[data, text width=26mm, below=4.5mm of head] (mu) {$(\mu, \log\sigma^2)$ per AP};
+
+  \draw[flow] (desc) -- (descmlp);
+  \draw[flow] (descmlp) -- node[dimlbl, right] {64} (c5);
+  \draw[flow] (qtags) -- (c5);
+  \draw[flow] (c5) -- (qrow);
+  \draw[flow] (qrow) -- (dself);
+  \draw[flow] (dself.south) -- node[dimlbl, right] {Q}
+        (dself.south |- dcross.north);
+  \draw[flow] (dcross) -- (dff);
+  \draw[flow] (dff) -- (head);
+  \draw[flow] (head) -- (mu);
+  % The grid is the whole of what the backbone returns; cross-attention derives
+  % both its keys and its values from it.
+  \draw[flow] (backbone.south) -- (backbone.south |- dself)
+        -- (gridx |- dself) -- (gridx |- dcross.north);
+  \node[dimlbl, anchor=west, align=center]
+       at ($(backbone.south)+(1.5mm,-8.75mm)$) {used for\\K, V};
+  % Against the rows' right edge, which stands further out than the centred
+  % blocks the brace also spans.
+  \coordinate (brcx) at ($(dself.east)+(2mm,0)$);
+  \draw[brc, readC] (brcx |- dself.north) -- (brcx |- dff.south)
+        node[note, midway, right=2.5mm] {$\times 2$};
+
+  \begin{scope}[on background layer]
+    \node[draw=black!55, dashed, rounded corners=3pt, inner sep=3mm,
+          fit=(desc)(descmlp)(c5)(qtags)(qrow)(dself)(dcross)(dff)(head)] (rdunit) {};
+  \end{scope}
+  \node[note, anchor=north west, font=\scriptsize\itshape]
+       at ([shift={(1mm,-1mm)}]rdunit.north west) {Readout};
+
+  % Under both lanes rather than under either one: the bounding box is only
+  % settled once everything above has been drawn, so this comes last.
+  \path ($(current bounding box.west)+(-\cpad,0)$);
+  \node[note, below=3mm of current bounding box.south]
+       {$\|$ concatenate \qquad $+$ add};
 \end{tikzpicture}

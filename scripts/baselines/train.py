@@ -341,8 +341,11 @@ def summary_table(agg: pd.DataFrame) -> pd.DataFrame:
     show = pd.DataFrame({
         "mae": agg[("mae", "mean")].map(lambda v: "-" if pd.isna(v) else f"{v:.3f}"),
         "top1": agg[("top1_rate", "mean")].map("{:.3f}".format),
-        "regret_mbps": agg[("mean_regret_mbps", "mean")].map("{:.3f}".format) + " +/- "
-                       + agg[("mean_regret_mbps", "std")].map("{:.3f}".format),
+        "regret_mbps": pd.Series(
+            [f"{m:.3f}" if pd.isna(sd) else f"{m:.3f} +/- {sd:.3f}"
+             for m, sd in zip(agg[("mean_regret_mbps", "mean")],
+                              agg[("mean_regret_mbps", "std")])],
+            index=agg.index),
         **{f"regret_cdf_{round(m * 100)}pct":
            agg[(f"regret_cdf_{round(m * 100)}pct", "mean")].map("{:.3f}".format)
            for m in REGRET_CDF_MARGINS},
@@ -471,6 +474,9 @@ def parse_args():
     parser.add_argument("--folds", type=int, default=N_FOLDS,
                         help="how many folds the topologies are dealt into; every "
                              "fold is run, so each topology is tested exactly once")
+    parser.add_argument("--only-fold", type=int, default=None,
+                        help="run this one rotation instead of all of them, "
+                             "leaving the deal into --folds parts unchanged")
     parser.add_argument("--train-fraction", type=float, default=1.0,
                         help="share of each fold's training topologies to fit on; "
                              "run the same command at several fractions for a "
@@ -479,6 +485,8 @@ def parse_args():
     args = parser.parse_args()
     if not 0 < args.train_fraction <= 1:
         parser.error("--train-fraction must lie in (0, 1]")
+    if args.only_fold is not None and not 0 <= args.only_fold < args.folds:
+        parser.error(f"--only-fold must lie in [0, {args.folds})")
     return args
 
 
@@ -497,7 +505,9 @@ def main():
     # The scatter figure shows the rows of one fold; the last is as good as any,
     # and keeping only it avoids holding every fold's frame in memory.
     final_test, final_pred = None, None
-    for fold in range(args.folds):
+    folds = ([args.only_fold] if args.only_fold is not None
+             else list(range(args.folds)))
+    for fold in folds:
         print(f"--- fold {fold} ---")
         res, chosen, test, test_pred, rows = run_fold(
             df, feats, fold, args.folds, args.train_fraction)
@@ -518,13 +528,13 @@ def main():
     res_all = pd.concat(all_res, ignore_index=True)
     agg = res_all.drop(columns="fold").groupby("model", sort=False).agg(["mean", "std"])
     show = summary_table(agg)
-    print(f"\n=== TEST, averaged over {args.folds} folds (mean +/- std) ===")
+    print(f"\n=== TEST, averaged over {len(folds)} fold(s) (mean +/- std) ===")
     print(show.to_string())
 
     preds_df = pd.concat(pred_rows, ignore_index=True)
     preds_df.to_csv(args.out_dir / "test_predictions.csv", index=False)
     write_stratified(preds_df, args.out_dir)
-    write_results_table(show, args.out_dir, args.folds)
+    write_results_table(show, args.out_dir, len(folds))
 
     # Chosen on the aggregate over every fold, so the figure does not follow
     # whichever model happened to win the last one.
@@ -539,7 +549,7 @@ def main():
     (args.out_dir / "summary.json").write_text(json.dumps({
         "rows": int(len(df)), "groups": int(df.scan_id.nunique()),
         "topologies": int(df.topology_id.nunique()) if "topology_id" in df else None,
-        "n_features": len(feats), "folds": args.folds,
+        "n_features": len(feats), "folds": folds,
         "oracle": label_spread(df), "best_model": best_model,
     }, indent=2))
     print(f"\nwrote results to {args.out_dir}")

@@ -42,8 +42,8 @@ class JointAPModel(CellGridModel):
     def identity_size(self) -> int:
         return self.n_identities if self.ap_identity_tag else 0
 
-    def make_identity_codes(self, codes, length: float) -> None:
-        self.ap_identity = CodeBook(codes, length) if self.ap_identity_tag else None
+    def make_identity_tags(self, tags, length: float) -> None:
+        self.ap_identity = CodeBook(tags, length) if self.ap_identity_tag else None
 
     def make_identity_tables(self, tag_width: int) -> list[nn.Embedding]:
         if not self.ap_identity_tag:

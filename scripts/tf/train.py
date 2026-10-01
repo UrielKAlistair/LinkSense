@@ -63,10 +63,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from scripts.tf.binned_model import BinnedModel  # noqa: E402
 from scripts.tf.cache_dataset import NO_AP  # noqa: E402
 from scripts.tf.joint_ap_model import JointAPModel  # noqa: E402
-from scripts.tf.layers import FRAME_POSITIONS, TAG_MODES, CellBatch  # noqa: E402
+from scripts.tf.layers import TAG_MODES, CellBatch  # noqa: E402
 from scripts.tf.target_ap_model import TargetAPModel  # noqa: E402
 from scripts.common.evaluate import (LABEL_COL, SCAN_COL, all_metrics,  # noqa: E402
-                                     validation_selection_key)
+                                     selection_metrics, validation_selection_key)
 from scripts.common.splits import N_FOLDS, split_rows_by_topology  # noqa: E402
 
 CellModel = JointAPModel | TargetAPModel | BinnedModel
@@ -83,6 +83,9 @@ CellModel = JointAPModel | TargetAPModel | BinnedModel
 
 # Epochs trained on squared error before the loss adds the predicted variance.
 WARMUP_EPOCHS = 5
+
+# What the head's outputs mean and what is fitted to them.
+OBJECTIVES = ("gaussian", "ranking")
 
 # A model trained from scratch and a frozen backbone under adapters want
 # different optimiser settings, so --lr and --weight-decay default per model
@@ -124,6 +127,7 @@ def run_fold(cache: Cache, fold: int, args: argparse.Namespace) -> tuple[pd.Data
         record = train(model, cache, train_scans, val_scans, scale, args,
                        np.random.default_rng(fold))
         torch.save({"model": args.model, "grid_reader": args.grid_reader,
+                    "objective": args.objective,
                     "state_dict": trainable_state(model),
                     "scale": dataclasses.asdict(scale.state()),
                     "frame_names": cache.frame_names,
@@ -136,7 +140,7 @@ def run_fold(cache: Cache, fold: int, args: argparse.Namespace) -> tuple[pd.Data
 
     # 4. Predict the test APs, and score them against the reference rules.
     mu, log_var = predict(model, cache, test_scans, scale, args)
-    results = score(cache, test_scans, mu, log_var, scale, args.model)
+    results = score(cache, test_scans, mu, log_var, scale, args.model, args.objective)
     record.update(train=len(train_scans), val=len(val_scans), test=len(test_scans))
     return results, record
 
@@ -153,18 +157,20 @@ def build_model(cache: Cache, args: argparse.Namespace) -> CellModel:
         # transformers and peft, which cost seconds to import on every run.
         from scripts.tf.llm_model import llama_reader
         reader = llama_reader(args.backbone, args.lora_rank,
-                              pretrained=not args.random_backbone)
+                              pretrained=not args.random_backbone,
+                              gradient_checkpointing=args.llm_gradient_checkpointing)
     # The backbone is what the encoder blocks would have been, so a model reading
     # the grid with one builds none of its own.
     shared = dict(readout_bias=not args.no_readout_bias,
                   encoder_bias=not args.no_encoder_bias, tag_mode=args.tag_mode,
-                  tag_scale=args.tag_scale, frame_position=args.frame_position,
-                  grid_reader=reader, layers=0 if reader else 2)
+                  tag_scale=args.tag_scale, grid_reader=reader,
+                  layers=0 if reader else 2)
     if args.model == "joint_ap":
         return JointAPModel(*sizes, n_identities=args.identities,
                             ap_identity_tag=not args.no_identity_tag,
                             **shared).to(args.device)
     return TargetAPModel(*sizes, role_tag=not args.no_identity_tag,
+                         fixed_role_codes=args.fixed_role_codes,
                          **shared).to(args.device)
 
 
@@ -210,6 +216,11 @@ def load_fold(cache: Cache, fold: int, args: argparse.Namespace
     if stored != (cache.frame_names, cache.aggregate_names, cache.descriptor_names):
         raise SystemExit(f"{path} was trained on a cache with different columns "
                          f"than {args.cache_dir}; retrain rather than score it")
+    if checkpoint.get("objective", "gaussian") != args.objective:
+        raise SystemExit(
+            f"{path} was trained under the "
+            f"{checkpoint.get('objective', 'gaussian')} objective and this run "
+            f"asks for {args.objective}; its outputs do not mean the same thing")
     if checkpoint.get("grid_reader", "native") != args.grid_reader:
         raise ValueError(f"{path} was trained with the "
                          f"{checkpoint.get('grid_reader', 'native')} grid reader "
@@ -434,7 +445,11 @@ def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
     for epoch in range(args.epochs):
         started = time.time()
         model.train()
+        # The warm-up exists so the variance cannot widen before the mean is
+        # worth anything. A ranking run predicts no variance, so it has none.
+        ranking = args.objective == "ranking"
         with_variance = epoch >= WARMUP_EPOCHS
+        keepable = ranking or with_variance
         losses = []
         order = rng.permutation(train_scans)
         for start in range(0, len(order), args.batch_size):
@@ -443,7 +458,9 @@ def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
                 scale, args, rng)
             with autocast(args.device):
                 mu, log_var = model(batch)
-            loss = gaussian_nll(mu.float(), log_var.float(), target, mask, with_variance)
+            loss = (listnet_loss(mu.float(), target, mask, args.rank_temperature)
+                    if ranking else
+                    gaussian_nll(mu.float(), log_var.float(), target, mask, with_variance))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(training, 1.0)
@@ -462,11 +479,17 @@ def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
                       "seconds": round(time.time() - started, 1)})
         print(f"    epoch {epoch:3d}  train {np.mean(losses):8.4f}  "
               f"val regret {key[0]:.4f}  {time.time() - started:5.1f}s", flush=True)
-        if with_variance and key < best_key:
+        if keepable and key < best_key:
             best_key, best_epoch = key, epoch
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            # What trains, and not the frozen backbone beside it: keeping the
+            # whole state dict here puts a second copy of the backbone on the
+            # device every time validation improves.
+            best_state = {k: v.detach().clone()
+                          for k, v in trainable_state(model).items()}
 
-    model.load_state_dict(best_state)
+    # Frozen parameters are absent from best_state and did not move, so they are
+    # the only keys a load is allowed to find missing.
+    model.load_state_dict(best_state, strict=False)
     return {"best_epoch": best_epoch, "best_val_regret_mbps": best_key[0],
             "best_val_spearman": -best_key[1], "curve": curve}
 
@@ -493,6 +516,37 @@ def gaussian_nll(mu: torch.Tensor, log_var: torch.Tensor, target: torch.Tensor,
     else:
         loss = 0.5 * (target - mu) ** 2
     return (loss * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def listnet_loss(score: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+                 temperature: float) -> torch.Tensor:
+    """Cross-entropy between the scan's predicted choice distribution and the
+    one its labels imply, averaged over scans.
+
+    The head's first output is read as a score rather than a throughput: a
+    softmax over a scan's discovered APs turns the scores into the probability
+    of each being the best, and the labels are put through the same softmax to
+    say what that probability should have been. Padded APs are barred from both
+    distributions. `temperature` sets how sharp the target is; at 0 it is
+    one-hot on the best AP, and a tie shares the mass evenly.
+
+    Nothing here reads the scale of a score, only its order within one scan, so
+    the number a model returns is no longer a throughput and the regression
+    metrics do not apply to it.
+    """
+    barred = torch.finfo(score.dtype).min
+    predicted = torch.log_softmax(score.masked_fill(~mask, barred), dim=-1)
+    if temperature > 0:
+        wanted = torch.softmax((target / temperature).masked_fill(~mask, barred), dim=-1)
+    else:
+        best = target.masked_fill(~mask, -torch.inf).max(dim=-1, keepdim=True).values
+        ties = (target >= best) & mask
+        wanted = ties.to(score.dtype) / ties.sum(dim=-1, keepdim=True).clamp(min=1)
+    # A scan with nothing to choose between teaches nothing, and its row of the
+    # softmax is degenerate rather than wrong.
+    scored = mask.sum(dim=-1) > 1
+    per_scan = -(wanted * predicted).sum(dim=-1)
+    return (per_scan * scored).sum() / scored.sum().clamp(min=1)
 
 
 def make_batch(scans: list[CachedScan], scale: Scale, args: argparse.Namespace,
@@ -601,7 +655,8 @@ def predict(model: CellModel, cache: Cache, positions: np.ndarray, scale: Scale,
 
 
 def score(cache: Cache, test_scans: np.ndarray, mu: list[np.ndarray],
-          log_var: list[np.ndarray], scale: Scale, name: str) -> pd.DataFrame:
+          log_var: list[np.ndarray], scale: Scale, name: str,
+          objective: str = "gaussian") -> pd.DataFrame:
     """One row: every metric on the test scans, with the model's calibration.
 
     The model's throughput is the median of its prediction, expm1 of the
@@ -609,8 +664,21 @@ def score(cache: Cache, test_scans: np.ndarray, mu: list[np.ndarray],
     falls inside the central 50% and 90% of their predicted distribution. The
     heuristics this is measured against are scored once, on their own, by
     baselines/train.py.
+
+    A ranking run returns an order rather than a throughput, so the columns
+    that read a prediction's scale - the regression errors and the coverage of
+    its interval - are left empty for it instead of being filled with the
+    reading of a number that is not a throughput.
     """
     test_frame = ap_frame(cache, test_scans)
+    if objective == "ranking":
+        return pd.DataFrame([{
+            "model": name,
+            **{column: float("nan") for column in ("mae", "rmse", "r2", "r2_log")},
+            **selection_metrics(test_frame, np.concatenate(mu)),
+            "coverage_50": float("nan"), "coverage_90": float("nan"),
+            "mean_spread_log1p": float("nan"),
+        }])
     log_mean = scale.log1p_throughput(np.concatenate(mu))
     log_spread = np.exp(0.5 * np.concatenate(log_var)) * scale.target_std
     throughput = np.clip(np.expm1(log_mean), 0.0, None)
@@ -662,21 +730,27 @@ def main() -> int:
     parser.add_argument("--no-identity-tag", action="store_true",
                         help="drop the per-AP identity tag from the cell and question "
                              "vectors; for target_ap, drop the role tag instead")
+    parser.add_argument("--fixed-role-codes", action="store_true",
+                        help="for target_ap, use fixed orthogonal role directions "
+                             "instead of learned role embeddings")
     parser.add_argument("--grid-reader", choices=("native", "llm"), default="native",
                         help="who reads the grid in stage 2: this repository's "
                              "encoder blocks, or a pretrained language model "
                              "under adapters. Ignored by --model binned")
-    parser.add_argument("--tag-mode", choices=TAG_MODES, default="add",
-                        help="how a cell carries its tags: summed into the cell "
-                             "vector, summed into a normalised one, or given "
-                             "dimensions of their own")
+    parser.add_argument("--objective", choices=OBJECTIVES, default="gaussian",
+                        help="gaussian fits each AP's throughput and its "
+                             "variance; ranking reads the head's first output "
+                             "as a score and fits the choice between a scan's "
+                             "APs, leaving the regression metrics undefined")
+    parser.add_argument("--rank-temperature", type=float, default=1.0,
+                        help="how sharp --objective ranking makes the target "
+                             "distribution over a scan's APs; 0 puts all of it "
+                             "on the best AP")
+    parser.add_argument("--tag-mode", choices=TAG_MODES, default="codes",
+                        help="fixed tag directions with learned lengths, or "
+                             "learned vectors initialised at standard deviation 0.02")
     parser.add_argument("--tag-scale", type=float, default=None,
-                        help="standard deviation the tag tables are drawn at, "
-                             "overriding what --tag-mode would pick")
-    parser.add_argument("--frame-position", choices=FRAME_POSITIONS, default="concat",
-                        help="how a frame carries when in its dwell it began: set "
-                             "beside its content in its own columns, or summed "
-                             "onto a normalised content spanning the whole width")
+                        help="initial length of fixed tags (default 0.5)")
     parser.add_argument("--no-encoder-bias", action="store_true",
                         help="drop the learned channel-distance bias from every "
                              "encoder block")
@@ -689,13 +763,18 @@ def main() -> int:
     parser.add_argument("--lora-rank", type=int, default=8,
                         help="rank of the adapters on the backbone's query and "
                              "value projections")
+    parser.add_argument("--llm-gradient-checkpointing", action="store_true",
+                        help="recompute LLM activations during backward to reduce "
+                             "GPU memory use")
     parser.add_argument("--random-backbone", action="store_true",
                         help="draw the backbone's frozen weights from its config "
                              "rather than its checkpoint: the control for whether "
                              "pretraining is what helped")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    if args.epochs <= WARMUP_EPOCHS:
+    if args.rank_temperature < 0:
+        parser.error("--rank-temperature is a temperature, so it cannot be negative")
+    if args.objective == "gaussian" and args.epochs <= WARMUP_EPOCHS:
         parser.error(f"--epochs must exceed the {WARMUP_EPOCHS} warm-up epochs, "
                      "or no epoch trains the variance and none can be kept")
     if args.only_fold is not None and not 0 <= args.only_fold < args.folds:
@@ -707,7 +786,7 @@ def main() -> int:
         args.lr = settings.lr
     if args.weight_decay is None:
         args.weight_decay = settings.weight_decay
-    if args.model == "llm" and args.backbone is None:
+    if args.grid_reader == "llm" and args.backbone is None:
         # resolved once here, so a checkpoint records the name it trained under
         # rather than the None that stood for it on the command line.
         from scripts.tf.llm_model import DEFAULT_BACKBONE
