@@ -126,10 +126,9 @@ measurements becomes a powerful signal for models in a way that does not reflect
 \end{figure}
 
 Each scenario first draws 2, 3, 4, 6, or 8 APs. They sit on a triangular
-lattice 20 m apart, following \cite{tgax2016scenarios}, where it is reasoned
-that such a topology keeps the nearest-neighbor distance from varing with the number of
-APs. APs are confined to two rows of the lattice with the bottom row having 
-$min(2, \lceil\frac{N_{\mathrm{AP}}}{2}\rceil)$ APs. 
+lattice 20 m apart, following \cite{tgax2016scenarios}. This keeps the nearest-neighbor 
+distance from varying with the number of APs. APs are confined to two rows of the lattice 
+with the bottom row having $max(2, \lceil\frac{N_{\mathrm{AP}}}{2}\rceil)$ APs. 
 
 Each AP then draws a channel uniformly at random from channels 
 36, 40, 44, and 48. Random assignment biases the data toward more in-channel 
@@ -145,7 +144,7 @@ The total number of stations is decided by independently drawing a count of 3, 4
 $N_{\mathrm{AP}}$ times and summing them.
 
 A quarter of scenarios spread the stations uniformly. 
-The rest declare one or more APs as "hotspots" around which stations are clustered. 
+The rest declare one or more APs as ``hotspots'' around which stations are clustered. 
 Such mixing of uniform and deliberately clustered regimes follows common practice in WLAN studies
 \cite{wong2018daga,zhang2020placement}, and is of particular import here because under uniform
 load every AP is about equally busy and the problem we examine collapses to signal
@@ -169,9 +168,10 @@ Every station then draws its own offered load, independently, from a log-normal
 distribution with median 2.25\,Mbit/s and shape 0.9, capped at 25\,Mbit/s, for a
 mean of 3.37\,Mbit/s. Traffic volumes are log-normal rather than Gaussian
 \cite{lognormal2020}, and the right skew is what puts most stations on a light
-load and a few on a heavy one without needing a mixture. The quartiles span the
-mix an AP actually carries, from voice and browsing up through
-high-definition video.
+load and a few on a heavy one without needing a mixture. Its quartiles, 
+about 1.2 and 4.1\,Mbit/s, cover browsing and standard-definition streaming, 
+and the upper tail reaches high-definition video.
+
 
 \subsection{Placement of candidate STA}
 
@@ -182,8 +182,7 @@ background stations: the AP footprint plus a 10 m border.
 
 Background traffic starts at $t=0.5$ s. Each station's arrivals are Poisson at
 its own data rate, and its first packet is delayed by a phase drawn uniformly
-over one mean interval, without which, stations that share an AP and a rate
-transmit in lockstep for the whole run.
+over one mean interval.
 
 Passive recording runs from $t=2$ s to $t=8$ s, covering 6\,s of loaded
 traffic. It starts 1.5\,s after the traffic because Minstrel-HT needs about that
@@ -194,7 +193,8 @@ The candidate starts joining at $t=8$ s, the moment recording ends. After joinin
 the candidate offers 100\,Mbit/s in 1250-byte packets until the
 run ends at $t=20$ s. That rate keeps it backlogged, so its measured throughput
 reflects the service the network gives it rather than the limit of its own
-traffic generator.
+traffic generator. We define the throughput label as the mean rate offered from the 
+moment of association to t=20 s; a candidate that never associates scores 0.
 
 \subsection{Matched Counterfactual Replays}
 
@@ -204,7 +204,7 @@ AP and station positions, background traffic, the candidate's position, and
 every pre-association device stay fixed; only the AP selected at $t=8$ s
 changes. A \code{topologySeed} fixes the deployment: station placement, channel
 selection, and the load offered by each station. Independently, \code{candidateSeed}
-fixes the candidate STA's posistion, and \code{rngSeed} controls all other randomness 
+fixes the candidate STA's position, and \code{rngSeed} controls all other randomness 
 such as fading, contention, rate adaptation, and arrival times of background packets. 
 
 \begin{table}[!ht]
@@ -232,17 +232,24 @@ Candidate position & uniform over the station area \\
 
 \subsection{Recording and Projection}
 
-A deployed client scans across all channels that host APs in a rotating fashion.
+A deployed client scans across all available channels in a rotating fashion.
 The simulation records more than any deployed client can be expected to observe
 by recording activity on every occupied channel simultaneously. We then project 
 this complete record down to what a single scan would see.
+
+\begin{figure}[!ht]
+  \centering
+  \input{arch_figures_tikz/fig_scan}
+  \caption{The all-channel recording projected onto one passive radio.}
+  \label{fig:scan}
+\end{figure}
 
 Specifically, the candidate STA carries one receive-only scanner PHY per
 occupied channel, plus a separate PHY reserved for association. The scanner
 PHYs never transmit and never associate; the association PHY is parked on
 unused channel 149 until the decision time. At $t=8$ s the scanner PHYs move to
-the parking channel, and the assocation PHY moves into the channel of the AP it 
-intends to assocate with.
+the parking channel, and the association PHY moves into the channel of the AP it 
+intends to associate with.
 
 Two traces are recorded. The monitor-sniffer trace holds every frame a scanner
 decodes, with the start and end of the transmission carrying it, frequency,
@@ -259,22 +266,21 @@ PHY recognizes. Most driver stacks expose an equivalent channel-busy counter,
 though availability varies by platform.
 
 The projection onto one passive radio is done as follows: 
-One radio is assumed to rotate through the occupied channels in a certain 
+One radio is assumed to rotate through the available channels in a certain 
 randomly decided order, dwelling 110\,ms on each with 0.15\,ms to retune, 
-and repeats the cycle for as much of the observation window as possible. 
-A frame is kept only if its whole transmission falls inside a dwell after retuning: 
-CCA intervals outside a dwell are discarded. A 110\,ms dwell spans just over one 102.4\,ms beacon 
-interval, so each visit yields about one beacon from every AP on that channel. 
-
-RSSI is then perturbed by uniform error within $\pm3$ dB and quantized to 1\,dB. 
-Both steps run after ns-3 from a recorded scan seed, so scan policy and 
-measurement noise can be varied without repeating a simulation.
+and repeats the cycle for as much of the observation window as possible. Only an integer number 
+of all-channel cycles are retained in the dataset, and the last few dwells may be
+excluded to this effect. A frame is retained in the dataset only if its whole transmission falls 
+inside a dwell after retuning: CCA intervals outside a dwell are discarded as well. 
+A 110\,ms dwell spans just over one 102.4\,ms beacon interval, so each visit yields about 
+one beacon from every AP on that channel. Finally, the RSSI of each frame is quantized to 1\,dB when 
+creating the dataset so as to match practical precision.
 
 \subsection{Training Data}
 
 The corpus used in the making of this report simulated 1{,}000 deployments,  
 placing the candidate at five positions in each of them. Seven of the resulting 
-5{,}000 \textit{"scans"} heard beacons from fewer than two APs and were dropped, 
+5{,}000 \textit{``scans''} heard beacons from fewer than two APs and were dropped, 
 having no choice to offer.
 
 \begin{table}[ht]
@@ -341,18 +347,21 @@ unlikely to be the one that would have served best.
 
 The observation window contains several thousand frames and carrier sense
 datapoints, making attending over the scan frame by frame impractical. Further,
-several meaningful signals lay as aggregates or counts which would not be best 
+several meaningful signals lie as aggregates or counts which would not be best 
 captured by such a model.
 
 Thus, we undertake the following process to vectorize our observation:
 First, the scan is cut into bins over time. Each bin is chosen to be of 110\,ms, 
 such that it coincides with channel dwells, keeping same-channel frames together. 
-For each bin, we emit several \emph{cells}. One cell is emitted per discovered AP: 
-each of these only contains frames that carry its BSSID. We also emit one channel 
-cell with all the frames of the dwell.
+For each bin, we emit several \emph{cells}. One cell is emitted per discovered AP
+on that dwell's channel: each of these only contains frames that carry its BSSID. 
+We also emit one channel cell with all the frames of the dwell.
 
 The model then learns a representation for each cell by allowing frames within the 
-cell to attend amongst themselves. Frames carry 10 numerical values and a 
+cell to attend amongst themselves. A maximum of 512 frames are used for this purpose 
+to limit quadratic attention costs contributed by a few outlier cells. 
+
+Frames carry 10 numerical values and a 
 categorical flag; 9 numbers and the category are embedded into a 48-dimensional space 
 with a 2 layer MLP. 
 Non-linearity is needed here to capture relations between the frame characteristics, 
@@ -366,53 +375,56 @@ sine-cosine pair turns less than half a circle over any gap within a dwell and
 orders it unambiguously. The 8 pairs are appended to the aforementioned embedding, 
 creating an overall embedding dimension of 64 for each frame.
 
-Keeping time in its own columns separates the inner product of two frame
-tokens into a content term and a time term, and for sine-cosine pairs the time
-term depends only on the gap between the two start times.
-Xu~\emph{et al.}~\cite{xu2019functional} take that separation as the
-requirement on a time encoding, asking its inner product to be a
-translation-invariant kernel, and derive from Bochner's theorem the functional
-forms that satisfy it, of which the sine-cosine pairs above are an instance.
-We adopt their construction.
+The original transformer \textit{adds} the positional encoding to the token embedding, rather than 
+concatenate, so the position and the content share all coordinates~\cite{vaswani2017}. 
+This has a notable advantage that both content and position are able to use the full
+dimensionality of the embedding, allowing for greater expressibility of both of them. 
+The drawback with this approach is that content and position are mixed into the same values
+and separating out that information is left to training, and is typically achieved only with
+large volumes of training data.
 
-The attended frames are then reduced to a single vector. We take two reductions
-and concatenate them: the mean over the cell's frames, and the output of one
-learned query attending over them, the pooling of the Set
-Transformer~\cite{lee2019set}. The mean reports the cell as a whole, while the
-query is free to weight a few frames above the rest. A cell hands over at most
-512 frames --- a random subset while training, an even stride at evaluation ---
-which bounds an attention cost that grows with the square of the frame count;
-the cap binds on 0.5\% of cells.
+When the inputs are timestamped observations rather than ordered tokens, however, 
+there is actually considerable precedent for the encoding to be concatenated%
+~\cite{xu2019functional,horn2020seft}. Nagesh~\emph{et al.}~\cite{nagesh2021ema} 
+compare the two arrangements on sequences of timestamped records and find concatenation 
+ahead in every setting they test, by a margin that narrows as they add training data. With a
+corpus of a few thousand scans, we opt to concatenate.
 
-Two exact summaries join the pooled vector. The first is 16 aggregates taken
-over every frame the cell held, including those the cap dropped.
+The attended frames must now be reduced to a single vector that represents the entire cell. 
+To achieve this, we use one learned query attending over them, the pooling of the Set
+Transformer~\cite{lee2019set}, and in addition, we concatenate a mean of all attended values.
+The mean reports the cell as a whole, while the query is free to weight a few frames above 
+the rest. 
+
+Two exact summaries join the pooled vector: the first is 16 aggregates taken
+over every frame the cell held, including those the cap of 512 dropped.
 Table~\ref{tab:inputs} lists the quantities that are aggregated here.
 Such counts and totals cannot be reported by the pooled set of vectors 
 and are thus directly given to the model. The second summary belongs to channel 
 cells alone: the 109 carrier-sense samples of the dwell, one per millisecond, 
 read by a strided one-dimensional convolution. (One CCA sample is lost to 
-radio retune)
+radio retune.)
 
 A final MLP maps the concatenation of the summaries and the pooled vector 
-to a single 64 dimensional vector leaving the encoder. (Figure~\ref{fig:arch}). 
+to a single 64 dimensional vector leaving the encoder (Figure~\ref{fig:arch}). 
 Both an AP and a channel cell share the frame embedding and the self-attention,
 but each keeps its own pooling query and its own output MLP, since only 
 channel cells carry CCA signals, and an aggregate such as beacon
-level does not mean the same thing on the two and should not afforded the same 
+level does not mean the same thing on the two and should not be afforded the same 
 mapping. A cell that heard nothing has nothing to pool and takes a learned 
 vector in place of both reductions.
 
 The resulting cell vector, although containing a summary of all its frames, mostly
-lacks identifiers to distinguish itself or relate to other cells. We add tags
-for the channel it was heard on, whether it is an AP or channel cell, and its
-dwell in the sweep. Each tag is a 64 dimensional vector added onto the cell
+lacks identifiers to distinguish itself or relate to other cells. We thus add tags
+for the channel it was heard on, whether it is an AP or channel cell, and a positional
+embedding for the dwell number it belongs to. Each tag is a 64 dimensional vector added onto the cell
 vector, its direction drawn once from a random orthogonal set and never
 trained. Tags from different sets are orthogonal, as are the tags within the
 cell type and channel sets. The dwell tags are instead sinusoidal in the dwell
 index, so that dwells close in time take similar tags. 
-Each codebook has a trainable length shared by its entries,
-initially 0.5. This leaves the AP's identity, for which we take two
-approaches:
+All tags have a trainable length shared within their kind, initially 0.5. 
+Finally the AP's identity must be added to the representation of AP cells, 
+for which we take two approaches:
 
 \begin{itemize}
   \item Declare one AP as the target AP whose throughput we are interested in.
@@ -422,13 +434,12 @@ approaches:
   Inference runs once per target AP,
   with a different set of roles added to the cell vectors each time.
 
-  \item Assign each AP in the scan a numerical identity and look up its fixed
+  \item Assign each AP in the scan a numerical identity and look up a fixed
   tag direction. The direction is shared by that AP's cells and its readout row;
   its length is learned. Identities are randomly relabelled for each training
   sample, so the model cannot attach a persistent meaning to an AP number.
-  The table fixes the maximum
-  number of APs handled at once, but permits all their throughputs to be
-  predicted from one grid encoding.
+  The table fixes the maximum number of APs handled at once, but permits all 
+  their throughputs to be predicted from one grid encoding.
 \end{itemize}
 
 \subsection{Backbone}
@@ -465,18 +476,22 @@ match observations without identifying an AP across deployments.
 \label{sec:decoder}
 
 The backbone returns one vector per cell, while we need one prediction per AP.
-To obtain it, we construct a query row from the AP's descriptor, the
-whole-window summary of its beacons and its BSS in
-Table~\ref{tab:inputs}. A two-layer MLP projects them to 64 dimensions, to
-which we add a learned query vector and the AP's channel tag. In the joint
-model, the row also receives the identity tag carried by that AP's cells.
+To obtain it, we construct a single learnable query per AP. (In the target model, 
+this is just one AP)
 
-These rows pass through two decoder blocks. Each block lets the rows attend
-to the backbone's cell vectors, using the rows as queries and the cells as keys
-and values, then applies a feed-forward MLP. Both operations have normalisation
-and residual connections. In the joint model, self-attention between AP rows
+We provide additional context to the query, by means of an embedded representation
+of what could identify the AP. 
+
+We take the AP's channel tag, the AP's identity tag (applicable only to the joint model), 
+and an AP descriptor: a whole-window summary of its beacons and its BSS (Exact quantities listed 
+in Table~\ref{tab:inputs}.) and project it to 64 dimensions with a two-layer MLP. 
+
+The queries thus created pass through two decoder blocks. Each block lets the queries 
+attend to the backbone's cell vectors, using the rows as queries and the cells as keys
+and values. The block ends with a standard feed-forward MLP. Both operations have normalisation
+and residual connections. In the joint model, self-attention between AP query rows
 precedes cross-attention, allowing each prediction to use what the other rows
-have learned. The target model has one row per backbone pass and omits this step.
+have learned. The target model has only one query row so it omits this step.
 
 A final MLP maps each row to a mean and log variance of standardised
 $\log(1+y_i)$, where $y_i$ is throughput in Mbit/s. Training begins with squared
@@ -488,59 +503,66 @@ outputs. The predicted means order the APs for selection.
 
 \subsection{Frame Time and Cell Identity}
 
-The embedding above concatenates time with frame content, but adds identity
-to cell content. Both choices use a total width of 64. Concatenation reserves
-coordinates for each component; addition lets both use the full width, at the
-cost of superposing them~\cite{vaswani2017}.
+We concatenate time embeddings with frame content, but \textit{add} dwell embedding to
+cell content following common practice. Concatenation is motivated through the separation of
+content and time, but this argument actually needs further qualification. 
 
-At the cell level, addition lets the cell's frame and aggregate summaries
-occupy all 64 dimensions. Reserving 16 dimensions for tags would compress
-those summaries into 48 dimensions. The fixed cell-type and channel directions
-are distinct at input, while their learned lengths let the model set their
-weight against the raw cell content.
+The output of attention layers can write context into the timestamp coordinates 
+as well as the content coordinates, so even though residual addition retains 
+the original input, the fields end up becoming a combined representation nonetheless 
+in subsequent layers.
 
-The separation also lasts only as long as subsequent layers preserve it.
-The value and output projections can write attended content into any
-coordinate, as can the feed-forward layers. After the first residual update,
-the reserved coordinates may contain both identity and content.
+To avoid this problem, TUPE~\cite{ke2021tupe} maintains separation in the 
+attention scores themselves. It computes content--content and position--position 
+scores with separate projections, then sums them before a single softmax.
+The positional encoding remains separate from the contextual content across layers. 
+Concatenation alone does not impose this structure: its query and key projections can produce
+mixed content--time scores even in the first layer.
 
-The sinusoidal argument at the frame level needs a similar qualification.
-For a time encoding $p(\tau)$ with sine-cosine pairs at frequencies $\omega_k$,
-\begin{equation}
- p(\tau_i)^\top p(\tau_j)
- = \sum_k \cos\!\left(\omega_k(\tau_i-\tau_j)\right).
-\end{equation}
-This dot product depends only on the time difference. Attention, however,
-compares projected queries and keys. Writing their maps from the positional
-coordinates as $U_Q$ and $U_K$, the positional term is
-$p(\tau_i)^\top U_Q^\top U_K p(\tau_j)$, which need not retain that property.
-Concatenation alone neither constrains these projections nor removes the
-content--position cross terms. TUPE~\cite{ke2021tupe} treats content and position
-with separate attention terms; reserving input coordinates does not implement
-that separation.
+The empirical precedent survives this qualification. Nagesh~\emph{et al.}~\cite{nagesh2021ema}
+concatenate time with observations in a standard six-layer encoder, without
+TUPE's separate positional scores, and still find concatenation ahead of
+addition. Our frame encoder has only one self-attention layer before pooling,
+so the argument that subsequent layers have greater mixing of fields doesn't really apply.
 
-Addition offers a different allocation of the same width: all 64 coordinates
-can represent frame content, and time can use 32 sine-cosine pairs rather than
-8. More pairs sample the chosen frequency range more densely, though that
-need not improve the task. Whether that extra capacity improves AP selection
-remains to be established, so the present model retains concatenation at the
-frame level.
+At the cell level, the temporal coordinate is a dwell number, advancing at
+fixed 110\,ms intervals. Frame timestamps instead describe observations that
+can cluster in busy periods and become sparse in quiet ones, and thus can be 
+treated as true timestamps whereas dwell numbers are closer to a numbered position. 
+Nagesh's timestamped-record precedent therefore applies more closely to frames. 
+There is also a difference in what the content must represent: 
+one frame vector just describes one frame of 10 headers, while
+a cell vector summarises all of its frames and their aggregates. This means that dedicating
+dimensions to positional embedding comes at a great cost at the cell level, which could better be used
+for representational power. Thus, the arguments that support concatenation at the frame level, do not
+apply strongly at the cell level, and addition remains the norm.
 
 \subsection{Identity in the Attention Logits}
 
-Two cells' channel tags already say whether they share a channel. We can also
-supply that relationship directly to attention. In the custom encoder, each
-head can learn a scalar for each channel separation, measured in 20\,MHz steps,
-and add it to the scaled query--key score before softmax. The decoder can use
-its own channel-separation table and an additional scalar indicating whether
-the cell belongs to the AP being scored. These are learned preferences rather
-than masks: every observed cell remains available to attention.
+Alongside the channel tags, we give channel separation an independent
+contribution to the attention score. For one head, the logit between query
+$i$ and key $j$ becomes
+\begin{equation}
+ \ell_{ij} = \frac{q_i^\top k_j}{\sqrt{d_h}} + b(\Delta_{ij}),
+\end{equation}
+where $d_h$ is the query and key dimension, $\Delta_{ij}$ is the separation
+between their channels, and $b$ assigns a learned scalar to each possible
+separation. Thus, pairs with the same channel separation share a bias,
+regardless of their content. Each head learns its own biases.
+
+In encoder self-attention, the channels belong to the query cell and the key
+cell. In decoder cross-attention, they belong to the AP being scored and the
+key cell; the decoder also adds yet another learned bias for same AP relations. 
+These biases adjust the logits before softmax, changing the relative
+attention weights while leaving every observed cell available.
 
 T5~\cite{raffel2020t5} and Swin~\cite{liu2021swin} use learned relative-position
-biases in attention, while Graphormer~\cite{ying2021graphormer} supplies graph
-relationships through such biases. Here, however, the relationships are also
-present in the tags. This raises the question of whether the explicit biases
-provide a useful constraint or duplicate something attention can learn.
+biases in attention, while Graphormer~\cite{ying2021graphormer} uses biases
+indexed by shortest-path distance between nodes. These provide precedent for
+adjusting a query--key score using a relationship between the two inputs.
+However, in our case, channel and AP relationships are also available through the tags, 
+which raises the question of whether a direct bias supplies anything attention
+could not already learn.
 
 To see the overlap, write an input as content plus tag, $x_i=c_i+t_i$.
 Let $W_Q$ and $W_K$ be one head's query and key maps. Temporarily omitting
@@ -553,116 +575,116 @@ $M=W_Q^\top W_K$. Then
 \end{split}
 \label{eq:tag_attention}
 \end{equation}
-The last term assigns a score to a pair of tags independently of content.
-It can therefore express preferences such as matching identities, which are
-also supplied by an explicit bias. In cross-attention the same expansion
-applies with row content and tags on the query side and cell content and tags
-on the key side.
+The last term can express preferences for pairs of tags, including matching
+channels or AP identities. In cross-attention the same expansion applies with
+AP row content and tags on the query side and cell content and tags on the
+key side.
 
-This overlap does not establish equivalence. A tag-derived table is constrained
-by the fixed tag directions and the head's projections; an explicit table
-directly ties all pairs with the same relationship to one parameter. Our blocks
-also normalise the combined token before projecting it, and later layers
-receive attended values. We therefore keep the learned channel-distance bias
-in the encoder and both the channel-distance and own-AP biases in the decoder.
+However, $M$ is shared by all four terms. Adjusting it to obtain a particular
+tag preference can also change how content is compared and how content and
+tags interact. The tag score is therefore tied to the rest of the attention
+calculation, even when the tag directions themselves are learned. A direct
+bias gives each relationship its own parameter,
+adjustable without changing the query and key projections, and shares that
+parameter across every pair with the same relationship. Our blocks also
+normalise content and tags together, so the expansion above illustrates the
+overlap rather than an exact decomposition of their logits. We retain the
+channel-distance bias in the encoder and both the channel-distance and own-AP
+biases in the decoder to give these relationships an independently adjustable
+contribution alongside the tags.
 
 \section{Results}
 \label{sec:results}
 
-% BEGIN 800-topology corpus results. Remove \iffalse and \fi to restore.
-\iffalse
-Table~\ref{tab:results} reports the 800-deployment corpus. The reference
-rules, tabular models and three small transformer models have results for all
-five topology folds: one for test, the next for validation and the remaining
-three for training. Each topology is tested once. Their entries are the mean
-and sample standard deviation of the five fold scores. The five-fold cell
-models used learned identity embeddings and 64-dimensional frame content.
-None of these runs evaluates fixed identity tags.
-The loud-tag comparison uses fold 1, containing 805 test scans, with the
-48+16 frame construction. Its entries are single-fold scores.
+We compare the transformers with passive-selection heuristics and predictors
+that read whole-window summaries. We use five-fold cross-validation by
+topology: each rotation uses three folds for training, one for validation and
+one for testing. Over the five rotations, every topology is tested exactly
+once, with all its scans kept together. The LoRA and ranking-loss comparisons
+use fold 0 only.
 
-Ridge regression, random forests and gradient boosting use 32 window
-features; their hyperparameters and choice of raw or log-throughput target
-are selected on validation. The RSSI-minus-busy rule fits its tradeoff
-coefficient on training data alone. MAE measures absolute throughput
-prediction error. Top-1 is the fraction of scans on which the selected AP is
-best; regret is the throughput lost by that choice; and Spearman correlation
-measures the ordering of the discovered APs within each scan.
+\subsection{Baselines}
 
-\begin{table*}[!t]
-\caption{800-topology corpus results. Throughput errors and regret are in Mbit/s.}
-\label{tab:results}
-\centering
-\footnotesize
-\begin{tabular}{@{}lcccc@{}}
-\toprule
-Model & MAE $\downarrow$ & Top-1 $\uparrow$ & Mean regret $\downarrow$ & Spearman $\uparrow$ \\
-\midrule
-\multicolumn{5}{@{}l}{\textit{Reference rules}} \\
-Random choice & --- & 0.287 $\pm$ 0.001 & 14.445 $\pm$ 0.266 & --- \\
-Strongest RSSI & --- & 0.622 $\pm$ 0.008 & 5.196 $\pm$ 0.501 & 0.616 $\pm$ 0.028 \\
-Least busy channel & --- & 0.524 $\pm$ 0.008 & 6.458 $\pm$ 0.173 & 0.391 $\pm$ 0.026 \\
-RSSI minus busy & --- & 0.799 $\pm$ 0.012 & 1.415 $\pm$ 0.128 & 0.751 $\pm$ 0.017 \\
-\addlinespace
-\multicolumn{5}{@{}l}{\textit{Tabular predictors}} \\
-Ridge regression & 4.644 $\pm$ 0.162 & 0.828 $\pm$ 0.014 & 0.994 $\pm$ 0.141 & 0.810 $\pm$ 0.010 \\
-Random forest & 2.415 $\pm$ 0.040 & 0.878 $\pm$ 0.013 & 0.493 $\pm$ 0.057 & 0.871 $\pm$ 0.011 \\
-Gradient boosting & 2.277 $\pm$ 0.072 & 0.873 $\pm$ 0.008 & 0.494 $\pm$ 0.035 & 0.860 $\pm$ 0.011 \\
-\addlinespace
-\multicolumn{5}{@{}l}{\textit{Task-trained transformers}} \\
-Binned sequence & 2.304 $\pm$ 0.049 & 0.873 $\pm$ 0.008 & 0.498 $\pm$ 0.053 & 0.869 $\pm$ 0.004 \\
-Target AP & 2.074 $\pm$ 0.114 & 0.889 $\pm$ 0.012 & 0.429 $\pm$ 0.052 & 0.889 $\pm$ 0.012 \\
-Joint AP & 2.033 $\pm$ 0.127 & 0.884 $\pm$ 0.010 & 0.455 $\pm$ 0.064 & 0.888 $\pm$ 0.005 \\
-\midrule
-\multicolumn{5}{@{}l}{\textit{Loud-tag comparison (fold 1 only)}} \\
-Joint AP, encoder bias only & 2.307 & 0.864 & 0.571 & 0.863 \\
-Llama-3.2-1B + LoRA, no encoder bias & 2.431 & 0.864 & 0.624 & 0.866 \\
-\bottomrule
-\end{tabular}
-\\[2pt]
-{\color{gray}\scriptsize The first three groups show mean $\pm$ standard deviation across five folds. The fold-1 group shows single-fold scores; neither model uses decoder/readout bias.}
-\end{table*}
+We evaluate four reference rules over the discovered APs. \emph{Random choice}
+selects uniformly; its scores are the exact expected Top-1 rate and regret,
+rather than the outcome of one random draw. \emph{Strongest RSSI} selects the
+AP with the highest mean decoded-beacon RSSI. \emph{Least busy channel}
+selects an AP whose channel has the lowest CCA busy fraction, averaged over
+the dwells on that channel. Tied choices share selection credit and regret
+uniformly.
 
-The target-AP transformer has the lowest five-fold mean regret in the table,
-0.429\,Mbit/s; the joint-AP model is close at 0.455\,Mbit/s. The central
-comparison is whether a task-trained transformer can match the LoRA-adapted
-language model motivated by NetLLM~\cite{wu2024netllm}. Tan et
-al.~\cite{tan2024useful} found that smaller attention models often matched or
-surpassed adapted language models in time-series forecasting, motivating the
-comparison here without predicting its outcome for passive Wi-Fi traces.
+\emph{RSSI minus busy} combines these measurements, scoring AP $i$ as
+$r_i-kb_i$, where $r_i$ is its mean beacon RSSI in dBm and $b_i$ is its
+channel's CCA busy fraction. We fit the single coefficient $k$ on training
+scans, choosing from $\{0,5,\ldots,80\}$ the value with the lowest mean regret.
+At $k=0$ this reduces to strongest-RSSI selection.
 
-With loud tags and no readout bias, the joint model obtains 0.571\,Mbit/s of
-regret on fold 1 and the LoRA-adapted LLM obtains 0.624\,Mbit/s. Their top-1
-rates are both 0.864 after rounding. The LLM replaces the custom encoder
-blocks and has no native channel-distance encoder bias, so this comparison
-changes both the backbone and that bias. The joint configuration was selected
-after examining fold-0 test results, which we do not quote as its evaluation.
-Fold 1 was the validation fold during those ablations and is therefore not a
-completely untouched holdout. These single-fold scores do not establish a
-general advantage for either backbone or isolate the value of language
-pretraining.
-\fi
-% END 800-topology corpus results.
+The tabular predictors read 32 whole-window features per discovered AP:
+10 summarise its channel, 16 its own BSS, and 6 its relationship to the other
+discovered APs. These include CCA occupancy, frame and byte rates, retries,
+beacon RSSI and spacing, observed transmitter counts, and relative signal
+strength and airtime shares. They provide a comparison with both linear and
+nonlinear fits of summary statistics.
 
-Table~\ref{tab:v1000_results} shows the available results on the expanded
-1{,}000-topology corpus. It contains 4{,}993 usable scans, of which 1{,}013
-belong to fold 0. The reference rules, tabular predictors, target-AP model and
-joint-AP model were evaluated on all five topology folds, with one fold for
-test, the next for validation and the remaining three for training. Their
-entries are the mean and sample standard deviation of the five fold scores.
-The remaining entries were evaluated on fold 0 alone, so each is an individual
-score rather than a cross-fold estimate. Fold 0 of the target-AP and joint-AP
-models appears among them, so that the single-fold entries can be read against
-the same held-out topologies.
+\emph{Ridge regression} fits a linear predictor after standardising the
+features on training data, with an $L_2$ penalty selected from
+$\alpha\in\{0.1,1,10,100\}$. \emph{Random forest} averages 400 regression
+trees; we vary the minimum leaf size over $\{1,2,4\}$ and the number of
+features considered at each split between the square root of the feature
+count, half the features, and all features. \emph{Histogram gradient boosting}
+fits trees sequentially to correct prediction errors. We try 200 or 400
+iterations, learning rates in $\{0.03,0.06,0.1\}$, and minimum leaf sizes in
+$\{4,8,16\}$, with $L_2$ regularisation fixed at 1.
 
-MAE is absolute throughput error. Top-1 is the fraction of scans on which the
-selected AP is best; regret is the throughput lost by that choice; Spearman
-correlation measures the ordering of discovered APs within each scan. The
-rules do not predict throughput, so they have no MAE, and neither do the
-models fitted to the ranking loss, whose output orders a scan's APs rather than
-estimating what each would deliver. Ridge regression,
-random forests and gradient boosting use 32 window features and choose their
-hyperparameters on validation.
+Each tabular configuration is fitted against either throughput or
+$\log(1+y_i)$. Validation mean regret selects the configuration and target
+transform within each family, with Spearman correlation breaking ties. The
+test topologies are held out from both fitting and selection.
+
+\subsection{Transformer Training and Objectives}
+
+The custom grid encoder contains 100{,}000 parameters across its two blocks;
+including the embedding and readout layers, the target-AP and joint-AP models
+have 0.313 and 0.347 million trainable parameters. Llama-3.2-1B retains
+973 million frozen parameters after removing its unused vocabulary embedding.
+Its rank-8 LoRA adapters contain 0.852 million trainable parameters; together
+with the width projections, embedding and readout layers, the target and joint
+variants train 1.330 and 1.363 million parameters, respectively.
+
+We train the transformer models for 60 epochs with AdamW and cosine
+learning-rate decay. The custom models use an initial learning rate of
+$10^{-3}$ and weight decay of $10^{-2}$; the LLM variants use $10^{-4}$ for
+both. Throughput predictors minimise Gaussian negative log likelihood on
+standardised $\log(1+y_i)$, averaged over the discovered APs in each batch.
+The first five epochs fit the mean with squared error before introducing
+the predicted variance.
+
+The ranking runs instead train the joint-AP model to produce scores $s_i$
+using a listwise cross-entropy loss. For one scan, let $z_i$ be the
+standardised $\log(1+y_i)$ label. For $T>0$, the target distribution $q_i$
+and predicted distribution $p_i$ are
+\begin{equation}
+\begin{aligned}
+q_i(T)&=\frac{\exp(z_i/T)}{\sum_j\exp(z_j/T)},
+&p_i&=\frac{\exp(s_i)}{\sum_j\exp(s_j)},\\
+\mathcal{L}_{\mathrm{rank}}&=-\sum_i q_i(T)\log p_i.
+\end{aligned}
+\label{eq:ranking_loss}
+\end{equation}
+The sums run over the scan's discovered APs. A smaller target temperature
+$T$ concentrates weight on higher-throughput choices; at $T=0$, only the
+best AP receives weight, shared uniformly if several tie. We average this
+loss over scans with at least two discovered APs. Ranking runs use no
+squared-error warm-up, and their outputs are scores rather than throughput
+estimates. For both objectives, validation regret selects the checkpoint,
+with Spearman correlation breaking ties.
+
+\subsection{Comparison}
+
+Table~\ref{tab:v1000_results} reports throughput error (MAE), the fraction of
+scans selecting the best AP (Top-1), throughput lost by the selection (mean
+regret), and correlation of the predicted and true AP orderings (Spearman).
+MAE is omitted for the rules and ranking-only models.
 
 \begin{table*}[!t]
 \caption{1{,}000-topology corpus results. MAE and mean regret are in Mbit/s.}
@@ -689,7 +711,6 @@ Target AP & 2.452 $\pm$ 0.414 & 0.887 $\pm$ 0.020 & 0.444 $\pm$ 0.093 & 0.879 $\
 Joint AP & 2.032 $\pm$ 0.067 & 0.888 $\pm$ 0.009 & 0.422 $\pm$ 0.040 & 0.879 $\pm$ 0.015 \\
 \midrule
 \multicolumn{5}{@{}l}{\textit{Fold 0 only}} \\
-Binned sequence & 2.218 & 0.881 & 0.533 & 0.865 \\
 Target AP & 2.221 & 0.891 & 0.465 & 0.888 \\
 Joint AP & 2.140 & 0.890 & 0.435 & 0.871 \\
 Target AP, LoRA backbone & 2.038 & 0.886 & 0.462 & 0.885 \\
@@ -703,79 +724,51 @@ Joint AP, ranking loss, $T = 0$ & --- & 0.871 & 0.602 & 0.843 \\
 {\color{gray}\scriptsize Five-fold entries show mean $\pm$ standard deviation; fold-0 entries are single scores and need not represent cross-fold performance.}
 \end{table*}
 
-The joint-AP model has the lowest observed five-fold mean regret, 0.422
-Mbit/s, followed by target AP at 0.444 and gradient boosting at 0.448.
-The fold-to-fold variation does not establish that these differences
-generalise. Both cell transformers use fixed shared tags and raw cell
-content; target AP keeps learned relative-role embeddings, while joint AP uses
-fixed AP-identity directions. The comparison with a LoRA-adapted language model
-remains open on this corpus.
+On fold 0, the target-AP model's mean regret is 0.465\,Mbit/s with the custom
+encoder and 0.462\,Mbit/s with the LLM backbone; the joint-AP figures are
+0.435 and 0.485\,Mbit/s. Their Top-1 rates lie between 0.885 and 0.891.
+The LLM therefore gives comparable selection performance on this fold,
+while using about four times as many trainable parameters and a much larger
+frozen backbone. Its evaluation is limited to fold 0.
+
+Across five folds, the joint-AP model achieves the lowest mean regret,
+0.422\,Mbit/s, compared with 0.444 for target AP and 0.448 for gradient
+boosting. Both transformers improve substantially on ridge regression at
+1.031\,Mbit/s, but remain close to the nonlinear tabular predictors.
+
+LoRA allows the pretrained backbone to be reused while its adapters and task
+layers are fitted to another task or to deployment data. This motivates the
+LLM beyond its present selection scores, although transfer to real captures
+is untested and the custom models can also be fine-tuned.
+
+Block-causal attention also allows the LLM to encode a scan prefix without
+access to later dwells. A shorter scan requires determining the discovered
+APs and their summaries from the observed prefix. The custom encoder also
+accepts fewer cells, although its bidirectional cell representations change when later
+cells are added. One-second scan prefixes have not been evaluated, so their
+selection accuracy remains an open question.
+
+Gradient boosting's close performance may reflect the fixed mean offered
+rates during each scan: arrivals and contention fluctuate, but traffic
+sources do not change their mean loads or start and stop during observation.
+Window summaries may therefore capture much of the information needed for
+selection. Varying loads and bursty sessions would test the value of temporal
+modelling; we will discuss these extensions in Section~\ref{sec:future}.
 
 \section{Further Study}
 \label{sec:future}
 
-\subsection{AP-Advertised Load}
-
-The present model estimates load from transmissions and carrier sense at the
-candidate station. An AP may also advertise BSS Load information in its
-beacons. Adding this information would retain passive pre-association
-operation, while giving the model a view from the AP that the client's
-observations need not reproduce. We should compare predictions with and
-without these fields, including cases where they are absent or stale. This
-would also permit a closer comparison with selection methods that use
-AP-reported load.
+\subsection{AP-Advertised BSS Load}
 
 \subsection{Traffic That Changes During the Scan}
 
-Each background station currently keeps a fixed mean offered rate throughout
-a run. Poisson arrivals and wireless contention introduce variation, but the
-simulator does not model sustained changes in demand. Repeated observations
-therefore mostly refine an estimate of the same traffic regime.
-
-Bursty sessions, changes in offered rate, and stations starting or stopping
-traffic would make the order and recency of observations more consequential.
-A useful extension would vary both the size of these changes and their time
-scale relative to scanning and association. The throughput measurement
-horizon should then be varied too: a long average after association may hide
-a short period of poor service that matters to the client. Matched replays
-must preserve the same background demand schedule across the alternative AP
-associations.
+Bursty sessions. Random Changes in offered rate. Stations randomly starting or stopping?
 
 \subsection{Shorter Observation Windows}
 
-A client may not be willing to spend six seconds observing a network, and
-under changing traffic the earliest observations may already be stale. We
-should compare shorter windows, including one second, ending at the same
-association time. Descriptors, aggregates and the set of discovered APs must
-be rebuilt from each window so that no information from discarded observations
-reaches the model.
+\subsection{Adding realism to the Simulator}
 
-Under the current fixed-rate traffic, a short window may recover much of the
-same information with fewer samples. That remains a hypothesis: fewer beacon
-receptions and less evidence of contention can still reduce reliability.
-Under changing demand, a shorter window also trades statistical precision
-against recency. Selection regret should be accompanied by AP-discovery
-coverage, distinguishing a poor choice among heard APs from a better AP that
-the shorter scan never discovered.
-
-\subsection{Variation Beyond the Simulated Deployment}
-
-The present corpus fixes radio capabilities and channel width, places APs on a
-regular lattice, and has no walls or device motion. Irregular layouts,
-obstructions and mobility would test whether the model can distinguish a
-change in propagation from a change in load. Mixed radio capabilities and
-channel widths would test whether relationships learned under homogeneous
-802.11n devices transfer to networks with different service rates. These
-variations should include held-out environments, rather than only more
-samples from the same parameter distributions.
-
-Finally, real monitor-mode captures would test which simulated observations
-are available and reliable on client hardware. Carrier-sense counters, PHY
-metadata and frame reception may differ between devices. Such a study would
-also face a different labelling constraint: a real client observes service
-from the AP it joins, while the simultaneous alternatives remain unknown.
-Controlled repeated measurements can help, but should not be presented as the
-exact counterfactuals supplied by the simulator.
+\subsection{Testing Beyond the Simulated Deployment}
 
 \begin{thebibliography}{00}
 
@@ -850,6 +843,14 @@ D. Xu, C. Ruan, S. Kumar, E. Korpeoglu, and K. Achan, ``Self-attention with
 functional time representation learning,'' in \emph{Proc. NeurIPS}, 2019,
 pp. 15915--15925.
 
+\bibitem{horn2020seft}
+M. Horn, M. Moor, C. Bock, B. Rieck, and K. Borgwardt, ``Set functions for
+time series,'' in \emph{Proc. ICML}, 2020, pp. 4353--4363.
+
+\bibitem{nagesh2021ema}
+S. Nagesh \emph{et al.}, ``Transformers for prompt-level EMA non-response
+prediction,'' arXiv:2111.01193, 2021.
+
 \bibitem{ke2021tupe}
 G. Ke, D. He, and T.-Y. Liu, ``Rethinking positional encoding in language
 pre-training,'' in \emph{Proc. ICLR}, 2021.
@@ -915,7 +916,7 @@ carrying it \\
 \code{rate\_log1p} & PHY rate \\
 \code{is\_beacon}, \code{is\_retry} & Beacon and retry flags \\
 \code{from\_ap} & The BSSID itself sent it, not one of its stations \\
-\code{of\_valid\_ap} & Carries a discovered AP's BSSID \\
+\code{of\_discovered\_ap} & Carries a discovered AP's BSSID \\
 \code{category} & Management, control or data; embedded rather than numeric \\
 \addlinespace
 \multicolumn{2}{@{}l}{\textbf{Cell aggregate}} \\
