@@ -9,6 +9,7 @@
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 \usepackage{tikz}
+\usepackage{stfloats}
 \input{arch_figures_tikz/archstyle}
 
 % IEEEtran leaves a lot of air above a subsection heading. Tighten it while
@@ -51,9 +52,19 @@ therefore favor a nearby but congested AP. This project investigates whether a
 client can make a better decision using only passive observations collected
 before association without assistance from the network.
 
-We define a controlled ns-3 simulator of multi-AP deployments to investigate this.
-The simulation of each topology of devices is replayed n times to a candidate STA
-to obtain the throughputs offered by each AP. 
+We build a controlled ns-3 simulator of multi-AP 802.11n deployments in which
+each deployment is replayed once per AP, with everything before association
+held fixed, so that one passive observation is paired with the throughput
+every AP would have delivered. The observation is projected onto what a single
+radio cycling through the channels would hear. A hierarchical transformer predicts 
+each AP's throughput from this observation, with either a small backbone trained 
+from scratch or, following NetLLM, a LoRA-adapted Llama-3.2-1B. Over 1,000 simulated
+deployments, the small model selects the best AP in 88.8\% of scans with a mean
+regret of 0.42\,Mbit/s, against 62.1\% and 5.26\,Mbit/s for strongest-signal
+selection. Gradient boosting on whole-window summaries comes within error margins, 
+and the 1B-parameter LLM backbone performs comparably to the bespoke model 
+with 0.35 million trainable parameters.
+
 
 \end{abstract}
 
@@ -95,8 +106,10 @@ AP and observes that AP's throughput, while the values of $y_j$ for every AP it 
 join are not easily recoverable. For broader applicability, and adaptation to reality, 
 choice models are not investigated extensively here.
 
+
 \section{Simulator Design and Assumptions}
 \label{sec:sim}
+
 
 \subsection{Simulation Environment}
 
@@ -118,6 +131,7 @@ measurements becomes a powerful signal for models in a way that does not reflect
 
 \subsection{Count, Topology and Channel occupancy of APs}
 
+
 \begin{figure}[!ht]
   \centering
   \input{arch_figures_tikz/fig_deployment}
@@ -126,9 +140,9 @@ measurements becomes a powerful signal for models in a way that does not reflect
 \end{figure}
 
 Each scenario first draws 2, 3, 4, 6, or 8 APs. They sit on a triangular
-lattice 20 m apart, following \cite{tgax2016scenarios}. This keeps the nearest-neighbor 
+lattice 20 m apart (Fig.~\ref{fig:deployment}), following \cite{tgax2016scenarios}. This keeps the nearest-neighbor 
 distance from varying with the number of APs. APs are confined to two rows of the lattice 
-with the bottom row having $max(2, \lceil\frac{N_{\mathrm{AP}}}{2}\rceil)$ APs. 
+with the bottom row having $\max(2, \lceil\frac{N_{\mathrm{AP}}}{2}\rceil)$ APs. 
 
 Each AP then draws a channel uniformly at random from channels 
 36, 40, 44, and 48. Random assignment biases the data toward more in-channel 
@@ -144,7 +158,7 @@ The total number of stations is decided by independently drawing a count of 3, 4
 $N_{\mathrm{AP}}$ times and summing them.
 
 A quarter of scenarios spread the stations uniformly. 
-The rest declare one or more APs as ``hotspots'' around which stations are clustered. 
+The rest declare one or more APs as ``hotspots'' around which stations are clustered, keeping the total station count fixed~\cite{3gpp36814}.
 Such mixing of uniform and deliberately clustered regimes follows common practice in WLAN studies
 \cite{wong2018daga,zhang2020placement}, and is of particular import here because under uniform
 load every AP is about equally busy and the problem we examine collapses to signal
@@ -193,8 +207,8 @@ The candidate starts joining at $t=8$ s, the moment recording ends. After joinin
 the candidate offers 100\,Mbit/s in 1250-byte packets until the
 run ends at $t=20$ s. That rate keeps it backlogged, so its measured throughput
 reflects the service the network gives it rather than the limit of its own
-traffic generator. We define the throughput label as the mean rate offered from the 
-moment of association to t=20 s; a candidate that never associates scores 0.
+traffic generator. We define the throughput label as the mean rate delivered to the candidate from the 
+moment of association to $t=20$ s; a candidate that never associates scores 0.
 
 \subsection{Matched Counterfactual Replays}
 
@@ -207,7 +221,10 @@ selection, and the load offered by each station. Independently, \code{candidateS
 fixes the candidate STA's position, and \code{rngSeed} controls all other randomness 
 such as fading, contention, rate adaptation, and arrival times of background packets. 
 
+Table~\ref{tab:params} summarises the deployment parameters and sampling distributions.
+
 \begin{table}[!ht]
+\caption{Simulator parameters and sampling distributions}
 \label{tab:params}
 \centering
 \begin{tabularx}{\columnwidth}{@{}lY@{}}
@@ -235,7 +252,8 @@ Candidate position & uniform over the station area \\
 A deployed client scans across all available channels in a rotating fashion.
 The simulation records more than any deployed client can be expected to observe
 by recording activity on every occupied channel simultaneously. We then project 
-this complete record down to what a single scan would see.
+this complete record down to what a single scanning radio would see
+(Fig.~\ref{fig:scan}).
 
 \begin{figure}[!ht]
   \centering
@@ -282,6 +300,8 @@ The corpus used in the making of this report simulated 1{,}000 deployments,
 placing the candidate at five positions in each of them. Seven of the resulting 
 5{,}000 \textit{``scans''} heard beacons from fewer than two APs and were dropped, 
 having no choice to offer.
+
+Table~\ref{tab:corpus} summarises the resulting corpus.
 
 \begin{table}[ht]
 \caption{The corpus, after projection onto one radio.}
@@ -350,12 +370,14 @@ datapoints, making attending over the scan frame by frame impractical. Further,
 several meaningful signals lie as aggregates or counts which would not be best 
 captured by such a model.
 
-Thus, we undertake the following process to vectorize our observation:
-First, the scan is cut into bins over time. Each bin is chosen to be of 110\,ms, 
-such that it coincides with channel dwells, keeping same-channel frames together. 
-For each bin, we emit several \emph{cells}. One cell is emitted per discovered AP
-on that dwell's channel: each of these only contains frames that carry its BSSID. 
-We also emit one channel cell with all the frames of the dwell.
+Thus, we group the frames of a scan into \emph{cells}, each of which the model
+reduces to a single 64-dimensional vector. First, the scan is cut into bins over
+time. Each bin is chosen to be of 110\,ms, such that it coincides with channel
+dwells, keeping same-channel frames together. For each bin, we emit one channel
+cell with all the frames of the dwell, and one cell per discovered AP on that
+dwell's channel, containing only the frames that carry its BSSID. A six-second
+scan of 13 cycles thus yields, in each cycle, four channel cells and one cell
+per discovered AP.
 
 The model then learns a representation for each cell by allowing frames within the 
 cell to attend amongst themselves. A maximum of 512 frames are used for this purpose 
@@ -438,8 +460,8 @@ for which we take two approaches:
   tag direction. The direction is shared by that AP's cells and its readout row;
   its length is learned. Identities are randomly relabelled for each training
   sample, so the model cannot attach a persistent meaning to an AP number.
-  The table fixes the maximum number of APs handled at once, but permits all 
-  their throughputs to be predicted from one grid encoding.
+  This lookup fixes the maximum number of APs handled at once, but permits all 
+  their throughputs to be predicted from one pass through the backbone.
 \end{itemize}
 
 \subsection{Backbone}
@@ -449,8 +471,8 @@ The tagged cell vectors attend across the scan so that a cell describing one
 AP can incorporate the activity of other APs and channels. We consider two
 backbones for this step.
 
-The first is a transformer encoder trained from scratch, with two blocks of
-four-head self-attention at width 64. Each block normalises its input before
+The custom backbone is a transformer encoder trained from scratch, with two
+blocks of four-head self-attention at width 64. Each block normalises its input before
 attention, adds the attended values to the input, then applies a feed-forward
 MLP with another normalisation and residual connection; that MLP widens to 256
 and back. Each block also adds to its attention logits a learned scalar per
@@ -459,7 +481,7 @@ cell can attend to every observed cell; dwell order is supplied by the tags.
 
 The second follows the adaptation of a pretrained language model described
 above. Linear projections map the cell vectors from 64 to 2048 dimensions,
-then back after Llama-3.2-1B has processed them. The backbone weights remain
+then back after Llama-3.2-1B~\cite{meta2024llama32} has processed them. The backbone weights remain
 frozen, with LoRA adapters of rank 8 and $\alpha = 32$ on the query and value
 projections, at dropout 0.05. Its
 attention mask is block causal, permitting cells to attend within their own dwell 
@@ -468,16 +490,14 @@ since their order within that dwell carries no meaning~\cite{su2024roformer}.
 
 The target-AP model runs the backbone separately for each AP, because changing
 the target changes the role tags on its input. The joint-AP model runs it once
-for the scan. AP identity tags in this model are assigned randomly within each
-sample and shared between an AP's cells and its readout; they provide a way to
-match observations without identifying an AP across deployments.
+for the scan.
 
 \subsection{Decoder}
 \label{sec:decoder}
 
 The backbone returns one vector per cell, while we need one prediction per AP.
 To obtain it, we construct a single learnable query per AP. (In the target model, 
-this is just one AP)
+this is just one AP.)
 
 We provide additional context to the query, by means of an embedded representation
 of what could identify the AP. 
@@ -492,6 +512,13 @@ and values. The block ends with a standard feed-forward MLP. Both operations hav
 and residual connections. In the joint model, self-attention between AP query rows
 precedes cross-attention, allowing each prediction to use what the other rows
 have learned. The target model has only one query row so it omits this step.
+
+In cross-attention, we add two learned biases to the query--key score before
+softmax. The first depends on the separation between the query AP's channel
+and the cell's channel; the second applies when an AP cell belongs to the AP
+being scored. Each head learns its own biases, shared across the two decoder
+blocks. These adjust the attention weights while leaving every observed cell
+available.
 
 A final MLP maps each row to a mean and log variance of standardised
 $\log(1+y_i)$, where $y_i$ is throughput in Mbit/s. Training begins with squared
@@ -529,7 +556,7 @@ At the cell level, the temporal coordinate is a dwell number, advancing at
 fixed 110\,ms intervals. Frame timestamps instead describe observations that
 can cluster in busy periods and become sparse in quiet ones, and thus can be 
 treated as true timestamps whereas dwell numbers are closer to a numbered position. 
-Nagesh's timestamped-record precedent therefore applies more closely to frames. 
+The precedent established by Nagesh~\emph{et al.} therefore applies more closely to frames. 
 There is also a difference in what the content must represent: 
 one frame vector just describes one frame of 10 headers, while
 a cell vector summarises all of its frames and their aggregates. This means that dedicating
@@ -550,11 +577,9 @@ between their channels, and $b$ assigns a learned scalar to each possible
 separation. Thus, pairs with the same channel separation share a bias,
 regardless of their content. Each head learns its own biases.
 
-In encoder self-attention, the channels belong to the query cell and the key
-cell. In decoder cross-attention, they belong to the AP being scored and the
-key cell; the decoder also adds yet another learned bias for same AP relations. 
-These biases adjust the logits before softmax, changing the relative
-attention weights while leaving every observed cell available.
+In encoder self-attention, $\Delta_{ij}$ separates the channels of the query
+cell and the key cell; in decoder cross-attention, those of the AP being
+scored and the key cell.
 
 T5~\cite{raffel2020t5} and Swin~\cite{liu2021swin} use learned relative-position
 biases in attention, while Graphormer~\cite{ying2021graphormer} uses biases
@@ -593,22 +618,58 @@ channel-distance bias in the encoder and both the channel-distance and own-AP
 biases in the decoder to give these relationships an independently adjustable
 contribution alongside the tags.
 
+\begin{table*}[!t]
+\caption{1{,}000-topology corpus results. MAE and mean regret are in Mbit/s.}
+\label{tab:v1000_results}
+\centering
+\footnotesize
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Model & MAE $\downarrow$ & Top-1 $\uparrow$ & Mean regret $\downarrow$ & Spearman $\uparrow$ \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{Reference rules: five folds}} \\
+Random choice & --- & 0.287 $\pm$ 0.001 & 14.426 $\pm$ 0.590 & --- \\
+Strongest RSSI & --- & 0.621 $\pm$ 0.025 & 5.263 $\pm$ 0.676 & 0.615 $\pm$ 0.022 \\
+Least busy channel & --- & 0.525 $\pm$ 0.033 & 6.431 $\pm$ 0.329 & 0.391 $\pm$ 0.042 \\
+RSSI minus busy & --- & 0.803 $\pm$ 0.020 & 1.386 $\pm$ 0.138 & 0.754 $\pm$ 0.024 \\
+\addlinespace
+\multicolumn{5}{@{}l}{\textit{Tabular predictors: five folds}} \\
+Ridge regression & 4.892 $\pm$ 0.360 & 0.827 $\pm$ 0.016 & 1.031 $\pm$ 0.070 & 0.803 $\pm$ 0.008 \\
+Random forest & 2.396 $\pm$ 0.030 & 0.878 $\pm$ 0.014 & 0.508 $\pm$ 0.058 & 0.865 $\pm$ 0.007 \\
+Gradient boosting & 2.264 $\pm$ 0.082 & 0.883 $\pm$ 0.015 & 0.448 $\pm$ 0.078 & 0.866 $\pm$ 0.007 \\
+\addlinespace
+\multicolumn{5}{@{}l}{\textit{Custom backbone: five folds}} \\
+Target AP & 2.452 $\pm$ 0.414 & 0.887 $\pm$ 0.020 & 0.444 $\pm$ 0.093 & 0.879 $\pm$ 0.016 \\
+Joint AP & 2.032 $\pm$ 0.067 & 0.888 $\pm$ 0.009 & 0.422 $\pm$ 0.040 & 0.879 $\pm$ 0.015 \\
+\addlinespace
+\multicolumn{5}{@{}l}{\textit{LoRA fine-tuned backbone}} \\
+Target AP & 2.038 & 0.886 & 0.462 & 0.885 \\
+Joint AP & 2.163 & 0.885 & 0.485 & 0.880 \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\color{gray}\scriptsize Five-fold entries show mean $\pm$ standard deviation. LoRA scores are provisional fold-0 values pending replacement with five-fold results.}
+\end{table*}
+
 \section{Results}
 \label{sec:results}
 
-We compare the transformers with passive-selection heuristics and predictors
-that read whole-window summaries. We use five-fold cross-validation by
+Table~\ref{tab:v1000_results} compares the transformers with passive-selection
+heuristics and predictors that read whole-window summaries. We use five-fold cross-validation by
 topology: each rotation uses three folds for training, one for validation and
 one for testing. Over the five rotations, every topology is tested exactly
-once, with all its scans kept together. The LoRA and ranking-loss comparisons
-use fold 0 only.
+once, with all its scans kept together.
+
+We report throughput error (MAE), the fraction of
+scans selecting the best AP (Top-1), throughput lost by the selection (mean
+regret), and correlation of the predicted and true AP orderings (Spearman).
+MAE is omitted for the rules.
 
 \subsection{Baselines}
 
 We evaluate four reference rules over the discovered APs. \emph{Random choice}
-selects uniformly; its scores are the exact expected Top-1 rate and regret,
-rather than the outcome of one random draw. \emph{Strongest RSSI} selects the
-AP with the highest mean decoded-beacon RSSI. \emph{Least busy channel}
+selects uniformly. \emph{Strongest RSSI} selects the
+AP with the highest mean beacon RSSI. \emph{Least busy channel}
 selects an AP whose channel has the lowest CCA busy fraction, averaged over
 the dwells on that channel. Tied choices share selection credit and regret
 uniformly.
@@ -641,119 +702,84 @@ $\log(1+y_i)$. Validation mean regret selects the configuration and target
 transform within each family, with Spearman correlation breaking ties. The
 test topologies are held out from both fitting and selection.
 
-\subsection{Transformer Training and Objectives}
+\subsection{Transformer Training}
 
-The custom grid encoder contains 100{,}000 parameters across its two blocks;
-including the embedding and readout layers, the target-AP and joint-AP models
-have 0.313 and 0.347 million trainable parameters. Llama-3.2-1B retains
-973 million frozen parameters after removing its unused vocabulary embedding.
-Its rank-8 LoRA adapters contain 0.852 million trainable parameters; together
-with the width projections, embedding and readout layers, the target and joint
-variants train 1.330 and 1.363 million parameters, respectively.
+The custom backbone of Section~\ref{sec:backbone} contains 0.100 million
+parameters across its two blocks. The target-AP and joint-AP models built on it
+train 0.313 and 0.347 million parameters, including the embedding, decoder and
+readout layers on top of the backbone.
+
+In contrast, the LoRA backbone keeps the 973 million parameters of
+Llama-3.2-1B frozen, after removing its unused vocabulary embedding, and trains
+1.116 million: 0.852 million in its rank-8 adapters and 0.264 million in the
+width projections. With the same embedding, decoder and readout layers, the
+target-AP and joint-AP models built on it train 1.330 and 1.363 million
+parameters.
 
 We train the transformer models for 60 epochs with AdamW and cosine
-learning-rate decay. The custom models use an initial learning rate of
-$10^{-3}$ and weight decay of $10^{-2}$; the LLM variants use $10^{-4}$ for
+learning-rate decay. The models with the custom backbone use an initial
+learning rate of $10^{-3}$ and weight decay of $10^{-2}$; the LLM variants use $10^{-4}$ for
 both. Throughput predictors minimise Gaussian negative log likelihood on
 standardised $\log(1+y_i)$, averaged over the discovered APs in each batch.
 The first five epochs fit the mean with squared error before introducing
-the predicted variance.
-
-The ranking runs instead train the joint-AP model to produce scores $s_i$
-using a listwise cross-entropy loss. For one scan, let $z_i$ be the
-standardised $\log(1+y_i)$ label. For $T>0$, the target distribution $q_i$
-and predicted distribution $p_i$ are
-\begin{equation}
-\begin{aligned}
-q_i(T)&=\frac{\exp(z_i/T)}{\sum_j\exp(z_j/T)},
-&p_i&=\frac{\exp(s_i)}{\sum_j\exp(s_j)},\\
-\mathcal{L}_{\mathrm{rank}}&=-\sum_i q_i(T)\log p_i.
-\end{aligned}
-\label{eq:ranking_loss}
-\end{equation}
-The sums run over the scan's discovered APs. A smaller target temperature
-$T$ concentrates weight on higher-throughput choices; at $T=0$, only the
-best AP receives weight, shared uniformly if several tie. We average this
-loss over scans with at least two discovered APs. Ranking runs use no
-squared-error warm-up, and their outputs are scores rather than throughput
-estimates. For both objectives, validation regret selects the checkpoint,
+the predicted variance. Validation regret selects the checkpoint,
 with Spearman correlation breaking ties.
 
 \subsection{Comparison}
 
-Table~\ref{tab:v1000_results} reports throughput error (MAE), the fraction of
-scans selecting the best AP (Top-1), throughput lost by the selection (mean
-regret), and correlation of the predicted and true AP orderings (Spearman).
-MAE is omitted for the rules and ranking-only models.
+Signal strength alone picks the best AP in 62.1\% of scans and gives up
+5.26\,Mbit/s on average (Table~\ref{tab:v1000_results}). Channel occupancy
+alone does worse, at 52.5\% and 6.43\,Mbit/s. Combined under one fitted
+weight, the two reach 80.3\% and a regret of 1.39\,Mbit/s, about a quarter of
+the strongest-RSSI figure.
 
-\begin{table*}[!t]
-\caption{1{,}000-topology corpus results. MAE and mean regret are in Mbit/s.}
-\label{tab:v1000_results}
-\centering
-\footnotesize
-\begin{tabular}{@{}lcccc@{}}
-\toprule
-Model & MAE $\downarrow$ & Top-1 $\uparrow$ & Mean regret $\downarrow$ & Spearman $\uparrow$ \\
-\midrule
-\multicolumn{5}{@{}l}{\textit{Reference rules: five folds}} \\
-Random choice & --- & 0.287 $\pm$ 0.001 & 14.426 $\pm$ 0.590 & --- \\
-Strongest RSSI & --- & 0.621 $\pm$ 0.025 & 5.263 $\pm$ 0.676 & 0.615 $\pm$ 0.022 \\
-Least busy channel & --- & 0.525 $\pm$ 0.033 & 6.431 $\pm$ 0.329 & 0.391 $\pm$ 0.042 \\
-RSSI minus busy & --- & 0.803 $\pm$ 0.020 & 1.386 $\pm$ 0.138 & 0.754 $\pm$ 0.024 \\
-\addlinespace
-\multicolumn{5}{@{}l}{\textit{Tabular predictors: five folds}} \\
-Ridge regression & 4.892 $\pm$ 0.360 & 0.827 $\pm$ 0.016 & 1.031 $\pm$ 0.070 & 0.803 $\pm$ 0.008 \\
-Random forest & 2.396 $\pm$ 0.030 & 0.878 $\pm$ 0.014 & 0.508 $\pm$ 0.058 & 0.865 $\pm$ 0.007 \\
-Gradient boosting & 2.264 $\pm$ 0.082 & 0.883 $\pm$ 0.015 & 0.448 $\pm$ 0.078 & 0.866 $\pm$ 0.007 \\
-\addlinespace
-\multicolumn{5}{@{}l}{\textit{Cell transformers: five folds}} \\
-Target AP & 2.452 $\pm$ 0.414 & 0.887 $\pm$ 0.020 & 0.444 $\pm$ 0.093 & 0.879 $\pm$ 0.016 \\
-Joint AP & 2.032 $\pm$ 0.067 & 0.888 $\pm$ 0.009 & 0.422 $\pm$ 0.040 & 0.879 $\pm$ 0.015 \\
-\midrule
-\multicolumn{5}{@{}l}{\textit{Fold 0 only}} \\
-Target AP & 2.221 & 0.891 & 0.465 & 0.888 \\
-Joint AP & 2.140 & 0.890 & 0.435 & 0.871 \\
-Target AP, LoRA backbone & 2.038 & 0.886 & 0.462 & 0.885 \\
-Joint AP, LoRA backbone & 2.163 & 0.885 & 0.485 & 0.880 \\
-Joint AP, ranking loss, $T = 1$ & --- & 0.888 & 0.480 & 0.886 \\
-Joint AP, ranking loss, $T = 0.25$ & --- & 0.889 & 0.423 & 0.872 \\
-Joint AP, ranking loss, $T = 0$ & --- & 0.871 & 0.602 & 0.843 \\
-\bottomrule
-\end{tabular}
-\\[2pt]
-{\color{gray}\scriptsize Five-fold entries show mean $\pm$ standard deviation; fold-0 entries are single scores and need not represent cross-fold performance.}
-\end{table*}
+Every learned predictor improves on the rules. Ridge regression reaches a
+regret of 1.03\,Mbit/s. The random forest, gradient boosting and both
+transformers fall between 0.42 and 0.51\,Mbit/s, with Top-1 rates from 0.878
+to 0.888. The joint-AP model has the lowest mean regret, 0.422\,Mbit/s,
+against 0.444 for the target-AP model and 0.448 for gradient boosting. These
+gaps are smaller than the spread across folds. Compared fold by fold, the
+joint-AP model has lower regret than gradient boosting on three of the five
+folds, and the target-AP model on four.
 
-On fold 0, the target-AP model's mean regret is 0.465\,Mbit/s with the custom
-encoder and 0.462\,Mbit/s with the LLM backbone; the joint-AP figures are
-0.435 and 0.485\,Mbit/s. Their Top-1 rates lie between 0.885 and 0.891.
-The LLM therefore gives comparable selection performance on this fold,
-while using about four times as many trainable parameters and a much larger
-frozen backbone. Its evaluation is limited to fold 0.
+Throughput error does not track selection. The joint-AP model has the lowest
+MAE, 2.03\,Mbit/s. The target-AP model's MAE varies most across folds, and its
+fold with the highest MAE, 3.07\,Mbit/s, is also its fold with the lowest
+regret, 0.289\,Mbit/s.
 
-Across five folds, the joint-AP model achieves the lowest mean regret,
-0.422\,Mbit/s, compared with 0.444 for target AP and 0.448 for gradient
-boosting. Both transformers improve substantially on ridge regression at
-1.031\,Mbit/s, but remain close to the nonlinear tabular predictors.
+The LoRA backbone has so far been evaluated on fold 0 alone. On that fold the
+custom backbone's target-AP and joint-AP models reach regrets of 0.465 and
+0.435\,Mbit/s; with the LoRA backbone they reach 0.462 and 0.485\,Mbit/s.
+Top-1 rates move from 0.891 and 0.890 to 0.886 and 0.885. The pretrained
+backbone thus gives comparable selection on this fold, while training about
+four times as many parameters alongside 973 million frozen ones.
 
-LoRA allows the pretrained backbone to be reused while its adapters and task
-layers are fitted to another task or to deployment data. This motivates the
-LLM beyond its present selection scores, although transfer to real captures
-is untested and the custom models can also be fine-tuned.
+\subsection{Discussion}
 
-Block-causal attention also allows the LLM to encode a scan prefix without
-access to later dwells. A shorter scan requires determining the discovered
-APs and their summaries from the observed prefix. The custom encoder also
-accepts fewer cells, although its bidirectional cell representations change when later
-cells are added. One-second scan prefixes have not been evaluated, so their
-selection accuracy remains an open question.
+NetLLM~\cite{wu2024netllm} reports adapted language models outperforming
+task-specific networks on each of its networking tasks. Our fold-0 comparison
+sits closer to Tan~\emph{et al.}~\cite{tan2024useful}, who find that removing
+the language model from LLM-based time-series forecasters, or replacing it
+with a single attention layer, does not degrade forecasting. Here a two-block
+encoder trained from scratch matches the frozen 1B-parameter backbone.
 
-Gradient boosting's close performance may reflect the fixed mean offered
-rates during each scan: arrivals and contention fluctuate, but traffic
-sources do not change their mean loads or start and stop during observation.
-Window summaries may therefore capture much of the information needed for
-selection. Varying loads and bursty sessions would test the value of temporal
-modelling; we will discuss these extensions in Section~\ref{sec:future}.
+The LoRA backbone retains two properties the scores do not measure. Its
+adapters and task layers can be refitted to another task, or to captures from
+real deployments, while the backbone itself is shared, although the custom
+models can be fine-tuned as well and transfer to real captures is untested.
+Its block-causal mask also lets it encode a prefix of a scan without seeing
+later dwells. The custom backbone accepts fewer cells too, but each cell's
+representation changes as later cells arrive. A shorter window also changes
+which APs are discovered and what their descriptors hold. Neither backbone has
+been evaluated on prefixes, so selection from, for instance, one second of
+scanning remains open.
+
+Gradient boosting's closeness to the transformers may follow from how traffic
+is simulated. Arrivals and contention fluctuate within a scan, but every
+station keeps its mean load and none starts or stops during the observation,
+so summaries over the whole window may hold most of what selection needs.
+Loads that change within the scan would test what the cell sequence adds over
+those summaries.
 
 \section{Further Study}
 \label{sec:future}
@@ -769,6 +795,66 @@ Bursty sessions. Random Changes in offered rate. Stations randomly starting or s
 \subsection{Adding realism to the Simulator}
 
 \subsection{Testing Beyond the Simulated Deployment}
+
+% The appendix table is declared here, before the references, because a
+% full-width float cannot land on the page it is declared on: from here it
+% reaches the bottom of the page the appendix opens on (stfloats allows b).
+\begin{table*}[!b]
+\caption{The model inputs. Frame features are read once per decoded frame,
+aggregates once per cell over every frame it held, and descriptors once per
+discovered AP over the whole window.}
+\label{tab:inputs}
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\multicolumn{2}{@{}l}{\textbf{Frame}} \\
+\code{offset\_in\_dwell} & Where in the 110\,ms dwell the transmission began,
+0 to 1; encoded as sine--cosine pairs rather than embedded \\
+\code{gap\_log1p} & Idle time on this channel before it \\
+\code{rssi\_dbm} & Received level \\
+\code{airtime\_log1p} & The frame's own airtime, not that of the transmission
+carrying it \\
+\code{length\_log1p} & Length in bytes \\
+\code{rate\_log1p} & PHY rate \\
+\code{is\_beacon}, \code{is\_retry} & Beacon and retry flags \\
+\code{from\_ap} & The BSSID itself sent it, not one of its stations \\
+\code{of\_discovered\_ap} & Carries a discovered AP's BSSID \\
+\code{category} & Management, control or data; embedded rather than numeric \\
+\addlinespace
+\multicolumn{2}{@{}l}{\textbf{Cell aggregate}} \\
+\code{frames\_log1p}, \code{bytes\_log1p} & Frames and bytes the cell held \\
+\code{airtime\_fraction} & Their own airtimes summed, over the time listened \\
+\code{busy\_fraction} & Time with a decoded transmission on air, overlaps
+counted once \\
+\code{data\_fraction}, \code{mgmt\_fraction} & Share of frames by category \\
+\code{retry\_fraction} & Share marked retry \\
+\code{transmitters\_log1p} & Distinct transmitters; on an AP cell its own is
+left out \\
+\code{beacons\_log1p} & The AP's beacons; 0 on a channel cell \\
+\code{beacon\_rssi\_mean} & Their level; missing on a channel cell \\
+\code{rssi\_mean}, \code{rssi\_max} & Over every frame, its stations' as well as
+the AP's \\
+\code{data\_rate\_log1p} & Mean PHY rate of the data frames \\
+\code{longest\_gap\_fraction} & Longest stretch with nothing decoded, over the
+time listened \\
+\code{cca\_mean}, \code{cca\_max} & Carrier sense over the dwell; 0 on an AP
+cell \\
+\addlinespace
+\multicolumn{2}{@{}l}{\textbf{AP descriptor}} \\
+\code{beacon\_rssi\_\{mean,std,min,max,last\}} & Beacon level over the whole
+window: mean, spread, extremes, and most recent \\
+\code{beacons\_log1p} & Beacons decoded \\
+\code{bss\_airtime\_fraction} & Its BSS's summed airtime, over the time listened
+on its channel \\
+\code{bss\_transmitters\_log1p} & Distinct stations heard sending in its BSS \\
+\code{cochannel\_discovered\_aps} & Other discovered APs on its channel \\
+\code{n\_discovered\_aps} & Discovered APs in the scan \\
+\bottomrule
+\end{tabularx}
+\end{table*}
 
 \begin{thebibliography}{00}
 
@@ -829,9 +915,9 @@ A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,
 L. Kaiser, and I. Polosukhin, ``Attention is all you need,'' in \emph{Advances
 in Neural Information Processing Systems}, vol. 30, 2017, pp. 5998--6008.
 
-\bibitem{grattafiori2024llama3}
-A. Grattafiori \emph{et al.}, ``The Llama 3 herd of models,''
-arXiv:2407.21783, 2024.
+\bibitem{meta2024llama32}
+Meta, ``Llama 3.2-1B,'' model card, 2024. [Online]. Available:
+\url{https://huggingface.co/meta-llama/Llama-3.2-1B}
 
 \bibitem{su2024roformer}
 J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu, ``RoFormer: Enhanced
@@ -889,66 +975,12 @@ in \emph{Advances in Neural Information Processing Systems}, vol. 37, 2024.
 \section{Model Inputs}
 \label{app:inputs}
 
-Every number the models read, in the three groups they arrive in. Rates and
-fractions are normalized by the time actually spent listening on the relevant
-channel, not by the observation window. A \code{log1p} suffix marks a count or
-duration stored as $\log(1+x)$.
-
-\begin{table*}[!ht]
-\caption{The model inputs. Frame features are read once per decoded frame,
-aggregates once per cell over every frame it held, and descriptors once per
-discovered AP over the whole window.}
-\label{tab:inputs}
-\centering
-\footnotesize
-\begin{tabularx}{\textwidth}{@{}lX@{}}
-\toprule
-\textbf{Column} & \textbf{Meaning} \\
-\midrule
-\multicolumn{2}{@{}l}{\textbf{Frame}} \\
-\code{offset\_in\_dwell} & Where in the 110\,ms dwell the transmission began,
-0 to 1; encoded as sine--cosine pairs rather than embedded \\
-\code{gap\_log1p} & Idle time on this channel before it \\
-\code{rssi\_dbm} & Received level \\
-\code{airtime\_log1p} & The frame's own airtime, not that of the transmission
-carrying it \\
-\code{length\_log1p} & Length in bytes \\
-\code{rate\_log1p} & PHY rate \\
-\code{is\_beacon}, \code{is\_retry} & Beacon and retry flags \\
-\code{from\_ap} & The BSSID itself sent it, not one of its stations \\
-\code{of\_discovered\_ap} & Carries a discovered AP's BSSID \\
-\code{category} & Management, control or data; embedded rather than numeric \\
-\addlinespace
-\multicolumn{2}{@{}l}{\textbf{Cell aggregate}} \\
-\code{frames\_log1p}, \code{bytes\_log1p} & Frames and bytes the cell held \\
-\code{airtime\_fraction} & Their own airtimes summed, over the time listened \\
-\code{busy\_fraction} & Time with a decoded transmission on air, overlaps
-counted once \\
-\code{data\_fraction}, \code{mgmt\_fraction} & Share of frames by category \\
-\code{retry\_fraction} & Share marked retry \\
-\code{transmitters\_log1p} & Distinct transmitters; on an AP cell its own is
-left out \\
-\code{beacons\_log1p} & The AP's beacons; 0 on a channel cell \\
-\code{beacon\_rssi\_mean} & Their level; missing on a channel cell \\
-\code{rssi\_mean}, \code{rssi\_max} & Over every frame, its stations' as well as
-the AP's \\
-\code{data\_rate\_log1p} & Mean PHY rate of the data frames \\
-\code{longest\_gap\_fraction} & Longest stretch with nothing decoded, over the
-time listened \\
-\code{cca\_mean}, \code{cca\_max} & Carrier sense over the dwell; 0 on an AP
-cell \\
-\addlinespace
-\multicolumn{2}{@{}l}{\textbf{AP descriptor}} \\
-\code{beacon\_rssi\_\{mean,std,min,max,last\}} & Beacon level over the whole
-window: mean, spread, extremes, and most recent \\
-\code{beacons\_log1p} & Beacons decoded \\
-\code{bss\_airtime\_fraction} & Its BSS's summed airtime, over the time listened
-on its channel \\
-\code{bss\_transmitters\_log1p} & Distinct stations heard sending in its BSS \\
-\code{cochannel\_discovered\_aps} & Other discovered APs on its channel \\
-\code{n\_discovered\_aps} & Discovered APs in the scan \\
-\bottomrule
-\end{tabularx}
-\end{table*}
+Table~\ref{tab:inputs} lists every quantity the models read, in the three
+groups of Section~\ref{sec:model}: frame features enter the frame embedding,
+cell aggregates join each pooled cell vector, and AP descriptors build the
+decoder's query for each discovered AP. Fractions and rates are computed over
+the time the radio actually listened on the relevant channel, which is about a
+quarter of the observation window. Counts and durations marked \code{log1p}
+are stored as $\log(1+x)$.
 
 \end{document}
