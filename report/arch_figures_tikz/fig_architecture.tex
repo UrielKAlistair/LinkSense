@@ -154,18 +154,18 @@
   % down the centre from the descriptor, and the two meet at cross-attention.
   \node[data, text width=24mm, anchor=north]
        (desc) at ($(backbone.south -| descx)+(0,-15mm)$) {AP descriptor};
-  \node[read, text width=24mm, below=4.5mm of desc] (descmlp) {MLP};
+  \node[mixmlp, text width=24mm, below=4.5mm of desc] (descmlp) {MLP};
   \node[op, below=5mm of descmlp] (c5) {$+$};
   \node[tagbox, text width=20mm] (qtags) at (qtagx |- c5)
        {Learned query, \\ channel tag,\\ AP tag (joint only)};
-  \node[read, text width=26mm, below=5mm of c5] (qrow) {Question rows, one per AP};
+  \node[vector, text width=26mm, below=5mm of c5] (qrow) {Question rows, one per AP};
 
-  \node[read, optional, text width=24mm, below=6.5mm of qrow] (dself)
+  \node[selfattn, optional, text width=24mm, below=6.5mm of qrow] (dself)
        {Self-attention among rows (joint model only)};
-  \node[read, text width=31mm, anchor=north]
+  \node[selfattn, text width=31mm, anchor=north]
        (dcross) at ($(dself.south -| lanex)+(0,-4.5mm)$) {Cross-attention};
-  \node[read, text width=31mm, below=4.5mm of dcross] (dff) {Feed-forward};
-  \node[read, text width=26mm, below=7mm of dff] (head) {Norm and MLP head};
+  \node[mixmlp, text width=31mm, below=4.5mm of dcross] (dff) {Feed-forward};
+  \node[mixmlp, text width=26mm, below=7mm of dff] (head) {Norm and MLP head};
   \node[data, text width=26mm, below=4.5mm of head] (mu) {$(\mu, \log\sigma^2)$ per AP};
 
   \draw[flow] (desc) -- (descmlp);

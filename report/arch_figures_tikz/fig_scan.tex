@@ -1,0 +1,81 @@
+% fig_scan.tex -- the cyclical projection of the all-channel recording onto one
+% radio. (a) one dwell, drawn large; (b) the first cycles, the dwell of (a)
+% outlined in the same colour.
+% The channel order is the one scripts/common/projection.py draws for scan
+% t00363__c02, the deployment of Fig. 1: 48, 36, 40, 44, repeated every cycle.
+\begin{tikzpicture}[arch, x=1mm, y=1mm]
+
+  % ==================== (a) one dwell ====================
+  % Both labels hang off bounding boxes rather than fixed coordinates: each
+  % sits \labelgap below its own panel, and both centre on the box enclosing
+  % the pair, so they align with each other however the panels change width.
+  % The yshift opening (b) is the one hand-set distance in the figure.
+  \def\labelgap{-2.5mm}
+  \begin{scope}[local bounding box=bothpanels]
+  \begin{scope}[local bounding box=panelA]
+    \def\zw{62}     % 110 ms drawn this wide
+    \def\zh{-3.4}
+
+    % frames the radio decodes, and one beacon from each AP on the channel
+    \fill[embedC!50] (14.4, \zh) rectangle (16.2, 0);
+    \fill[embedC!50] (22.4, \zh) rectangle (23.6, 0);
+    \fill[embedC!50] (32.7, \zh) rectangle (34.5, 0);
+    \fill[embedC!50] (48.8, \zh) rectangle (50.1, 0);
+    \fill[tagC!75]   (8.4,  \zh) rectangle (10.0, 0);
+    \fill[tagC!75]   (42.6, \zh) rectangle (44.2, 0);
+
+    % deaf while the radio retunes, and a frame that outlasts the dwell
+    \fill[backC!60] (0, \zh) rectangle (1.2, 0);
+    \draw[readC, line width=0.6pt] (0, 0) rectangle (\zw, \zh);
+    \filldraw[draw=black!50, dashed, line width=0.4pt, fill=black!7]
+      (58.4, \zh) rectangle (65.0, 0);
+    \draw[readC, line width=0.6pt] (\zw, 0) -- (\zw, \zh);
+
+    \draw[->, black!55, line width=0.3pt] (3.6, 2.6) -- (0.7, 0.3);
+    \node[note, anchor=west] at (3.4, 3.0) {0.15\,ms retune};
+    \draw[->, black!55, line width=0.3pt] (60.4, \zh-2.5) -- (62.2, \zh-0.5);
+    \node[note, anchor=east] at (59.8, \zh-3.1) {dropped: outlasts the dwell};
+
+    \begin{scope}[yshift=-10.8mm]
+      \fill[tagC!75] (0, 0) rectangle (1.4, 2.2);
+      \node[note, anchor=west] at (2.4, 1.1) {beacon};
+      \fill[embedC!50] (16.0, 0) rectangle (17.4, 2.2);
+      \node[note, anchor=west] at (18.4, 1.1) {other decoded frame};
+    \end{scope}
+  \end{scope}
+
+  % ==================== (b) the cycle ====================
+  % x is milliseconds from the first dwell, y is millimetres.
+  \begin{scope}[local bounding box=panelB, x=0.0564mm, y=1mm, yshift=-30mm]
+    \def\bh{1.3}   % half-height of a dwell box
+    \def\rp{3.3}   % row pitch
+
+    % where each cycle ends
+    \foreach \x in {440, 880}
+      \draw[black!55, dotted, line width=0.5pt] (\x, \bh+1.6) -- (\x, -3*\rp-\bh-1.6);
+
+    % ten dwells: two and a half cycles of 48, 36, 40, 44
+    \foreach \i in {1,5,9}  \fill[embedC!50] (\i*110, -\bh)       rectangle (\i*110+110, \bh);
+    \foreach \i in {2,6}    \fill[embedC!50] (\i*110, -\rp-\bh)   rectangle (\i*110+110, -\rp+\bh);
+    \foreach \i in {3,7}    \fill[embedC!50] (\i*110, -2*\rp-\bh) rectangle (\i*110+110, -2*\rp+\bh);
+    \foreach \i in {0,4,8}  \fill[embedC!50] (\i*110, -3*\rp-\bh) rectangle (\i*110+110, -3*\rp+\bh);
+
+    % the dwell drawn out in (a)
+    \draw[readC, line width=0.6pt] (110, -\bh) rectangle (220, \bh);
+
+    \foreach \ch/\r in {36/0, 40/1, 44/2, 48/3}
+      \node[note, anchor=east] at (-70, -\r*\rp) {\ch};
+    \node[note, anchor=east] at (-70, \rp*0.8) {ch.};
+
+    \draw[brc, black!65] (0, \bh+2.2) -- (440, \bh+2.2);
+    \node[note] at (220, \bh+4.4) {one cycle, 440\,ms};
+
+    \node[note] at (1180, -1.5*\rp) {$\cdots$};
+  \end{scope}
+  \end{scope}
+
+  \node[panel, anchor=north] at ([yshift=\labelgap]panelA.south -| bothpanels)
+    {(a) One dwell: 110\,ms};
+  \node[panel, anchor=north] at ([yshift=\labelgap]panelB.south -| bothpanels)
+    {(b) Cyclical projection};
+\end{tikzpicture}

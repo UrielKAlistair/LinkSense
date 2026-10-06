@@ -25,5 +25,6 @@ report/arch_figures_tikz/*
 !report/arch_figures_tikz/archstyle.tex
 !report/arch_figures_tikz/fig_architecture.tex
 !report/arch_figures_tikz/fig_deployment.tex
+!report/arch_figures_tikz/fig_scan.tex
 # the Android rule waits on BSS Load; keep it out of the tree for now
 scripts/baselines/android_throughput.py

@@ -77,3 +77,12 @@ test split is done once, in `common/splits.py`.
         --out-dir results/table
 
 The three `--model` choices are invoked the same way.
+
+Who reads the grid in stage 2 is a second, independent flag. `--grid-reader
+native` stacks this repository's encoder blocks; `--grid-reader llm` hands the
+cells to a frozen language model under low-rank adapters instead. It combines
+with either grid model, so a pretrained backbone can be tried scoring every AP
+at once or one AP at a time.
+
+    .venv/bin/python3 scripts/tf/train.py data/cache \
+        --model target_ap --grid-reader llm --out results/llm/target
