@@ -1,4 +1,8 @@
-# Design choices V3
+As of 6 October 2026: Claude has read 1,454,837,704 input tokens (most of which is reloaded context) and written 7,528,828 output tokens for this project, which comes to $1,207 at the global per-million-token API rates. Yikes!
+
+---
+
+# Simulator Design
 
 - **Simulator:** `SpectrumWifiPhy` on one `MultiModelSpectrumChannel`, 802.11n
   at 20 MHz, Minstrel-HT, log-distance loss (n = 3) then per-link shadowing then
@@ -74,7 +78,18 @@
 
 - **Sweep passes:** as many as the 6 s window fits. It might be worth examining in the future, how the models perform with just <1 second of data. Claude decided for some reason that this should be the default and allowed only one single pass over all the channels, which silently broke my V0 results.
 
+- **Scanner PHYs only on occupied channels:** the candidate carries a scanner PHY
+  only for channels that hold an AP, so a dwell on an empty channel records no
+  frames and exactly zero CCA. A real radio would register some adjacent-channel
+  energy there, which works against the reason `SpectrumWifiPhy` was chosen over
+  Yans. Four scanner PHYs on every candidate would record that leakage and make
+  every scan uniform, at the cost of a larger cache that is mostly zeros. The
+  model gives a silent cell a learned vector in place of its pooled frames. To
+  revisit in later simulators.
+
 - **BSS Load:** not simulated and not used; still deferred.
+
+# ML Design
 
 - **Splits:** the topology, not the scan, is the unit kept whole, because the
   scans of one topology hear the same deployment and splitting them would
@@ -84,6 +99,158 @@
   tested exactly once over the rotation. The seed lives in `splits.py` rather
   than being passed in, so every model trained from this repo is tested on the
   same folds.
+
+  Initially, Claude decided to draw a 60/20/20 train/val/test split at random five times and pool the results, to get a better estimate of performance by training the
+  models more than once. 
+  Random draws are bad, I replaced it with K-fold cross-validation, a much more established methodology for the this purpose. Random draws mean that not every topology is used as a test datapoint, it also means test sets in the different runs are
+  not disjoint so how much that averaging is worth is questionable.
+
+- **Evaluation:** the reference rules, the tabular predictors and the
+  custom-backbone models are scored over all five folds, with hyperparameters and
+  checkpoints chosen on each fold's validation part, and reported as mean and
+  sample standard deviation. RSSI minus busy is the one rule with a parameter, and
+  its weight is fitted on the training scans. The LoRA backbone has only been run
+  on fold 0: one fold takes 2.5 h (joint) to 9 h (target) on the local 8 GB GPU,
+  so its five folds wait for the cluster. Its numbers compare against fold 0 of
+  the custom runs, never against their five-fold means.
+
+- **Identity in the token, and the two attention biases:** every cell token
+  carries learned vectors for what kind of cell it is, which dwell it covers,
+  which channel it was heard on and which AP it belongs to. They are summed onto
+  a normalised cell vector and drawn large enough at initialisation to be heard
+  against it. We have the opportunity to add biases to the logits in the encoder
+  and decoder layers based on the channel distance and AP identity. There is much 
+  precedent for this idea. Question: should we?
+
+  Q1: How should we initialize identity tags? 
+  
+  The cell vector out of the MLP is not Normalized after being embedded, so its magnitude can grow unconstrianed. The tags were initialized as small guassian noise and added, the tags could never become of comparable magnitude and thus attention could not learn to use these tags at all. (Cell vector ~21 magnitude, Identity tags ~0.7 magnitude)
+
+  `Normalize_MLP`: We thus considered normalise the cell vector's embedding.
+
+  `Loud Init`: We considered initalizing tags at a "loud" value, so that they find optima with strong identity components.
+
+  Q2: Should we add biases in the encoder?
+
+  The rule has precedent (T5, Swin and Graphormer all add a learned per-pair
+  scalar to the logits) but precedent is not a reason. Writing a token as content
+  plus tag and expanding an attention logit, `q·k = cᵀMc + cᵀMt + tᵀMc + tᵀMt`
+  with `M = W_QᵀW_K`, the last term is already a table over pairs of tag values —
+  the same object the bias adds. 
+
+  `Decoder Bias`: Maybe?
+
+  `Encoder Bias`: Maybe?
+
+  Now we are left with 4 variables to consider, and they are not independent by any 
+  means. The Encoder/Decoder Biases compensate for poor itag dentites, and under 
+  their presence, the tags will not need to worry so much about finding optima.
+
+  The presence of these tags could just be a stabilizing force for the model to find optimal use of the relationships, but it could just as likely happen that they prevent 
+  tag gradients from taking the tags to their optima by virtue of scalar biases being the quick and easy optimizing mechanism as opposed to the quadratic attention relationship.
+
+  |norm  |loud | dec |  enc |   arm      | regret|
+  |------|-----|-----|------|------------|-------|
+  |yes   |no   | no  |  no  |   joint_N  |  0.640|
+  |yes   |yes  | no  |  no  |   joint_M  |  0.395|
+  |------|-----|-----|------|------------|-------|
+  |no    |no   | no  |  yes |   joint_C  |  0.517|
+  |yes   |no   | no  |  yes |   joint_K  |  0.521|
+  |no    |yes  | no  |  yes |   joint_L  |  0.417|
+  |yes   |yes  | no  |  yes |   joint_E  |  0.340|
+  |yes   |yes  | yes |  yes |   joint_J  |  0.358|
+  |no    |no   | yes |  yes |   joint_A  |  0.359|
+  |------|-----|-----|------|------------|-------|
+
+  From the table: normalising alone buys nothing, loud tags alone get most of the
+  way, and the two together (0.340) beat the original model with its biases
+  (0.359). With both, the decoder bias was redundant (0.358 with it, 0.340
+  without), while removing the encoder bias as well cost 0.395, so the encoder
+  bias stayed. These arms predate the fixed codes of the next entry, which
+  replaced the normalisation and loud-init knobs; the current model keeps both biases.
+
+  The identity tag is not how a query row finds its own AP's cells. Removing AP
+  identity from the cells and the query rows moved the own-AP attention preference
+  by under 0.2 of a logit, against preferences of +0.6 to +13.7: a row finds its
+  own cells by content, since they and its descriptor carry the same beacons and
+  RSSI. Dropping the tag still cost 0.072 Mbit/s, most likely because it separates
+  APs that look alike.
+
+- **Cell tags, fixed orthogonal codes on raw content:** cell type, channel and
+  joint-AP identity take fixed, mutually orthogonal unit directions, and the dwell
+  a sinusoidal code; each codebook has one trainable length, starting at 0.5. Over
+  five folds the joint model scored 0.422 Mbit/s mean regret against 0.442 with
+  learned Gaussian tags. The gap changes sign across folds, so this is a design
+  choice rather than a measured win. The target model's three roles stay learned
+  vectors.
+
+  The content the codes are added onto is not normalised. On fold 0, normalising
+  it to unit length gave 0.537 Mbit/s and a LayerNorm gave 0.519, against 0.447
+  raw. The AP-identity length finished at 0.0056, 0.031 and 0.068 respectively:
+  the more the content was constrained, the further the model turned the identity
+  code down.
+
+- **Tags are added, not concatenated:** giving them 16 dimensions of their own and
+  leaving 48 for content was worse at every setting: 0.446 against 0.340 without
+  the decoder bias, 0.433 against 0.358 with it. A quarter of the cell width costs
+  more than a tag subspace free of content buys.
+
+- **Frame content through an MLP, frame time concatenated:** content features and
+  category go through Linear, GELU, Linear. A single linear layer makes every
+  column a weighted sum of single features, so the mean pool only recovers
+  averages the cell aggregates already hold; the MLP lets a column hold a
+  conjunction, such as a retry on a discovered AP. Time is concatenated: over five
+  folds, adding it gave 0.440 Mbit/s against 0.422, worse on four of five folds,
+  and addition had also lost in earlier runs, so only concatenation remains in the
+  code. Concatenation lost for the cell tags but wins here, likely because a
+  sinusoid has a fixed magnitude and keeps its share of the frame vector without
+  having to learn it.
+
+- **Carrier sense keeps its time axis:** the encoder averages its filters down to
+  four stretches of the dwell rather than over the whole trace. Where a busy
+  stretch fell is the only coarse link between the trace and the frames decoded
+  in the same dwell, and busy time with no decoded frame under it points to a
+  transmitter the radio could not decode.
+
+- **Two grid models on one base:** `CellGridModel` holds the cell encoder, the
+  backbone, the decoder blocks and the head; `JointAPModel` and `TargetAPModel`
+  differ only in the identity tag and in how many copies of the grid the backbone
+  reads. The joint identity does not depend on which AP is scored, so one grid
+  serves every AP; the target role does, so the grid is copied once per discovered
+  AP, which is why the target model costs about four times as much. The backbone
+  is a component, so the LoRA backbone works with either model from one flag.
+
+- **Batching:** the scans' frame tables are laid end to end and each cell's
+  member rows offset by where its scan starts, since frames are reached only
+  through cells. Padding per scan left 38% of the table as dummy frames at batch
+  size 16. Cells are pooled in eight groups of similar frame count, each padded to
+  its own largest, which is 17% of the attention work of padding every cell to
+  the batch's largest.
+
+- **LoRA backbone, how it attaches:** it replaces the custom backbone and nothing
+  else. A linear layer either side crosses between width 64 and Llama's 2048, at
+  264,256 parameters for the pair. Only the frozen weights are bfloat16, so the
+  cast happens at the backbone's boundary. The token embedding table is replaced
+  by a stub, since nothing is tokenised, which frees 525 MB. A cell may always
+  attend to itself, padding included: without that, a padded cell's row can be
+  masked in full, and the softmax over nothing is NaN, which reaches the AP rows
+  even at zero attention weight because zero times NaN is NaN.
+
+- **LoRA rank 8, not 32:** rank 32 would reproduce NetLLM's 0.31% adapter ratio,
+  but that ratio is their choice for a 7B model. Rank 8 gives 851,968 adapter
+  parameters and 1.363 million trainable in the joint model, four times the
+  custom joint model rather than twelve.
+
+- **Two optimiser defaults, resolved after parsing:** a model trained from scratch
+  and a frozen backbone under adapters want different learning rates. Requiring
+  `--lr 1e-4` on the command line would leave a forgotten flag training the
+  adapters at ten times the intended rate, which would not fail, only be wrong.
+
+- **Checkpoints carry only what trains, and record what they cannot carry:**
+  frozen parameters are dropped, which saves about 2 GB a fold for the LLM. With
+  the backbone absent, a load cannot tell which backbone trained the adapters, so
+  the checkpoint records the backbone name, the random-weight flag, the rank and
+  the grid reader, and a load refuses a run whose settings differ.
 
 - **Android as a reference rule:** AOSP's `ThroughputScorer` and
   `ThroughputPredictor` are reproduced in `baselines/android_throughput.py`, but
