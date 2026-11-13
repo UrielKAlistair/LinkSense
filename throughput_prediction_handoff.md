@@ -22,9 +22,13 @@ Done and pushed:
 - `scripts/simulate/run_sweep.py` is rewritten for v2 (section 4.1 describes it).
   Each scan runs `__draw` first, then its matched (`__apK`) or replicated (`__fN`) runs.
 - A 30-topology pilot was launched at 07:03 IST into `data/runs_v2_pilot`, log in
-  `logs/sweep_v2_pilot.log`. The heavy-compute check passed; the CPU sat at 87 C with
-  14 workers, close to the user's 90 C alarm line, so watch `sensors` and consider
-  12 workers for the full sweep.
+  `logs/sweep_v2_pilot.log`. The heavy-compute check passed before launch, but with
+  14 workers the CPU (`Tctl`) read 95 C at 07:06, above the user's 90 C alarm line.
+  The user's rule is that an agent reports this and never pauses or stops the job
+  itself. **Do not launch the full sweep at 14 workers.** Start it at 8, read
+  `sensors` after five minutes, and only raise the count if `Tctl` stays under 90 C.
+- Run time is long-tailed: light runs take 10-20 s, heavy ones over 2 minutes. The
+  sweep prints progress in scan order, so one slow scan holds the counter back.
 
 Broken by the rewrite, to fix: `scripts/tests/check_observation_identity.py` imports
 `sample_candidate`, and `scripts/tests/test_models.py` imports `Run` and
@@ -40,9 +44,10 @@ Not done, in priority order (section 4 gives the detail):
    `common/evaluate.py` and `baselines/train.py` are edited for v2 (unlabelled APs are
    NaN and masked out of the loss and the scores; checkpoints and grids are selected
    on validation MAE; regime parameters travel in `_index.npz` and as `gt_*` columns).
-   **These edits passed a syntax check only.** Run them on the pilot corpus and fix
-   what breaks: `scripts/tf/cache_dataset.py data/runs_v2_pilot --out data/cache_v2_pilot`,
-   then `build_datatable.py`, then a few epochs of `tf/train.py`. Known loose ends:
+   Smoke-tested end to end on the first 65 pilot scans: cache (63 cached, 2 scans did
+   not discover the AP they joined), datatable (71 labelled rows) and 8 epochs of the
+   joint model all ran. `baselines/train.py` is not yet run on v2. The splitter needs
+   at least 5 topologies per AP count, so it only works on a full sweep. Known loose ends:
    the ranking objective (`--objective ranking`) has no meaning under MAE selection;
    selection metrics (regret, top-1) are only meaningful on matched topologies
    (index % 10 == 0) and should be reported on those alone; `scripts/tests/test_cells.py`
