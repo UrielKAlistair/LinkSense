@@ -267,8 +267,8 @@ def prediction_rows(test, predictions, fold):
     """The fold's test rows: the identifiers and labels, the columns the slices
     are cut on, and one pred_* column per model and heuristic."""
     keep = ["topology_id", "scan_id", "ap_index", "label_throughput_mbps",
-            "gt_n_aps", "feat_ap_rssi_mean"]
-    rows = test[[c for c in keep if c in test.columns]].copy()
+            "feat_ap_rssi_mean"]
+    rows = test[keep + [c for c in test.columns if c.startswith("gt_")]].copy()
     rows["fold"] = fold
     for name, p in predictions.items():
         rows[f"pred_{name}"] = p
