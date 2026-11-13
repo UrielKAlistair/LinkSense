@@ -66,6 +66,8 @@ namespace
 //   rngSeed            seed for ns-3's radio randomness and for background
 //                      traffic up to the join
 //   futureSeed         seed for background traffic after the join
+//   redrawSessions     1 also redraws, at the join, how long each station
+//                      stays in the session or pause it is in
 //   outDir, runTag     where the outputs go
 //
 // Drawn inside from the seeds:
@@ -97,7 +99,9 @@ namespace
 // Nothing before 8 s depends on targetAP or futureSeed. Running the same
 // inputs once per AP gives the true throughput of every AP from one shared
 // observation; running them once per futureSeed gives the spread of the
-// throughput that one observation can be followed by.
+// throughput that one observation can be followed by. With redrawSessions
+// that spread includes how long the traffic heard during the observation
+// goes on, which the observation cannot tell.
 // ---------------------------------------------------------------------------
 constexpr uint16_t kBasePort = 8000;
 constexpr uint32_t kPacketSize = 1250;
@@ -179,6 +183,7 @@ struct RunConfig
     uint32_t topologySeed{1};
     uint32_t rngSeed{1};
     uint32_t futureSeed{1};
+    bool redrawSessions{false};
     std::string outDir{"runs"};
     std::string runTag;
     bool captureObservation{true};
@@ -257,6 +262,9 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("futureSeed",
                  "seeds background traffic after the candidate joins",
                  config.futureSeed);
+    cmd.AddValue("redrawSessions",
+                 "1 redraws the length of every session and pause in force at the join",
+                 config.redrawSessions);
     cmd.AddValue("outDir", "directory under which the run directory is written", config.outDir);
     cmd.AddValue("runTag", "run directory name", config.runTag);
     cmd.AddValue("captureObs",
@@ -758,6 +766,8 @@ struct BackgroundFlow
     double meanSessionS;
     double meanPauseS;
     double sessionEndS;
+    bool isInSession;
+    EventId nextSession;
 };
 
 std::vector<TrafficStreams> gTrafficStreams;
@@ -786,7 +796,9 @@ SendInSession(std::size_t sta)
     BackgroundFlow& flow = gFlows[sta];
     if (Simulator::Now().GetSeconds() >= flow.sessionEndS)
     {
-        Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
+        flow.isInSession = false;
+        flow.nextSession =
+            Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
         return;
     }
     flow.source->Send(Create<Packet>(kPacketSize));
@@ -796,9 +808,29 @@ SendInSession(std::size_t sta)
 void
 StartSession(std::size_t sta)
 {
+    gFlows[sta].isInSession = true;
     gFlows[sta].sessionEndS =
         Simulator::Now().GetSeconds() + ExponentialDraw(gFlows[sta].meanSessionS, sta);
     SendInSession(sta);
+}
+
+// Redraws how long the flow stays in the session or pause it is in. Both
+// lengths are exponential, so what remains of one is distributed like a new
+// one, and the redrawn future is as likely as the one it replaces.
+void
+RedrawSession(std::size_t sta)
+{
+    BackgroundFlow& flow = gFlows[sta];
+    if (flow.isInSession)
+    {
+        flow.sessionEndS = Simulator::Now().GetSeconds() + ExponentialDraw(flow.meanSessionS, sta);
+    }
+    else
+    {
+        flow.nextSession.Cancel();
+        flow.nextSession =
+            Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
+    }
 }
 
 // Connects the flow and puts it in a session or a pause, each with the chance
@@ -815,7 +847,8 @@ StartFlow(std::size_t sta)
     }
     else
     {
-        Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
+        flow.nextSession =
+            Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
     }
 }
 
@@ -1168,7 +1201,9 @@ main(int argc, char* argv[])
                           meanPacketGapS,
                           traffic.meanSessionS,
                           traffic.meanPauseS,
-                          0.0});
+                          0.0,
+                          false,
+                          EventId()});
         std::uniform_real_distribution<double> phase(0.0, meanPacketGapS);
         Simulator::ScheduleWithContext(
             sender->GetId(),
@@ -1195,6 +1230,17 @@ main(int argc, char* argv[])
                                    &GenerateCandidateTraffic,
                                    candidateSource,
                                    candidateInterval);
+
+    if (config.redrawSessions)
+    {
+        for (std::size_t sta = 0; sta < gFlows.size(); ++sta)
+        {
+            Simulator::ScheduleWithContext(gFlows[sta].source->GetNode()->GetId(),
+                                           Seconds(kCandidateStartS),
+                                           &RedrawSession,
+                                           sta);
+        }
+    }
 
     // Retuning is scheduled before changing the SSID at the same timestamp.
     // ns-3 executes equal-time events in insertion order, so the MAC begins
@@ -1290,6 +1336,7 @@ main(int argc, char* argv[])
     metadata << "    \"candidate_seed\": " << config.candidateSeed << ",\n";
     metadata << "    \"rng_seed\": " << config.rngSeed << ",\n";
     metadata << "    \"future_seed\": " << config.futureSeed << ",\n";
+    metadata << "    \"redraw_sessions\": " << (config.redrawSessions ? 1 : 0) << ",\n";
     metadata << "    \"n_cols\": " << config.nCols << ",\n";
     metadata << "    \"n_rooms\": " << kRoomRows * config.nCols << ",\n";
     metadata << "    \"room_size_m\": " << kRoomSizeM << ",\n";

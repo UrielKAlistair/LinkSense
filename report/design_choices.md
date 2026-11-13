@@ -312,3 +312,9 @@ the v1 simulator, which was tuned to make AP selection non-trivial; these descri
   recorded: for a saturated UDP sender they are functions of throughput.
 - **Transmit power:** 16 dBm set explicitly (ns-3's default is 16.02), so the
   association model and the channel use one number.
+- **Noise floor with sessions redrawn (`redrawSessions`):** `futureSeed` alone keeps
+  every session and pause that was in force at the join, so its replicates share
+  how long the traffic heard during the observation goes on. The observation
+  cannot tell that length, since session and pause lengths are exponential, so
+  the replicates that measure the floor redraw them at the join. The corpus runs
+  (`__draw`, `__ap`, `__f`) do not use the flag and are unchanged.

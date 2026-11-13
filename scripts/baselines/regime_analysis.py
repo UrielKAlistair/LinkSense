@@ -18,6 +18,8 @@ PROCESS, every part on the topology folds of common/splits.py:
   6. The three factors of the label, each predicted on its own: the share of
      time the candidate transmitted, the PHY rate it used and the share of its
      frames that were acknowledged.
+  7. Privileged facts: the same model given what the simulator knows and the
+     client cannot observe directly, to bound what the observation leaves out.
 
 Run:
   .venv/bin/python3 scripts/baselines/regime_analysis.py data/aggregate_v2.csv \
@@ -81,6 +83,7 @@ def main() -> int:
                             for regime in HELD_OUT_REGIMES},
         "learning_curve": learning_curve(folds, features["all"]),
         "label_factors": label_factors(table, args.runs_dir, features["all"]),
+        "privileged": privileged(table, args.runs_dir, features["all"]),
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "regime_analysis.json").write_text(json.dumps(report, indent=2))
@@ -257,6 +260,45 @@ def label_factors(table: pd.DataFrame, runs_dir: Path, columns: list[str]) -> di
             "quartiles": [round(float(q), 3) for q in sent[factor].quantile([.25, .5, .75])],
             "variance_explained": across_folds(explained),
             "log_variance": round(float(np.log(sent[factor].clip(lower=1e-3)).var()), 3)}
+    return report
+
+
+# ---------------------------------------------------------------------------
+# 7. Privileged facts
+#
+# The simulator knows the mean power the client receives from the AP, how many
+# stations the AP serves and what they offer, and the same totals for the
+# other APs on its channel. A model given these beside the features shows how
+# much of the remaining error is information the observation did not deliver.
+# ---------------------------------------------------------------------------
+
+PRIVILEGED = ("true_rx_dbm", "true_sta_count", "true_offered_mbps",
+              "true_cochannel_sta_count", "true_cochannel_offered_mbps")
+
+
+def privileged(table: pd.DataFrame, runs_dir: Path, columns: list[str]) -> dict:
+    facts = []
+    for scan_id in table.scan_id.unique():
+        aps = json.loads((runs_dir / f"{scan_id}__draw" / "metadata.json").read_text())["aps"]
+        for ap in aps:
+            others = [o for o in aps if o["channel"] == ap["channel"] and o is not ap]
+            facts.append({
+                "scan_id": scan_id, "ap_index": ap["index"],
+                "true_rx_dbm": ap["candidate_rx_dbm"],
+                "true_sta_count": ap["sta_count"],
+                "true_offered_mbps": ap["offered_mbps"],
+                "true_cochannel_sta_count": sum(o["sta_count"] for o in others),
+                "true_cochannel_offered_mbps": sum(o["offered_mbps"] for o in others)})
+    known = table.merge(pd.DataFrame(facts), on=["scan_id", "ap_index"], validate="1:1")
+
+    report = {}
+    for name, given in (("features", columns), ("privileged", list(PRIVILEGED)),
+                        ("features_and_privileged", columns + list(PRIVILEGED))):
+        errors = []
+        for fold in range(N_FOLDS):
+            train, val, test = split_by_topology(known, test_fold=fold)
+            errors.append(mae(test, fit_predict(pd.concat([train, val]), test, given)))
+        report[name] = across_folds(errors)
     return report
 
 
