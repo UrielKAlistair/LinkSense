@@ -15,15 +15,33 @@ Done and pushed:
 - The v1 binary is kept at `~/workspace/ns-3.45/build/scratch/ns3.45-my-wifi-test-v1`.
   The v1 corpus in `data/runs`, `data/cache` is untouched. Do not delete either.
 
+- Observation identity holds on v2: for one topology, `observation.csv` and
+  `chanbusy.csv` were byte-identical across three target APs and across two
+  `futureSeed` values, and a repeated run reproduced its label exactly (manual check;
+  the scripted test is not yet adapted).
+- `scripts/simulate/run_sweep.py` is rewritten for v2 (section 4.1 describes it).
+  Each scan runs `__draw` first, then its matched (`__apK`) or replicated (`__fN`) runs.
+- A 30-topology pilot was launched at 07:08 into `data/runs_v2_pilot`, log in
+  `logs/sweep_v2_pilot.log`. The heavy-compute check passed; the CPU sat at 87 C with
+  14 workers, close to the user's 90 C alarm line, so watch `sensors` and consider
+  12 workers for the full sweep.
+
+Broken by the rewrite, to fix: `scripts/tests/check_observation_identity.py` imports
+`sample_candidate`, and `scripts/tests/test_models.py` imports `Run` and
+`already_done`, none of which exist any more.
+
 Not done, in priority order (section 4 gives the detail):
 
-1. `scripts/simulate/run_sweep.py` still drives the v1 command line. Rewrite it.
-2. Observation-identity check on v2, then pilot sweep, then the full sweep.
-3. `parse_scans.py`, `cache_dataset.py`, `build_datatable.py`, `train.py` adapted to
+1. Read the pilot (unassociated fraction, label histogram, runtime tail, how often the
+   drawn target goes undiscovered by the projection), then launch the full sweep in
+   the background into `data/runs_v2` with the command in `run_sweep.py`'s docstring
+   (set `LD_LIBRARY_PATH` as below).
+2. `parse_scans.py`, `cache_dataset.py`, `build_datatable.py`, `train.py` adapted to
    scans with one labelled AP.
-4. Train the bespoke joint model and the tabular baselines; measure the noise floor.
-5. Log the choices of section 3 in `report/design_choices.md` (they are only here so far).
-6. Write the direction report for the user (section 5 is its skeleton).
+3. Train the bespoke joint model and the tabular baselines; measure the noise floor.
+4. Log the choices of section 3 and the sweep ranges in `report/design_choices.md`
+   (they are only here and in `run_sweep.py` so far).
+5. Write the direction report for the user (section 5 is its skeleton).
 
 Build and run:
 

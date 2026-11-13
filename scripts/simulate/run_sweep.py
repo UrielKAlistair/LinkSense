@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
-"""Build a dataset of ns-3 simulation observations for AP selection.
+"""Build a dataset of ns-3 simulation observations for throughput prediction.
 
-This file runs "n" Topological configurations of between 2 and 8 APs, 
-and random number of stations. Each topology is simulated once per AP,
-so that the true throughput by joining each can be known.
+This file draws deployments over a wide range of regimes and simulates clients
+arriving in them. The output is one directory per run, named at three levels:
 
-The output is one directory per run, named at three levels:
+    t00007              a topology: one deployment of rooms, APs and stations
+    t00007__c01         a scan: one client standing somewhere in it
+    t00007__c01__draw   the scan's observation, the client then joining an AP
+                        the simulator draws among those it can hear
+    t00007__c01__ap2    the same scan, the client joining AP 2 instead
+    t00007__c01__f3     the same scan and AP as __draw, with different
+                        background traffic after the join
 
-    t00007            a topology: one deployment of APs and background stations
-    t00007__c01       a candidate: that same client standing somewhere else
-    t00007__c01__ap1  a run: that candidate joining AP 1
+PROCESS
+  1. Draw each topology's regime and each scan's seeds.
+  2. Simulate every scan's __draw run, which records the observation.
+  3. In matched topologies, simulate the scan once per remaining AP.
+  4. In replicated topologies, simulate the scan's drawn AP under further
+     futures.
 
-All of a candidate's runs share one recording of the observation period, 
-so it is written to disk only once.
+Runs whose metadata.json exists are skipped, so an interrupted sweep resumes.
+
+Run:
+  .venv/bin/python3 scripts/simulate/run_sweep.py \
+      --binary ~/workspace/ns-3.45/build/scratch/ns3.45-my-wifi-test \
+      --out-dir data/runs_v2 --n-topologies 1000 --workers 14
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import dataclasses
 import json
 import math
 import random
@@ -26,276 +39,155 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple
 
+# The floor has two rows of rooms, so a topology of n_cols columns has
+# 2 * n_cols rooms, and at most one AP per room.
+ROOM_ROWS = 2
+N_COLS = (2, 6)
+MAX_APS = 8
 
-class Run(NamedTuple):
-    """Everything one invocation of the simulator needs.
+# Every topology draws its regime from these ranges, the starred ones on a
+# logarithmic scale.
+MEAN_OCCUPANCY = (0.3, 4.0)      # * stations per room
+OCCUPANCY_SHAPE = (0.3, 10.0)    # * small crowds a few rooms
+LOAD_MEDIAN_MBPS = (0.3, 10.0)   # * per station, while in a session
+DOWNLINK_FRACTION = (0.0, 1.0)
+TCP_FRACTION = (0.0, 1.0)
 
-    topology and candidate are dicts of ns-3 command-line arguments, passed
-    through unchanged; target_ap picks which AP the client joins, and rng_seed
-    drives fading, contention and rate control. tag is the output directory.
-    """
-    tag: str
-    topology: dict
-    candidate: dict
-    target_ap: int
-    rng_seed: int
-
-
-# ---------------------------------------------------------------------------
-# The script has four stages:
-#
-# plan_runs turns the command line into a list of Runs. For each topology it
-# draws a deployment (sample_topology) and a few places for the client to stand
-# in it (sample_candidate), then emits one Run per candidate per AP. Nothing is
-# simulated yet; this is only the plan.
-#
-# merge_manifest writes that plan into the output directory, so a later stage
-# can tell what the directory is meant to contain. reconcile decides whether an
-# entry already recorded there is the same topology asked for more candidates,
-# which is allowed, or a different topology under the same name, which is not.
-#
-# already_done checks if any given Run has already been simulated and stored.
-# This lets an interrupted sweep restart without redoing
-#
-# We then simulate the runs that are left, several at a time with multithreading.
-#
-# Three seeds divide the randomness, and every one of them is drawn here and
-# resolved inside the simulator:
-#
-#     topologySeed   AP lattice, channel assignment, station positions and
-#                    offered loads, associations, shadowing among them
-#     candidateSeed  where the client stands, and its own shadowing links
-#     rngSeed        fading, contention, rate control
-#
-# Holding topologySeed while varying candidateSeed is what lets one deployment
-# be sampled from several places with its background left untouched.
-# ---------------------------------------------------------------------------
-
-
-def plan_runs(args) -> tuple[list[Run], dict]:
-    """Every run this sweep should produce, and the manifest describing them."""
-    runs = []
-    manifest = {}
-    for topology_index in range(args.n_topologies):
-        topology_id = f"t{topology_index:05d}"
-        # One generator per purpose, keyed by topology, so drawing more
-        # candidates cannot shift the topology draws and topology 500 does not
-        # depend on the 499 before it. String seeds, not hash(), which is
-        # randomised per process.
-        key = f"{args.sweep_seed}:{topology_id}"
-        topology_rng = random.Random(f"topology:{key}")
-        candidate_rng = random.Random(f"candidates:{key}")
-        seed_rng = random.Random(f"seeds:{key}")
-
-        topology = sample_topology(topology_rng)
-        candidates = [sample_candidate(candidate_rng)
-                      for _ in range(args.candidates_per_topology)]
-        rng_seeds = [seed_rng.randrange(1, 2**31 - 1) for _ in candidates]
-        manifest[topology_id] = {"topology": topology, "candidates": candidates,
-                                 "seeds": rng_seeds}
-
-        for index, (candidate, rng_seed) in enumerate(zip(candidates, rng_seeds)):
-            for target_ap in range(topology["nAPs"]):
-                runs.append(Run(f"{topology_id}__c{index:02d}__ap{target_ap}",
-                                topology, candidate, target_ap, rng_seed))
-    return runs, manifest
-
-
-def sample_topology(rng: random.Random) -> dict:
-    """One deployment: how many APs and stations, and which APs are hotspots."""
-    n_aps = rng.choice([2, 3, 4, 6, 8])
-
-    sta_counts = [rng.choice([3, 4, 5]) for _ in range(n_aps)]
-
-    max_hotspots = math.ceil(n_aps / 3)
-    if rng.random() < 0.25:
-        hotspot_count = 0
-    else:
-        hotspot_count = rng.choices(range(1, max_hotspots + 1),
-                                    weights=range(max_hotspots, 0, -1))[0]
-    hotspot_aps = sorted(rng.sample(range(n_aps), hotspot_count))
-
-    return {
-        "nAPs": n_aps,
-        "nSTAs": sum(sta_counts),
-        "hotspotAPs": ",".join(map(str, hotspot_aps)) if hotspot_aps else "none",
-        "topologySeed": rng.randrange(1, 2**31 - 1),
-    }
-
-
-def sample_candidate(rng: random.Random) -> dict:
-    """Where the client stands: a seed the simulator draws a uniform position from."""
-    return {"candidateSeed": rng.randrange(1, 2**31 - 1)}
-
-
-def merge_manifest(out_dir: Path, manifest: dict) -> None:
-    """Add this sweep's topologies to the manifest, keeping earlier ones."""
-    path = out_dir / "_manifest.json"
-    stored = json.loads(path.read_text()) if path.exists() else {}
-    merged = dict(stored)
-    conflicts = []
-    for topology_id, entry in manifest.items():
-        agreed = (reconcile(stored[topology_id], entry)
-                  if topology_id in stored else entry)
-        if agreed is None:
-            conflicts.append(topology_id)
-        else:
-            merged[topology_id] = agreed
-    if conflicts:
-        sys.exit(f"manifest already describes {len(conflicts)} of these topologies "
-                 f"differently (first: {conflicts[:3]}). Use a new --out-dir, or "
-                 "delete this one to start over.")
-    kept = len(set(stored) - set(manifest))
-    path.write_text(json.dumps(merged, indent=2))
-    if kept:
-        print(f"manifest: {len(manifest)} topologies written, {kept} earlier ones kept")
-
-
-def reconcile(stored: dict, fresh: dict) -> dict | None:
-    """Merge one topology's old and new manifest entries, or None if they clash.
-
-    Topologies must be identical. Candidate and seed lists need only agree where
-    they overlap; the longer list wins.
-    """
-    if stored["topology"] != fresh["topology"]:
-        return None
-    merged = {"topology": fresh["topology"]}
-    for key in ("candidates", "seeds"):
-        old, new = stored[key], fresh[key]
-        longer, shorter = (old, new) if len(old) >= len(new) else (new, old)
-        if longer[:len(shorter)] != shorter:
-            return None
-        merged[key] = longer
-    return merged
-
-
-def already_done(out_dir: Path, run: Run) -> bool:
-    """True only when the files hold the exact run being asked for."""
-    topology, candidate = run.topology, run.candidate
-    run_dir = out_dir / run.tag
-    metadata = run_dir / "metadata.json"
-    # the simulator writes metadata last, so its absence means the run died
-    if not metadata.exists() or metadata.stat().st_size == 0:
-        return False
-    try:
-        stored = json.loads(metadata.read_text())
-        params = stored["params"]
-        expected_hotspots = ([] if topology["hotspotAPs"] == "none" else
-                             [int(value) for value in topology["hotspotAPs"].split(",")])
-        matches = (
-            stored["rng_seed"] == run.rng_seed and
-            stored["candidate"]["target_ap"] == run.target_ap and
-            params["topology_seed"] == topology["topologySeed"] and
-            params["n_aps"] == topology["nAPs"] and
-            params["n_stas"] == topology["nSTAs"] and
-            params["hotspot_aps"] == expected_hotspots and
-            stored["candidate_seed"] == candidate["candidateSeed"]
-        )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return False
-    if not matches:
-        return False
-    if run.target_ap != 0:
-        return True
-    # ap0 carries the recording the candidate's runs share
-    observation = run_dir / "observation.csv"
-    channel_busy = run_dir / "chanbusy.csv"
-    return (observation.exists() and observation.stat().st_size > 1000 and
-            channel_busy.exists() and channel_busy.stat().st_size > 100)
-
-
-def simulate(binary: str, out_dir: Path, run: Run,
-             timeout: float) -> tuple[bool, str]:
-    """Invoke the simulator once, returning success and any failure message."""
-    settings = {
-        **run.topology,
-        **run.candidate,
-        "outDir": out_dir,
-        "runTag": run.tag,
-        "targetAP": run.target_ap,
-        "rngSeed": run.rng_seed,
-        # a candidate's runs all hear the same thing, so only the first records it
-        "captureObs": 1 if run.target_ap == 0 else 0,
-    }
-    args = [binary] + [f"--{key}={value}" for key, value in settings.items()]
-
-    try:
-        proc = subprocess.run(args, capture_output=True, text=True,
-                              timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return False, f"TIMEOUT {run.tag}"
-    if proc.returncode != 0:
-        return False, (f"FAILED {run.tag} rc={proc.returncode}\n"
-                       f"{proc.stderr[-1200:]}")
-    if not (out_dir / run.tag / "metadata.json").exists():
-        return False, f"NO METADATA {run.tag}"
-    return True, ""
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--n-topologies", type=int, default=200,
-                        help="each expands to candidates x nAPs runs")
-    parser.add_argument("--candidates-per-topology", type=int, default=3,
-                        help="candidate positions sampled within each topology")
-    parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--sweep-seed", type=int, default=1234)
-    parser.add_argument("--timeout", type=float, default=900.0)
-    args = parser.parse_args()
-
-    if not args.binary.exists():
-        sys.exit(f"binary not found: {args.binary}")
-    for name in ("n_topologies", "candidates_per_topology", "workers"):
-        if getattr(args, name) < 1:
-            sys.exit(f"--{name.replace('_', '-')} must be at least 1")
-    return args
+SCANS_PER_TOPOLOGY = 5
+# One topology in MATCHED_EVERY is simulated once per AP, and the next one
+# under FUTURES_PER_REPLICATED_SCAN futures.
+MATCHED_EVERY = 10
+FUTURES_PER_REPLICATED_SCAN = 5
 
 
 def main():
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    scans = plan_scans(args)
+    print(f"{args.n_topologies} topologies -> {len(scans)} scans, "
+          f"{args.workers} at a time, writing to {args.out_dir}", flush=True)
 
-    runs, manifest = plan_runs(args)
-    merge_manifest(args.out_dir, manifest)
+    started, n_runs, n_failed = time.time(), 0, 0
+    with concurrent.futures.ThreadPoolExecutor(args.workers) as pool:
+        finished = pool.map(lambda scan: simulate_scan(args, scan), scans)
+        for done, (runs, failed) in enumerate(finished, start=1):
+            n_runs, n_failed = n_runs + runs, n_failed + failed
+            if done % 20 == 0 or done == len(scans):
+                minutes = (time.time() - started) / 60
+                print(f"[{done}/{len(scans)} scans] runs={n_runs} fail={n_failed} "
+                      f"elapsed={minutes:.1f}m "
+                      f"eta={minutes * (len(scans) - done) / done:.1f}m", flush=True)
+    sys.exit(1 if n_failed else 0)
 
-    finished, pending = [], []
-    for run in runs:
-        target = finished if already_done(args.out_dir, run) else pending
-        target.append(run)
-    print(f"{args.n_topologies} topologies x {args.candidates_per_topology} "
-          f"candidates -> {len(runs)} runs ({len(finished)} resumed, "
-          f"{len(pending)} pending), {args.workers} at a time")
-    print(f"writing to {args.out_dir}")
 
-    start = time.time()
-    n_ok = len(finished)
-    n_fail = 0
-    # threads, not processes: every run is a subprocess, so the GIL is idle
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = [pool.submit(simulate, str(args.binary), args.out_dir, run,
-                            args.timeout)
-                for run in pending]
-        for done, fut in enumerate(concurrent.futures.as_completed(futs), 1):
-            ok, msg = fut.result()
-            n_ok += ok
-            n_fail += not ok
-            if not ok:
-                print(msg, file=sys.stderr)
-            if done % 50 == 0 or done == len(pending):
-                elapsed = time.time() - start
-                rate = done / elapsed if elapsed else 0
-                eta = (len(pending) - done) / rate if rate else 0
-                print(f"[{len(finished) + done}/{len(runs)}] ok={n_ok} "
-                      f"fail={n_fail} elapsed={elapsed / 60:.1f}m eta={eta / 60:.1f}m")
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--n-topologies", type=int, default=1000)
+    parser.add_argument("--workers", type=int, default=14)
+    parser.add_argument("--sweep-seed", type=int, default=1234)
+    parser.add_argument("--timeout", type=float, default=1800.0,
+                        help="seconds one run may take")
+    return parser.parse_args()
 
-    print(f"done in {(time.time() - start) / 60:.1f}m: ok={n_ok} fail={n_fail}")
-    return 1 if n_fail else 0
+
+# ---------------------------------------------------------------------------
+# 1. The plan
+#
+# A topology is a regime and a seed; a scan adds the client's seeds. Every
+# draw comes from a generator keyed by the sweep seed and the topology's
+# number, so growing the sweep leaves the earlier topologies as they were.
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class Scan:
+    """One client in one topology: the simulator's arguments, less the target."""
+
+    tag: str
+    arguments: dict
+    is_matched: bool
+    is_replicated: bool
+
+
+def plan_scans(args) -> list[Scan]:
+    scans = []
+    for index in range(args.n_topologies):
+        rng = random.Random(f"topology:{args.sweep_seed}:{index}")
+        topology = sample_topology(rng)
+        for candidate in range(SCANS_PER_TOPOLOGY):
+            scans.append(Scan(
+                tag=f"t{index:05d}__c{candidate:02d}",
+                arguments={**topology,
+                           "candidateSeed": rng.randrange(1, 2**31 - 1),
+                           "rngSeed": rng.randrange(1, 2**31 - 1)},
+                is_matched=index % MATCHED_EVERY == 0,
+                is_replicated=index % MATCHED_EVERY == 1))
+    return scans
+
+
+def sample_topology(rng: random.Random) -> dict:
+    """One deployment's regime, as simulator arguments."""
+    log_uniform = lambda low, high: math.exp(rng.uniform(math.log(low), math.log(high)))  # noqa: E731
+    n_cols = rng.randint(*N_COLS)
+    return {
+        "topologySeed": rng.randrange(1, 2**31 - 1),
+        "nCols": n_cols,
+        "nAPs": rng.randint(2, min(MAX_APS, ROOM_ROWS * n_cols)),
+        "meanOccupancy": round(log_uniform(*MEAN_OCCUPANCY), 4),
+        "occupancyShape": round(log_uniform(*OCCUPANCY_SHAPE), 4),
+        "loadMedianMbps": round(log_uniform(*LOAD_MEDIAN_MBPS), 4),
+        "downlinkFraction": round(rng.uniform(*DOWNLINK_FRACTION), 4),
+        "tcpFraction": round(rng.uniform(*TCP_FRACTION), 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2-4. The runs of one scan
+#
+# The __draw run comes first because the simulator picks its target AP, and
+# the other runs are defined by it: the matched runs cover the APs it did not
+# pick, the replicated runs repeat the one it did.
+# ---------------------------------------------------------------------------
+
+def simulate_scan(args, scan: Scan) -> tuple[int, int]:
+    """Simulates the scan's runs; returns how many it ran and how many failed."""
+    drawn = simulate(args, f"{scan.tag}__draw", scan.arguments,
+                     {"targetAP": -1, "captureObs": 1})
+    if drawn is None:
+        return 1, 1
+
+    target = drawn["candidate"]["target_ap"]
+    extras = []
+    if scan.is_matched:
+        extras = [(f"{scan.tag}__ap{ap}", {"targetAP": ap})
+                  for ap in range(scan.arguments["nAPs"]) if ap != target]
+    elif scan.is_replicated:
+        extras = [(f"{scan.tag}__f{future}", {"targetAP": target, "futureSeed": future})
+                  for future in range(2, FUTURES_PER_REPLICATED_SCAN + 1)]
+    outcomes = [simulate(args, tag, scan.arguments, {**extra, "captureObs": 0})
+                for tag, extra in extras]
+    return 1 + len(outcomes), sum(outcome is None for outcome in outcomes)
+
+
+def simulate(args, tag: str, arguments: dict, extra: dict) -> dict | None:
+    """Runs the simulator once and returns its metadata, or None if it failed."""
+    metadata_path = args.out_dir / tag / "metadata.json"
+    if not metadata_path.exists():
+        command = [str(args.binary), f"--outDir={args.out_dir}", f"--runTag={tag}",
+                   *(f"--{name}={value}" for name, value in {**arguments, **extra}.items())]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            print(f"TIMEOUT {tag}", flush=True)
+            return None
+        if result.returncode != 0 or not metadata_path.exists():
+            print(f"FAILED {tag}: {result.stderr.strip()[-300:]}", flush=True)
+            return None
+    return json.loads(metadata_path.read_text())
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
