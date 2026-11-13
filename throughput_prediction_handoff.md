@@ -54,6 +54,23 @@ resumes if restarted with the same command (in `run_sweep.py`'s docstring, plus
 what exists at any time is a valid smaller corpus. Check `sensors` now and then; the
 rule on temperature above applies.
 
+Status at 07:16 IST:
+
+- **Temperature, for the user to decide:** with only the 8-worker sweep running,
+  `Tctl` still reads 95.1 C, steady, CPU fan at 7,700 RPM. That is over the user's
+  90 C line. The first session did not pause or stop the sweep, because the user's
+  rule forbids an agent doing so; the options are `kill -STOP 18098` /
+  `kill -CONT 18098` to pause and resume `run_sweep.py` (its children finish their
+  current run), or stopping it. Nobody but the user takes either.
+- `scripts/tests/check_observation_identity.py` is adapted and passes on 4 scans
+  (all target APs and a second `futureSeed`). `scripts/tests/test_models.py` still
+  imports `Run` and `already_done` and fails at import.
+- `baselines/train.py` runs on the pilot datatable. On 145 pilot scans (about 100
+  for training, AP-count stratum flattened by hand in a scratch copy): random forest
+  MAE 6.3 Mbit/s, gradient boosting 6.4, ridge 8.4. These are smoke-test numbers on
+  a corpus far too small to report; all they suggest is that v2 has headroom above
+  its noise floor of roughly 0.8.
+
 Not done, in priority order (section 4 gives the detail):
 
 1. While the sweep runs: cache what exists (`scripts/tf/cache_dataset.py data/runs_v2
