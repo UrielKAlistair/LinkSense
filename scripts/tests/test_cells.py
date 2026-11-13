@@ -7,8 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.tf.cache_dataset import (CCA_SAMPLES, NO_AP, Cell, DescriptorTable,
-                                         Dwell, FrameTable, build_scan)
+from scripts.tf.cache_dataset import (CCA_SAMPLES, NO_AP, REGIME_PARAMETERS, Cell,
+                                         DescriptorTable, Dwell, FrameTable, build_scan)
 from scripts.common.projection import (DWELL_S, MISSING_RSSI_DBM, TYPE_CTRL, TYPE_DATA,
                                        TYPE_MGMT, dwell_bounds, dwell_of, sweep_rng,
                                        sweep_schedule)
@@ -30,7 +30,7 @@ def cell(frames, cca=(), ap_mac=None):
     """A cell of a one-dwell scan that listened from 0 to 0.1 s: its channel
     cell, or, given AP_ONE, that AP's cell."""
     dwell = Dwell(0, 36, 0.0, 0.0, 0.1, list(frames), list(cca))
-    table = FrameTable([dwell], [DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})])
+    table = FrameTable([dwell], [DiscoveredAP(0, AP_ONE, 36, 12.0, {})])
     return Cell(table, dwell) if ap_mac is None else Cell(table, dwell, 0, ap_mac)
 
 
@@ -112,7 +112,7 @@ class FrameRowTests(unittest.TestCase):
         flags = [(row["from_ap"], row["of_discovered_ap"])
                  for row in FrameTable.frame_features(dwell, {AP_ONE})]
         self.assertEqual(flags, [(1.0, 1.0), (0.0, 0.0), (0.0, 0.0)])
-        table = FrameTable([dwell], [DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})])
+        table = FrameTable([dwell], [DiscoveredAP(0, AP_ONE, 36, 12.0, {})])
         self.assertEqual(table.categories.tolist(), [TYPE_MGMT, TYPE_CTRL, TYPE_DATA])
 
     def test_the_gap_is_idle_time_since_the_last_transmission_ended(self):
@@ -133,7 +133,7 @@ class FrameRowTests(unittest.TestCase):
 
 class DescriptorTests(unittest.TestCase):
     def test_levels_come_from_beacons_not_from_the_stations_of_the_bss(self):
-        ap = DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})
+        ap = DiscoveredAP(0, AP_ONE, 36, 12.0, {})
         frames = ([frame(0.3, 0.31, ta=AP_ONE, beacon=True, cat=TYPE_MGMT, rssi=-50.0),
                    frame(0.4, 0.41, ta=AP_ONE, beacon=True, cat=TYPE_MGMT, rssi=-52.0)]
                   + [frame(0.5 + i / 100, 0.51 + i / 100, rssi=-80.0) for i in range(10)])
@@ -144,7 +144,7 @@ class DescriptorTests(unittest.TestCase):
         self.assertAlmostEqual(row["bss_transmitters_log1p"], float(np.log1p(1)))
 
     def test_one_beacon_gives_a_level_and_no_spread(self):
-        ap = DiscoveredAP(0, AP_ONE, 36, 12.0, True, {})
+        ap = DiscoveredAP(0, AP_ONE, 36, 12.0, {})
         beacon = frame(0.3, 0.31, ta=AP_ONE, beacon=True, cat=TYPE_MGMT, rssi=-50.0)
         row = DescriptorTable.ap_descriptor(ap, [beacon], 1.428, cochannel=0,
                                             n_discovered_aps=2)
@@ -160,12 +160,13 @@ class BuildScanTests(unittest.TestCase):
         channels = {AP_ONE: schedule[0], AP_TWO: next(c for c in schedule if c != schedule[0])}
         runs = {}
         for index, mac in enumerate((AP_ONE, AP_TWO)):
-            run = root / f"{scan_id}__ap{index}"
+            run = root / f"{scan_id}__{'draw' if index == 0 else 'ap1'}"
             run.mkdir()
             runs[index] = run
             run.joinpath("metadata.json").write_text(json.dumps({
-                "run_id": f"{scan_id}__ap{index}",
-                "params": {"feature_window_end": 6.0, "n_aps": 2, "n_hotspots": 0},
+                "run_id": run.name,
+                "params": {"feature_window_end": 6.0, "n_aps": 2,
+                           **dict.fromkeys(REGIME_PARAMETERS, 1.0)},
                 "aps": [{"index": 0, "mac": AP_ONE}, {"index": 1, "mac": AP_TWO}],
                 "candidate": {"target_ap": index, "throughput_mbps": 10.0 + index,
                               "associated": 1},
@@ -191,7 +192,7 @@ class BuildScanTests(unittest.TestCase):
                 busy.append(f"{millisecond / 1000},{(millisecond + 1) / 1000},{channel},"
                             f"{5000 + 5 * channel},0.25")
         runs[0].joinpath("chanbusy.csv").write_text("\n".join(busy) + "\n")
-        return Scan(scan_id, scan_id.split("__")[0], runs)
+        return Scan(scan_id, scan_id.split("__")[0], runs[0], (runs[1],))
 
     def test_a_scan_becomes_one_cell_per_dwell_plus_one_per_ap_dwell(self):
         with tempfile.TemporaryDirectory() as tmp:

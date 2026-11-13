@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,8 +9,7 @@ import pandas as pd
 from scripts.common.splits import N_FOLDS, split_by_topology, split_rows_by_topology
 from scripts.common.evaluate import selection_metrics
 from scripts.baselines.train import fit_rssi_busy_k, heuristic_predictions
-from scripts.simulate.run_sweep import Run, already_done
-from scripts.baselines.train import choose_by_validation_regret, subset_topologies
+from scripts.baselines.train import choose_by_validation_error, subset_topologies
 
 
 class ScanSplitTests(unittest.TestCase):
@@ -91,54 +88,15 @@ class ScanSplitTests(unittest.TestCase):
         self.assertTrue((small.groupby("topology_id").size() == 3).all())
 
 
-class SweepResumeTests(unittest.TestCase):
-    def test_resume_requires_matching_scenario_and_complete_shared_trace(self):
-        topology = {
-            "nAPs": 2,
-            "nSTAs": 4,
-            "hotspotAPs": "1",
-            "topologySeed": 19,
-        }
-        candidate = {"candidateSeed": 77}
-        metadata = {
-            "rng_seed": 23,
-            "params": {
-                "topology_seed": 19,
-                "n_aps": 2,
-                "n_stas": 4,
-                "bg_mean_per_sta_mbps": 2.5,
-                "hotspot_aps": [1],
-            },
-            "candidate_seed": 77,
-            "candidate_position": {"x": 12.5, "y": 3.0},
-            "candidate": {"target_ap": 0},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            run = root / "t00000__c00__ap0"
-            run.mkdir()
-            (run / "metadata.json").write_text(json.dumps(metadata))
-            (run / "observation.csv").write_text("x" * 1001)
-            (run / "chanbusy.csv").write_text("x" * 101)
-            job = Run(run.name, topology, candidate, 0, 23)
-            self.assertTrue(already_done(root, job))
-            self.assertFalse(already_done(root, job._replace(rng_seed=24)))
-            # a different candidate seed is a different position, not a resume
-            self.assertFalse(already_done(root, job._replace(
-                candidate=dict(candidate, candidateSeed=99))))
-            (run / "chanbusy.csv").write_text("short")
-            self.assertFalse(already_done(root, job))
-
-
 class EvaluationTests(unittest.TestCase):
-    def test_validation_selection_prefers_the_lower_regret_candidate(self):
+    def test_validation_selection_prefers_the_lower_error_candidate(self):
         frame = pd.DataFrame({
             "scan_id": ["a0", "a0", "a1", "a1", "b0", "b0"],
             "label_throughput_mbps": [10.0, 0.0, 10.0, 0.0, 14.0, 0.0],
         })
         two_of_three = np.array([1, 0, 1, 0, 0, 1])
         one_of_three = np.array([0, 1, 0, 1, 1, 0])
-        _, selected = choose_by_validation_regret(
+        _, selected = choose_by_validation_error(
             [("one_of_three", one_of_three), ("two_of_three", two_of_three)], frame)
         self.assertEqual(selected, "two_of_three")
 

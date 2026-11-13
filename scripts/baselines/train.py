@@ -152,7 +152,7 @@ def fit_models(train, val, test, feats, n_test_fold):
             for cfg in grid:
                 cands.append(((cfg, is_log_target),
                               predict(fit(cfg, is_log_target), X_va, is_log_target)))
-        (regret, _), (cfg, is_log_target) = choose_by_validation_regret(cands, val)
+        (mae, _), (cfg, is_log_target) = choose_by_validation_error(cands, val)
 
         # So the winner is fitted a second time, now to predict the test rows too.
         m = fit(cfg, is_log_target)
@@ -160,7 +160,7 @@ def fit_models(train, val, test, feats, n_test_fold):
             store[name] = predict(m, X, is_log_target)
         chosen[name] = {k: v for k, v in cfg.items() if k not in ("random_state", "n_jobs")}
         chosen[name].update(is_log_target=is_log_target,
-                            val_topology_regret=round(regret, 4))
+                            val_mae_mbps=round(mae, 4))
     return val_pred, test_pred, chosen
 
 
@@ -170,8 +170,8 @@ def to_xy(df: pd.DataFrame, feature_cols: list[str]):
     return X, y
 
 
-def choose_by_validation_regret(candidates, val):
-    """Return the (key, payload) of the candidate that decides best on validation.
+def choose_by_validation_error(candidates, val):
+    """Return the (key, payload) of the candidate with the lowest validation error.
 
     `candidates` pairs an arbitrary payload - whatever the caller needs to
     rebuild or look up the winner - with that candidate's validation
