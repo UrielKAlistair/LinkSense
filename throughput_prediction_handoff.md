@@ -8,16 +8,15 @@ with messages in the user's format (imperative subject, bulleted body of
 
 ## 1. Where things stand
 
-**Status at 11:15 IST, which supersedes the rest of this section:** the full sweep
-finished at 11:01 (1,000 topologies, 8,790 runs, no failures) and is cached in
-`data/cache_v2` and `data/aggregate_v2.csv`. The tabular baselines and the regime
-analysis have run; the bespoke joint model is training (five folds, about 30 minutes
-each, log `results/v2/joint_ap_train.log`). The results and the recommendation are
-in `throughput_prediction_report.md`. The unit tests in `scripts/tests` pass again.
-Still open from the list below: the ranking objective under MAE selection, and
-folds that stratify on AP count only.
+**Status at 13:35 IST, which supersedes the rest of this section:** everything
+planned has run. The full sweep (1,000 topologies, 8,790 runs) is cached in
+`data/cache_v2` and `data/aggregate_v2.csv`; the tabular baselines, the regime
+analysis and five folds of the bespoke joint model are in `results/v2/`; a second
+set of noise-floor replicates is in `data/runs_v2_redraw`. The results and the
+recommendation are in `throughput_prediction_report.md`, which is the document to
+read. The unit tests in `scripts/tests` pass. No job is running.
 
-Done and pushed:
+Done and pushed (history of the morning):
 
 - `sim/my-wifi-test.cc` is simulator v2 (commit `bf105d0`). It builds and six pilot
   runs gave sane output (8-48 s wall time each; labels 0, 0.2, 2.7, 22, 27, 31 Mbit/s).
