@@ -68,6 +68,8 @@ namespace
 //   futureSeed         seed for background traffic after the join
 //   redrawSessions     1 also redraws, at the join, how long each station
 //                      stays in the session or pause it is in
+//   printLossMatrix    1 prints the loss between every pair of nodes (APs,
+//                      then stations, then the candidate) and exits
 //   outDir, runTag     where the outputs go
 //
 // Drawn inside from the seeds:
@@ -184,6 +186,7 @@ struct RunConfig
     uint32_t rngSeed{1};
     uint32_t futureSeed{1};
     bool redrawSessions{false};
+    bool printLossMatrix{false};
     std::string outDir{"runs"};
     std::string runTag;
     bool captureObservation{true};
@@ -265,6 +268,9 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("redrawSessions",
                  "1 redraws the length of every session and pause in force at the join",
                  config.redrawSessions);
+    cmd.AddValue("printLossMatrix",
+                 "1 prints the loss in dB between every pair of nodes and exits",
+                 config.printLossMatrix);
     cmd.AddValue("outDir", "directory under which the run directory is written", config.outDir);
     cmd.AddValue("runTag", "run directory name", config.runTag);
     cmd.AddValue("captureObs",
@@ -992,6 +998,18 @@ main(int argc, char* argv[])
     Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(kTcpSegmentBytes));
 
     Topology topology = BuildTopology(config);
+    if (config.printLossMatrix)
+    {
+        for (const std::vector<double>& row : topology.lossDb)
+        {
+            for (double loss : row)
+            {
+                std::cout << loss << " ";
+            }
+            std::cout << "\n";
+        }
+        return 0;
+    }
     const uint32_t nStas = topology.staPositions.size();
     const uint32_t targetAp = topology.targetAp;
 
