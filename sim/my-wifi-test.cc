@@ -70,6 +70,8 @@ namespace
 //                      stays in the session or pause it is in
 //   printLossMatrix    1 prints the loss between every pair of nodes (APs,
 //                      then stations, then the candidate) and exits
+//   printSessionsAtJoin  1 simulates up to the join, prints 1 or 0 per
+//                      station for whether it is in a session then, and exits
 //   outDir, runTag     where the outputs go
 //
 // Drawn inside from the seeds:
@@ -187,6 +189,7 @@ struct RunConfig
     uint32_t futureSeed{1};
     bool redrawSessions{false};
     bool printLossMatrix{false};
+    bool printSessionsAtJoin{false};
     std::string outDir{"runs"};
     std::string runTag;
     bool captureObservation{true};
@@ -271,6 +274,9 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("printLossMatrix",
                  "1 prints the loss in dB between every pair of nodes and exits",
                  config.printLossMatrix);
+    cmd.AddValue("printSessionsAtJoin",
+                 "1 simulates up to the join, prints which stations are in a session, and exits",
+                 config.printSessionsAtJoin);
     cmd.AddValue("outDir", "directory under which the run directory is written", config.outDir);
     cmd.AddValue("runTag", "run directory name", config.runTag);
     cmd.AddValue("captureObs",
@@ -1313,6 +1319,18 @@ main(int argc, char* argv[])
     std::cout << "run=" << config.runTag << " topologySeed=" << config.topologySeed
               << " rngSeed=" << config.rngSeed << " nAPs=" << config.nAps
               << " nSTAs=" << nStas << " targetAP=" << targetAp << std::endl;
+
+    if (config.printSessionsAtJoin)
+    {
+        Simulator::Stop(Seconds(kCandidateStartS));
+        Simulator::Run();
+        for (const BackgroundFlow& flow : gFlows)
+        {
+            std::cout << "session " << (flow.isInSession ? 1 : 0) << "\n";
+        }
+        Simulator::Destroy();
+        return 0;
+    }
 
     Simulator::Stop(Seconds(kSimulationStopS));
     Simulator::Run();
