@@ -15,10 +15,13 @@ PROCESS, every part on the topology folds of common/splits.py:
      the upper half, and the reverse, beside a fit on as many topologies drawn
      from the whole range.
   5. A learning curve over the share of training topologies.
+  6. The three factors of the label, each predicted on its own: the share of
+     time the candidate transmitted, the PHY rate it used and the share of its
+     frames that were acknowledged.
 
 Run:
   .venv/bin/python3 scripts/baselines/regime_analysis.py data/aggregate_v2.csv \
-      --out-dir results/v2/regime_analysis
+      --runs-dir data/runs_v2 --out-dir results/v2/regime_analysis
 """
 
 from __future__ import annotations
@@ -56,6 +59,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("dataset", type=Path)
+    parser.add_argument("--runs-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
 
@@ -76,6 +80,7 @@ def main() -> int:
         "held_out_regime": {regime: held_out(table, regime, features["all"])
                             for regime in HELD_OUT_REGIMES},
         "learning_curve": learning_curve(folds, features["all"]),
+        "label_factors": label_factors(table, args.runs_dir, features["all"]),
     }
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "regime_analysis.json").write_text(json.dumps(report, indent=2))
@@ -207,6 +212,51 @@ def learning_curve(folds, columns: list[str]) -> dict:
             errors.append(mae(test, fit_predict(train[train[TOPOLOGY_COL].isin(kept)],
                                                 test, columns)))
         report[str(share)] = across_folds(errors)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# 6. The factors of the label
+#
+# A saturated sender's throughput is close to the product of three things the
+# simulator counts: the share of time it transmitted, the PHY rate of its data
+# frames and the share of them acknowledged. Each is fitted on its own, on the
+# rows whose AP the scan's recording joined and where the candidate sent data.
+# ---------------------------------------------------------------------------
+
+FACTORS = ("airtime_share", "phy_rate_mbps", "delivery_ratio")
+
+
+def label_factors(table: pd.DataFrame, runs_dir: Path, columns: list[str]) -> dict:
+    """How much of each factor's variance the features explain, and how much
+    of the label's log variance each factor carries."""
+    rows = []
+    for scan_id, scan in table.groupby("scan_id"):
+        candidate = json.loads(
+            (runs_dir / f"{scan_id}__draw" / "metadata.json").read_text())["candidate"]
+        joined = scan[scan.ap_index == candidate["target_ap"]]
+        if len(joined) and candidate["data_frames_sent"] > 0:
+            rows.append(joined.iloc[[0]].assign(
+                airtime_share=candidate["transmit_seconds"] / candidate["observed_seconds"],
+                phy_rate_mbps=candidate["mean_phy_rate_mbps"],
+                delivery_ratio=candidate["data_frames_acked"] / candidate["data_frames_sent"]))
+    sent = pd.concat(rows, ignore_index=True)
+
+    report = {"rows": len(sent)}
+    for factor in FACTORS:
+        explained = []
+        for fold in range(N_FOLDS):
+            train, val, test = split_by_topology(sent, test_fold=fold)
+            train = pd.concat([train, val], ignore_index=True)
+            model = HistGradientBoostingRegressor(max_iter=400, learning_rate=0.05,
+                                                  random_state=0)
+            model.fit(train[columns], train[factor])
+            residual = test[factor] - model.predict(test[columns])
+            explained.append(1.0 - residual.var() / test[factor].var())
+        report[factor] = {
+            "quartiles": [round(float(q), 3) for q in sent[factor].quantile([.25, .5, .75])],
+            "variance_explained": across_folds(explained),
+            "log_variance": round(float(np.log(sent[factor].clip(lower=1e-3)).var()), 3)}
     return report
 
 
