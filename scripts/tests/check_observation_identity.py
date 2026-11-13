@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Check that every run of a scan hears the same thing before the candidate joins.
 
-A scan is one deployment and one candidate position, simulated once per target
-AP. This draws scans with run_sweep.py's sampler and, for each:
+A scan is one deployment and one candidate position. This draws scans with
+run_sweep.py's sampler and, for each:
 
-  1. runs every target AP with the observation recorded, and requires
-     observation.csv and chanbusy.csv to be byte-identical across them and to
-     hold at least one frame;
+  1. runs every target AP, and the first AP again under another futureSeed,
+     with the observation recorded, and requires observation.csv and
+     chanbusy.csv to be byte-identical across them and to hold at least one
+     frame;
   2. reruns the last target AP without recording, and requires its
      metadata.json to be byte-identical to the recorded run's.
 
@@ -28,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from scripts.simulate.run_sweep import sample_candidate, sample_topology  # noqa: E402
+from scripts.simulate.run_sweep import sample_topology  # noqa: E402
 
 
 def plan_scans(n_scans: int, seed: int) -> list[dict]:
@@ -36,7 +37,8 @@ def plan_scans(n_scans: int, seed: int) -> list[dict]:
     scans = []
     for index in range(n_scans):
         rng = random.Random(f"identity:{seed}:{index}")
-        scans.append({**sample_topology(rng), **sample_candidate(rng),
+        scans.append({**sample_topology(rng),
+                      "candidateSeed": rng.randrange(1, 2**31 - 1),
                       "rngSeed": rng.randrange(1, 2**31 - 1)})
     return scans
 
@@ -82,6 +84,8 @@ def main() -> int:
             for target_ap in range(scan["nAPs"]):
                 jobs.append((recorded_dir, f"s{index:02d}__ap{target_ap}",
                              {**scan, "targetAP": target_ap, "captureObs": 1}))
+            jobs.append((recorded_dir, f"s{index:02d}__future",
+                         {**scan, "targetAP": 0, "futureSeed": 2, "captureObs": 1}))
             jobs.append((unrecorded_dir, f"s{index:02d}__ap{last_ap}",
                          {**scan, "targetAP": last_ap, "captureObs": 0}))
 
@@ -92,15 +96,16 @@ def main() -> int:
         all_passed = True
         for index, scan in enumerate(scans):
             runs = [recorded_dir / f"s{index:02d}__ap{ap}" for ap in range(scan["nAPs"])]
+            recordings = runs + [recorded_dir / f"s{index:02d}__future"]
             n_frames = len((runs[0] / "observation.csv").read_text().splitlines()) - 1
-            observation_same = identical([run / "observation.csv" for run in runs])
-            busy_same = identical([run / "chanbusy.csv" for run in runs])
+            observation_same = identical([run / "observation.csv" for run in recordings])
+            busy_same = identical([run / "chanbusy.csv" for run in recordings])
             metadata_same = identical([runs[-1] / "metadata.json",
                                        unrecorded_dir / runs[-1].name / "metadata.json"])
             passed = n_frames > 0 and observation_same and busy_same and metadata_same
             all_passed = all_passed and passed
             print(f"[{'PASS' if passed else 'FAIL'}] scan {index}: "
-                  f"nAPs={scan['nAPs']} nSTAs={scan['nSTAs']} frames={n_frames}  "
+                  f"nAPs={scan['nAPs']} frames={n_frames}  "
                   f"observation {'same' if observation_same else 'DIFFERENT'}, "
                   f"chanbusy {'same' if busy_same else 'DIFFERENT'}, "
                   f"metadata without recording {'same' if metadata_same else 'DIFFERENT'}")
