@@ -252,6 +252,14 @@ As of 6 October 2026: Claude has read 1,454,837,704 input tokens (most of which 
   the checkpoint records the backbone name, the random-weight flag, the rank and
   the grid reader, and a load refuses a run whose settings differ.
 
+- **A run resumes from its last epoch:** a target-AP LoRA fold takes about 9.5 h
+  on the laptop, longer than it stays on, so `train.py` rewrites
+  `progress.pt` after every epoch with the finished folds and the fold in training
+  (trainable weights, optimiser, schedule, random streams, best epoch so far). The
+  file is written aside and renamed, so a stop mid-write leaves the previous copy.
+  A restart with other settings is refused. Tested on CPU: a run killed mid-fold
+  and restarted matched an uninterrupted one in every selection metric.
+
 - **Android as a reference rule:** AOSP's `ThroughputScorer` and
   `ThroughputPredictor` are reproduced in `baselines/android_throughput.py`, but
   nothing imports that file and no Android number is reported. The rule needs the

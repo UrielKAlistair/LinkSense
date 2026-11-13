@@ -22,6 +22,8 @@ OUTPUT, in out_dir (results/<model> unless given)
   training.json     per fold: the epoch kept and the validation curve
   fold<k>.pt        the model kept for fold k, with the statistics its inputs
                     were standardised by
+  progress.pt       the run so far, rewritten after every epoch: started again
+                    with the same settings, a run carries on from it
 
 PROCESS, per fold
   1. Take the scans of fold k as the test set and of fold k+1 as the
@@ -50,6 +52,7 @@ import argparse
 import dataclasses
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -105,7 +108,8 @@ LLM_OPTIMISER = OptimiserDefaults(lr=1e-4, weight_decay=1e-4)
 Z_50, Z_90 = 0.6745, 1.6449
 
 
-def run_fold(cache: Cache, fold: int, args: argparse.Namespace) -> tuple[pd.DataFrame, dict]:
+def run_fold(cache: Cache, fold: int, args: argparse.Namespace,
+             progress: Progress | None) -> tuple[pd.DataFrame, dict]:
     """Train and score one fold: one row per model and reference rule, and the
     record of its training."""
     # 1. Split by topology, this fold testing and the next validating.
@@ -125,7 +129,7 @@ def run_fold(cache: Cache, fold: int, args: argparse.Namespace) -> tuple[pd.Data
         torch.manual_seed(fold)
         model = build_model(cache, args)
         record = train(model, cache, train_scans, val_scans, scale, args,
-                       np.random.default_rng(fold))
+                       np.random.default_rng(fold), fold, progress)
         torch.save({"model": args.model, "grid_reader": args.grid_reader,
                     "objective": args.objective,
                     "state_dict": trainable_state(model),
@@ -251,6 +255,59 @@ def load_fold(cache: Cache, fold: int, args: argparse.Namespace
             f"its entries are unexpected {list(unexpected)[:3]}")
     print(f"    scoring the model saved in {path}", flush=True)
     return model, Scale.restore(checkpoint["scale"]), {"loaded": str(path)}
+
+
+# ---------------------------------------------------------------------------
+# Progress on disk
+# ---------------------------------------------------------------------------
+
+# A run can be stopped at any moment and started again. After every epoch it
+# rewrites one file holding the folds it has finished and, for the fold in
+# training, everything the next epoch depends on. A stop costs the epoch it
+# interrupts and nothing else.
+
+class Progress:
+    """The run so far, in out_dir/progress.pt.
+
+    `finished` maps each finished fold to its scores and training record.
+    `training` is the fold in training at the end of its latest epoch: its
+    trainable weights, optimiser, schedule, random streams and best epoch so
+    far, or None between folds.
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        self.path = args.out / "progress.pt"
+        self.settings = {name: str(value) for name, value in vars(args).items()}
+        self.finished, self.training = {}, None
+        if self.path.exists():
+            saved = torch.load(self.path, map_location="cpu", weights_only=False)
+            if saved["settings"] != self.settings:
+                raise SystemExit(f"{self.path} was written by a run with other "
+                                 "settings; move it aside to start afresh")
+            self.finished, self.training = saved["finished"], saved["training"]
+
+    def resume(self, fold: int) -> dict | None:
+        """The saved state of this fold's training, if it was stopped midway."""
+        if self.training is not None and self.training["fold"] == fold:
+            return self.training
+        return None
+
+    def end_epoch(self, fold: int, state: dict) -> None:
+        self.training = {"fold": fold, **state}
+        self.save()
+
+    def end_fold(self, fold: int, results: pd.DataFrame, record: dict) -> None:
+        self.finished[fold] = (results.to_dict("records"), record)
+        self.training = None
+        self.save()
+
+    def save(self) -> None:
+        # Written aside and then renamed over the old file in one step, so a
+        # stop mid-write leaves the previous epoch's file whole.
+        partial = self.path.with_suffix(".partial")
+        torch.save({"settings": self.settings, "finished": self.finished,
+                    "training": self.training}, partial)
+        os.replace(partial, self.path)
 
 
 # ---------------------------------------------------------------------------
@@ -425,13 +482,14 @@ class Scale:
 
 def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
           val_scans: np.ndarray, scale: Scale, args: argparse.Namespace,
-          rng: np.random.Generator) -> dict:
+          rng: np.random.Generator, fold: int, progress: Progress) -> dict:
     """Fit the model for args.epochs epochs, and leave it holding the epoch
     whose means give the lowest validation regret, Spearman breaking ties.
 
     The learning rate falls from args.lr to zero along a cosine, one step per
     batch. Only epochs that trained on the full likelihood are kept, so the
-    model kept has a variance that was trained.
+    model kept has a variance that was trained. Each epoch ends by saving its
+    state to `progress`, and a fold found there carries on from it.
     """
     # Only what trains: the llm model's backbone is frozen, and handing its
     # parameters to AdamW would have it carry moment estimates for a billion of
@@ -442,7 +500,24 @@ def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
     batches = math.ceil(len(train_scans) / args.batch_size)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs * batches)
     best_key, best_epoch, best_state, curve = (math.inf, math.inf), None, None, []
-    for epoch in range(args.epochs):
+    first_epoch = 0
+
+    saved = progress.resume(fold)
+    if saved is not None:
+        model.load_state_dict(saved["weights"], strict=False)
+        optimizer.load_state_dict(saved["optimizer"])
+        schedule.load_state_dict(saved["schedule"])
+        best_key, best_epoch = saved["best_key"], saved["best_epoch"]
+        best_state, curve = saved["best_state"], saved["curve"]
+        rng.bit_generator.state = saved["numpy_rng"]
+        torch.set_rng_state(saved["torch_rng"])
+        if saved["cuda_rng"] is not None:
+            torch.cuda.set_rng_state_all(saved["cuda_rng"])
+        first_epoch = saved["epoch"] + 1
+        print(f"    carrying on from epoch {first_epoch}, saved in {progress.path}",
+              flush=True)
+
+    for epoch in range(first_epoch, args.epochs):
         started = time.time()
         model.train()
         # The warm-up exists so the variance cannot widen before the mean is
@@ -486,6 +561,15 @@ def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
             # device every time validation improves.
             best_state = {k: v.detach().clone()
                           for k, v in trainable_state(model).items()}
+
+        progress.end_epoch(fold, {
+            "epoch": epoch, "weights": trainable_state(model),
+            "optimizer": optimizer.state_dict(), "schedule": schedule.state_dict(),
+            "best_key": best_key, "best_epoch": best_epoch,
+            "best_state": best_state, "curve": curve,
+            "numpy_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+            "cuda_rng": (torch.cuda.get_rng_state_all()
+                         if torch.cuda.is_available() else None)})
 
     # Frozen parameters are absent from best_state and did not move, so they are
     # the only keys a load is allowed to find missing.
@@ -795,6 +879,7 @@ def main() -> int:
                  else [args.only_fold])
     args.out = args.out or Path("results") / args.model
     args.out.mkdir(parents=True, exist_ok=True)
+    progress = None if args.evaluate_only else Progress(args)
 
     started = time.time()
     cache = Cache(args.cache_dir)
@@ -804,7 +889,14 @@ def main() -> int:
     results, records = [], {}
     for fold in rotations:
         print(f"\n--- fold {fold} ---", flush=True)
-        fold_results, record = run_fold(cache, fold, args)
+        if progress is not None and fold in progress.finished:
+            rows, record = progress.finished[fold]
+            fold_results = pd.DataFrame(rows)
+            print(f"    finished earlier, read from {progress.path}", flush=True)
+        else:
+            fold_results, record = run_fold(cache, fold, args, progress)
+            if progress is not None:
+                progress.end_fold(fold, fold_results, record)
         fold_results.insert(0, "fold", fold)
         results.append(fold_results)
         records[f"fold{fold}"] = record
