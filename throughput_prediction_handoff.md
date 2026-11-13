@@ -21,7 +21,7 @@ Done and pushed:
   the scripted test is not yet adapted).
 - `scripts/simulate/run_sweep.py` is rewritten for v2 (section 4.1 describes it).
   Each scan runs `__draw` first, then its matched (`__apK`) or replicated (`__fN`) runs.
-- A 30-topology pilot was launched at 07:08 into `data/runs_v2_pilot`, log in
+- A 30-topology pilot was launched at 07:03 IST into `data/runs_v2_pilot`, log in
   `logs/sweep_v2_pilot.log`. The heavy-compute check passed; the CPU sat at 87 C with
   14 workers, close to the user's 90 C alarm line, so watch `sensors` and consider
   12 workers for the full sweep.

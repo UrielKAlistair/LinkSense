@@ -268,3 +268,47 @@ As of 6 October 2026: Claude has read 1,454,837,704 input tokens (most of which 
   rejected: it is the medium as the client hears it rather than as the AP hears
   it, and it is already an input to our own models, so it would compare a feature
   rather than compare Android. The file waits on BSS Load.
+
+# Simulator v2: throughput prediction
+
+The task became throughput prediction on 2026-11-13. The entries above describe
+the v1 simulator, which was tuned to make AP selection non-trivial; these describe
+`sim/my-wifi-test.cc` and `scripts/simulate/run_sweep.py` as they are now.
+
+- **Regimes are sampled, not tuned:** every nuisance parameter is a per-topology
+  draw recorded in `metadata.json`. A regressor is judged on coverage of the
+  regime space, so no single value has to be defended; the ranges do.
+- **Path loss:** TGax residential model at 5 GHz (IEEE 802.11-14/0980r16), with
+  5 dB per wall and 5 dB iid shadowing per link. It replaces a log-distance
+  exponent of 3 that had no source.
+- **Floor:** two rows of 10 m rooms, as in the TGax residential scenario; 2 to 6
+  columns. The upper bound is a choice, made to bound run time.
+- **AP placement:** distinct rooms at random, uniform inside the room (TGax
+  residential). 2 to 8 APs; 8 is the v1 maximum and within the models' 16 identities.
+- **Stations:** a room's count is Poisson with a gamma-distributed mean. Mean
+  occupancy is log-uniform on 0.3 to 4 per room and the gamma shape log-uniform on
+  0.3 to 10; both ranges are choices. Small shapes give crowded rooms, which
+  replaces the hotspot discs.
+- **Background traffic:** each station has one flow; uplink or downlink and UDP or
+  TCP by per-topology probabilities uniform on 0 to 1. Sessions and pauses are
+  exponential, their means log-uniform on 0.3 to 30 s per station: from under one
+  sweep pass to longer than the run. That range is a choice. Without on/off
+  traffic the listening window is close to a sufficient statistic of the future.
+- **Offered load:** log-normal per station, sigma 0.9 as before, the median
+  log-uniform on 0.3 to 10 Mbit/s per topology (a choice). The cap is 80 Mbit/s,
+  above the top PHY rate, so capped stations are full-buffer as in TGax.
+- **TCP flows:** the same Poisson offer written to a TCP socket (Cubic,
+  1448-byte segments), ending at the AP. A bulk transfer and a wired segment
+  behind the AP are not modelled; this is a shortcut.
+- **Target AP:** drawn among APs whose mean power at the candidate is at least
+  -88 dBm, 6 dB under preamble detection (a choice). One label per scan buys more
+  distinct observations per simulated second than one label per AP.
+- **Matched and replicated topologies:** one topology in ten is simulated once
+  per AP, to score selection as a secondary metric; another one in ten repeats the
+  drawn AP under 5 futures, which measures the label's spread given the
+  observation. Both fractions are choices.
+- **Extra labels:** per-second delivered bytes, transmit time, mean PHY rate,
+  data frames sent and acknowledged, association delay. Delay and loss were not
+  recorded: for a saturated UDP sender they are functions of throughput.
+- **Transmit power:** 16 dBm set explicitly (ns-3's default is 16.02), so the
+  association model and the channel use one number.
