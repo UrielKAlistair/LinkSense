@@ -36,10 +36,19 @@ Not done, in priority order (section 4 gives the detail):
    drawn target goes undiscovered by the projection), then launch the full sweep in
    the background into `data/runs_v2` with the command in `run_sweep.py`'s docstring
    (set `LD_LIBRARY_PATH` as below).
-2. `parse_scans.py`, `cache_dataset.py`, `build_datatable.py`, `train.py` adapted to
-   scans with one labelled AP.
+2. `parse_scans.py`, `cache_dataset.py`, `build_datatable.py`, `tf/train.py`,
+   `common/evaluate.py` and `baselines/train.py` are edited for v2 (unlabelled APs are
+   NaN and masked out of the loss and the scores; checkpoints and grids are selected
+   on validation MAE; regime parameters travel in `_index.npz` and as `gt_*` columns).
+   **These edits passed a syntax check only.** Run them on the pilot corpus and fix
+   what breaks: `scripts/tf/cache_dataset.py data/runs_v2_pilot --out data/cache_v2_pilot`,
+   then `build_datatable.py`, then a few epochs of `tf/train.py`. Known loose ends:
+   the ranking objective (`--objective ranking`) has no meaning under MAE selection;
+   selection metrics (regret, top-1) are only meaningful on matched topologies
+   (index % 10 == 0) and should be reported on those alone; `scripts/tests/test_cells.py`
+   still builds v1 metadata; the splits stratify on AP count only.
 3. Train the bespoke joint model and the tabular baselines; measure the noise floor.
-4. Log the choices of section 3 and the sweep ranges in `report/design_choices.md`
+4. (done) Choices are logged in `report/design_choices.md`, section "Simulator v2".
    (they are only here and in `run_sweep.py` so far).
 5. Write the direction report for the user (section 5 is its skeleton).
 

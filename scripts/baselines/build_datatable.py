@@ -207,14 +207,17 @@ def main() -> int:
         rows.extend(scan_rows(
             args.cache_dir / f"{scan_id}.npz", str(scan_id), str(index["topology_ids"][i - 1]),
             {"gt_n_aps": int(index["configured_n_aps"][i - 1]),
-             "gt_n_hotspots": int(index["n_hotspots"][i - 1])}, names))
+             **{f"gt_{name}": float(value) for name, value
+                in zip(index["regime_parameters"], index["regimes"][i - 1])}}, names))
         if i % 500 == 0 or i == len(index["scan_ids"]):
             print(f"[{i}/{len(index['scan_ids'])}] {len(rows)} rows", flush=True)
 
     # imported here rather than at module scope: only writing needs it
     import pandas as pd
 
-    table = pd.DataFrame(rows)
+    # Features are computed over every discovered AP; only the APs a run
+    # joined carry a label and make a row.
+    table = pd.DataFrame(rows).dropna(subset=["label_throughput_mbps"])
     args.out.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(args.out, index=False)
     print(f"wrote {len(table)} rows x {len(table.columns)} cols "

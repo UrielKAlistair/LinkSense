@@ -173,18 +173,11 @@ def _rank_correlation(pred: np.ndarray, label: np.ndarray) -> float | None:
 def validation_selection_key(frame: pd.DataFrame, pred: np.ndarray) -> tuple[float, float]:
     """Score one candidate configuration on validation; smaller sorts better.
 
-    The first term is mean regret over the validation scans. The second breaks
-    ties on within-scan ordering: regret bottoms out at zero as soon as
-    a configuration gets every validation scan right, and on a few hundred
-    scans several will, leaving the winner decided by the order the grid
-    happens to be written in.
+    `pred` is a throughput in Mbps per row of `frame`. The first term is the
+    mean absolute error, the second breaks ties on the root mean squared error.
     """
-    metrics = selection_metrics(frame, pred)
-    regret = metrics["mean_regret_mbps"]
-    spearman = metrics["mean_spearman"]
-    # A frame in which no scan has an orderable label leaves spearman
-    # undefined; fall back to regret alone rather than sorting on NaN.
-    return regret, -spearman if np.isfinite(spearman) else 0.0
+    metrics = regression_metrics(frame[LABEL_COL].to_numpy(), pred)
+    return metrics["mae"], metrics["rmse"]
 
 
 # ---------------------------------------------------------------------------

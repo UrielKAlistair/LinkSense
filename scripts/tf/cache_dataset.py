@@ -2,7 +2,7 @@
 """Cache each scan as the cells its models read.
 
 INPUT
-  All simulated observation data: runs_dir and _manifest.json written by run_sweep.py
+  All simulated observation data: runs_dir written by run_sweep.py
 
 OUTPUT
   <scan_id>.npz per scan, and _index.npz naming the scans, their topologies and
@@ -37,6 +37,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import functools
+import json
 import math
 import statistics
 import sys
@@ -105,11 +106,18 @@ DESCRIPTOR_FEATURES = (
 )
 
 
+# What the sweep drew for a scan's topology, kept in the index so results can
+# be split and reported by regime.
+REGIME_PARAMETERS = ("n_rooms", "n_stas", "mean_occupancy", "occupancy_shape",
+                     "load_median_mbps", "downlink_fraction", "tcp_fraction",
+                     "bg_total_offered_mbps")
+
+
 def build_scan(scan: Scan, out_dir: Path) -> dict | None:
     """Write one scan's .npz cache, and return what the index and the closing
     summary need to know about it.
 
-    None when the scan offers no choice, which find_discovered_aps already reports.
+    None when the scan has no label, which find_discovered_aps already reports.
     """
     # 1. Project onto one radio, and cut what it heard into dwells.
     projected = project(scan.recording, scan.scan_id, all_channels=False)
@@ -144,17 +152,20 @@ def build_scan(scan: Scan, out_dir: Path) -> dict | None:
         cca_samples=np.stack([cell.carrier_sense for cell in cells
                               if cell.is_channel]),
         descriptors=descriptors.features,
+        # NaN for a discovered AP that no run joined
         labels=np.array([ap.throughput_mbps for ap in discovered_aps], np.float32),
+        replicate_labels=np.array(
+            [label for ap in discovered_aps for label in ap.replicate_mbps], np.float32),
         ap_indices=np.array([ap.index for ap in discovered_aps], np.int16),
         ap_channels=np.array([ap.channel for ap in discovered_aps], np.uint8),
     )
-    params = discovered_aps[0].metadata["params"]
+    params = json.loads((scan.recording / "metadata.json").read_text())["params"]
     return {
         "scan_id": scan.scan_id,
         "topology_id": scan.topology_id,
         "n_discovered_aps": len(discovered_aps),
         "n_aps": int(params["n_aps"]),
-        "n_hotspots": int(params["n_hotspots"]),
+        "regime": [float(params[name]) for name in REGIME_PARAMETERS],
         "n_cells": len(cells),
         "n_frames": len(table.heard),
         "feature_names": (table.feature_names, list(cells[0].aggregates),
@@ -472,7 +483,8 @@ def main() -> int:
         topology_ids=np.array([row["topology_id"] for row in index]),
         n_discovered_aps=np.array([row["n_discovered_aps"] for row in index], np.int16),
         configured_n_aps=np.array([row["n_aps"] for row in index], np.int16),
-        n_hotspots=np.array([row["n_hotspots"] for row in index], np.int16),
+        regimes=np.array([row["regime"] for row in index], np.float32),
+        regime_parameters=np.array(REGIME_PARAMETERS),
         frame_features=np.array(frame_names),
         cell_aggregates=np.array(aggregate_names),
         descriptor_features=np.array(descriptor_names),

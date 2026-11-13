@@ -444,7 +444,8 @@ class Scale:
         self.ap_cells = ColumnScale(
             [scan.cell_aggregates[~scan.cell_is_channel] for scan in scans])
         self.descriptors = ColumnScale([scan.descriptors for scan in scans])
-        targets = np.log1p(np.concatenate([scan.labels for scan in scans]).astype(np.float64))
+        labels = np.concatenate([scan.labels for scan in scans]).astype(np.float64)
+        targets = np.log1p(labels[np.isfinite(labels)])
         self.target_mean, self.target_std = float(targets.mean()), float(targets.std())
 
     def aggregates(self, scan: CachedScan) -> np.ndarray:
@@ -544,16 +545,17 @@ def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
             losses.append(loss.item())
 
         mu, _ = predict(model, cache, val_scans, scale, args)
-        # The epoch kept is the one that decides best, ordered as the baselines
-        # order their grid. Only the ranking within a scan is read, so the
-        # standardised means serve as scores without being turned back to Mbps.
-        key = validation_selection_key(ap_frame(cache, val_scans), np.concatenate(mu))
+        # The epoch kept is the one that predicts best, ordered as the baselines
+        # order their grid.
+        val_frame = ap_frame(cache, val_scans)
+        key = validation_selection_key(
+            val_frame, throughput_mbps(labelled(cache, val_scans, mu), scale))
         curve.append({"epoch": epoch, "train_loss": float(np.mean(losses)),
-                      "val_regret_mbps": key[0], "val_spearman": -key[1],
+                      "val_mae_mbps": key[0], "val_rmse_mbps": key[1],
                       "lr": schedule.get_last_lr()[0],
                       "seconds": round(time.time() - started, 1)})
         print(f"    epoch {epoch:3d}  train {np.mean(losses):8.4f}  "
-              f"val regret {key[0]:.4f}  {time.time() - started:5.1f}s", flush=True)
+              f"val MAE {key[0]:.4f}  {time.time() - started:5.1f}s", flush=True)
         if keepable and key < best_key:
             best_key, best_epoch = key, epoch
             # What trains, and not the frozen backbone beside it: keeping the
@@ -574,8 +576,8 @@ def train(model: CellModel, cache: Cache, train_scans: np.ndarray,
     # Frozen parameters are absent from best_state and did not move, so they are
     # the only keys a load is allowed to find missing.
     model.load_state_dict(best_state, strict=False)
-    return {"best_epoch": best_epoch, "best_val_regret_mbps": best_key[0],
-            "best_val_spearman": -best_key[1], "curve": curve}
+    return {"best_epoch": best_epoch, "best_val_mae_mbps": best_key[0],
+            "best_val_rmse_mbps": best_key[1], "curve": curve}
 
 
 def autocast(device: str):
@@ -636,7 +638,7 @@ def listnet_loss(score: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
 def make_batch(scans: list[CachedScan], scale: Scale, args: argparse.Namespace,
                rng: np.random.Generator | None) -> tuple[CellBatch, torch.Tensor, torch.Tensor]:
     """Scans padded into one CellBatch, with their standardised targets and
-    which APs are real.
+    which APs carry a label.
 
     Given rng, the batch is for training: a cell holding more than
     args.frame_cap frames keeps a random subset of them, and the APs take
@@ -665,7 +667,7 @@ def make_batch(scans: list[CachedScan], scale: Scale, args: argparse.Namespace,
     cell_mask = np.zeros((n_scans, n_cells), bool)
     descriptors = np.zeros((n_scans, n_aps, scans[0].descriptors.shape[1]), np.float32)
     ap_channel, ap_identity = (np.zeros((n_scans, n_aps), np.int64) for _ in range(2))
-    ap_mask = np.zeros((n_scans, n_aps), bool)
+    ap_mask, is_labelled = (np.zeros((n_scans, n_aps), bool) for _ in range(2))
     target = np.zeros((n_scans, n_aps), np.float32)
 
     for g, scan in enumerate(scans):
@@ -691,7 +693,8 @@ def make_batch(scans: list[CachedScan], scale: Scale, args: argparse.Namespace,
         descriptors[g, :aps] = scale.descriptors(scan.descriptors)
         ap_channel[g, :aps], ap_identity[g, :aps] = scan.ap_channels, identities
         ap_mask[g, :aps] = True
-        target[g, :aps] = scale.target(scan.labels)
+        is_labelled[g, :aps] = np.isfinite(scan.labels)
+        target[g, :aps] = scale.target(np.nan_to_num(scan.labels))
 
     to = lambda array: torch.from_numpy(array).to(args.device)  # noqa: E731
     batch = CellBatch(
@@ -702,7 +705,7 @@ def make_batch(scans: list[CachedScan], scale: Scale, args: argparse.Namespace,
         cell_channel=to(channel), cell_ap_identity=to(cell_identity),
         cell_mask=to(cell_mask), descriptors=to(descriptors),
         ap_channel=to(ap_channel), ap_identity=to(ap_identity), ap_mask=to(ap_mask))
-    return batch, to(target), to(ap_mask)
+    return batch, to(target), to(is_labelled)
 
 
 def subsample(rows: np.ndarray, limit: int, rng: np.random.Generator | None) -> np.ndarray:
@@ -759,13 +762,14 @@ def score(cache: Cache, test_scans: np.ndarray, mu: list[np.ndarray],
         return pd.DataFrame([{
             "model": name,
             **{column: float("nan") for column in ("mae", "rmse", "r2", "r2_log")},
-            **selection_metrics(test_frame, np.concatenate(mu)),
+            **selection_metrics(test_frame, labelled(cache, test_scans, mu)),
             "coverage_50": float("nan"), "coverage_90": float("nan"),
             "mean_spread_log1p": float("nan"),
         }])
-    log_mean = scale.log1p_throughput(np.concatenate(mu))
-    log_spread = np.exp(0.5 * np.concatenate(log_var)) * scale.target_std
-    throughput = np.clip(np.expm1(log_mean), 0.0, None)
+    mu, log_var = (labelled(cache, test_scans, values) for values in (mu, log_var))
+    log_mean = scale.log1p_throughput(mu)
+    log_spread = np.exp(0.5 * log_var) * scale.target_std
+    throughput = throughput_mbps(mu, scale)
 
     miss = np.abs(np.log1p(test_frame[LABEL_COL].to_numpy()) - log_mean)
     return pd.DataFrame([{
@@ -778,11 +782,23 @@ def score(cache: Cache, test_scans: np.ndarray, mu: list[np.ndarray],
 
 
 def ap_frame(cache: Cache, positions: np.ndarray) -> pd.DataFrame:
-    """One row per discovered AP of the given scans: the two columns common.evaluate
+    """One row per labelled AP of the given scans: the two columns common.evaluate
     scores, which are the scan it belongs to and the throughput it delivered."""
     rows = [{SCAN_COL: cache.scans[i].scan_id, LABEL_COL: float(label)}
-            for i in positions for label in cache.scans[i].labels]
+            for i in positions for label in cache.scans[i].labels if np.isfinite(label)]
     return pd.DataFrame(rows)
+
+
+def labelled(cache: Cache, positions: np.ndarray, per_scan: list[np.ndarray]) -> np.ndarray:
+    """The per-AP values of the given scans, laid end to end as ap_frame lays
+    its rows: only the APs that carry a label."""
+    return np.concatenate([values[np.isfinite(cache.scans[i].labels)]
+                           for i, values in zip(positions, per_scan)])
+
+
+def throughput_mbps(standardised_mean: np.ndarray, scale: Scale) -> np.ndarray:
+    """The median of a prediction: expm1 of its log1p mean, never below zero."""
+    return np.clip(np.expm1(scale.log1p_throughput(standardised_mean)), 0.0, None)
 
 
 def main() -> int:

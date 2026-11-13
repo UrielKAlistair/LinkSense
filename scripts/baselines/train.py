@@ -267,7 +267,7 @@ def prediction_rows(test, predictions, fold):
     """The fold's test rows: the identifiers and labels, the columns the slices
     are cut on, and one pred_* column per model and heuristic."""
     keep = ["topology_id", "scan_id", "ap_index", "label_throughput_mbps",
-            "gt_n_aps", "gt_n_hotspots", "feat_ap_rssi_mean"]
+            "gt_n_aps", "feat_ap_rssi_mean"]
     rows = test[[c for c in keep if c in test.columns]].copy()
     rows["fold"] = fold
     for name, p in predictions.items():
@@ -395,7 +395,7 @@ def write_stratified(preds_df: pd.DataFrame, out_dir: Path) -> None:
 def dimension_report(preds_df: pd.DataFrame, models: list[str]) -> pd.DataFrame:
     """Regret by simulator regime and full/partial passive discovery."""
     rows = []
-    for dimension in ("gt_n_aps", "gt_n_hotspots", "discovery"):
+    for dimension in ("gt_n_aps", "discovery"):
         if dimension not in preds_df:
             continue
         for value, subset in preds_df.groupby(dimension):
