@@ -34,12 +34,30 @@ Broken by the rewrite, to fix: `scripts/tests/check_observation_identity.py` imp
 `sample_candidate`, and `scripts/tests/test_models.py` imports `Run` and
 `already_done`, none of which exist any more.
 
+Pilot result (30 topologies, 150 scans, 245 runs, 6.0 min at 14 workers, 213 MB):
+
+- 6% of drawn-target runs never associated, 10% have a label of exactly 0.
+- Label quartiles 15.6 / 36.1 / 52.6 Mbit/s, mean 33.9, sd 20.7. 52 of 150 labels lie
+  in 50-60 Mbit/s: the near-empty-channel case. v1 had median 5.3. The regime draw
+  puts a third of the mass where prediction is easy; whether to reweight it (for
+  example a higher lower bound on occupancy) is a choice for the user, not made here.
+- Median 5 stations per topology, 90th percentile 25, maximum 40.
+- Noise floor, from 15 replicated scans of 5 futures each: mean absolute deviation
+  from the scan median 0.76 Mbit/s, mean within-scan sd 1.1. Small sample; the full
+  sweep gives 500 such scans.
+
+**The full sweep is running** since 07:10 IST: 1,000 topologies, 8 workers, into
+`data/runs_v2`, log `logs/sweep_v2.log`, started by the first session as a background
+job. Expect about 8,200 runs at roughly 1,400 an hour, so it ends near 13:00. It
+resumes if restarted with the same command (in `run_sweep.py`'s docstring, plus
+`LD_LIBRARY_PATH`, `--workers 8`). Topologies finish roughly in order, so a cache of
+what exists at any time is a valid smaller corpus. Check `sensors` now and then; the
+rule on temperature above applies.
+
 Not done, in priority order (section 4 gives the detail):
 
-1. Read the pilot (unassociated fraction, label histogram, runtime tail, how often the
-   drawn target goes undiscovered by the projection), then launch the full sweep in
-   the background into `data/runs_v2` with the command in `run_sweep.py`'s docstring
-   (set `LD_LIBRARY_PATH` as below).
+1. While the sweep runs: cache what exists (`scripts/tf/cache_dataset.py data/runs_v2
+   --out data/cache_v2`), and get `baselines/train.py` and `tf/train.py` running on it.
 2. `parse_scans.py`, `cache_dataset.py`, `build_datatable.py`, `tf/train.py`,
    `common/evaluate.py` and `baselines/train.py` are edited for v2 (unlabelled APs are
    NaN and masked out of the loss and the scores; checkpoints and grids are selected
