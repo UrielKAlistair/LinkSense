@@ -318,3 +318,23 @@ the v1 simulator, which was tuned to make AP selection non-trivial; these descri
   cannot tell that length, since session and pause lengths are exponential, so
   the replicates that measure the floor redraw them at the join. The corpus runs
   (`__draw`, `__ap`, `__f`) do not use the flag and are unchanged.
+- **Time-scrambled control (`tf/train.py --scramble-time`):** the frame model is
+  trained and scored on scans whose frame offsets, pass order and carrier-sense
+  sample order are drawn at random, which leaves each dwell's frames and
+  aggregates intact. It measures what the model gains from time order. Per-frame
+  idle gaps are kept: they are a property of each frame, not of the order.
+
+# Pilot: heavy-tailed sessions
+
+- **Session and pause lengths (`sessionShape`):** Pareto of shape 1.5 at the same
+  means as the exponential ones, with every flow started in the long-run state
+  of its on/off process. It changes one property of the corpus, whether a
+  period's age tells how long it will go on, and nothing else. The shape is a
+  choice: 1.5 is what Crovella and Bestavros (1997) report for user think times
+  on a wired network in 1995; no measurement of Wi-Fi session persistence at the
+  scale of seconds was found.
+- **Replicated futures under heavy tails** redraw each period in force at the
+  join given its age, so the label spread includes what the observation cannot
+  tell about how long the traffic it heard goes on.
+- **Pilot size:** the first 300 topologies of the v2 plan, so each pilot scan
+  has a v2 twin with the same deployment, client and regime.

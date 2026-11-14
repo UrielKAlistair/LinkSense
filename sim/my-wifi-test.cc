@@ -66,6 +66,9 @@ namespace
 //   rngSeed            seed for ns-3's radio randomness and for background
 //                      traffic up to the join
 //   futureSeed         seed for background traffic after the join
+//   sessionShape       0 draws session and pause lengths from exponentials;
+//                      above 1 it is the shape of the Pareto law they are
+//                      drawn from instead, at the same means
 //   redrawSessions     1 also redraws, at the join, how long each station
 //                      stays in the session or pause it is in
 //   printLossMatrix    1 prints the loss between every pair of nodes (APs,
@@ -187,6 +190,7 @@ struct RunConfig
     uint32_t topologySeed{1};
     uint32_t rngSeed{1};
     uint32_t futureSeed{1};
+    double sessionShape{0.0};
     bool redrawSessions{false};
     bool printLossMatrix{false};
     bool printSessionsAtJoin{false};
@@ -268,6 +272,9 @@ ParseRunConfig(int argc, char* argv[])
     cmd.AddValue("futureSeed",
                  "seeds background traffic after the candidate joins",
                  config.futureSeed);
+    cmd.AddValue("sessionShape",
+                 "0 for exponential session and pause lengths, or the Pareto shape (above 1)",
+                 config.sessionShape);
     cmd.AddValue("redrawSessions",
                  "1 redraws the length of every session and pause in force at the join",
                  config.redrawSessions);
@@ -754,11 +761,13 @@ class ObservationRecorder
 // Background traffic.
 //
 // Every background station owns one flow, uplink or downlink, over UDP or TCP.
-// The flow alternates sessions and pauses of exponentially distributed length.
-// Inside a session its sender offers packets at exponentially distributed
-// gaps, a Poisson stream at the station's offered load. A TCP flow offers the
-// same stream to a TCP socket, which then paces what reaches the air and drops
-// what its buffer cannot hold.
+// The flow alternates sessions and pauses. Their lengths are exponential, or,
+// with sessionShape, Pareto with the same means: a heavy-tailed period that
+// has lasted long is likely to last longer still, where an exponential one
+// forgets its age. Inside a session the sender offers packets at exponentially
+// distributed gaps, a Poisson stream at the station's offered load. A TCP flow
+// offers the same stream to a TCP socket, which then paces what reaches the
+// air and drops what its buffer cannot hold.
 //
 // Each station draws from two generators of its own: one for every draw made
 // before the candidate joins, seeded from topologySeed and rngSeed, and one
@@ -780,10 +789,12 @@ struct BackgroundFlow
     double sessionEndS;
     bool isInSession;
     EventId nextSession;
+    double periodStartS; // when the session or pause in force began
 };
 
 std::vector<TrafficStreams> gTrafficStreams;
 std::vector<BackgroundFlow> gFlows;
+double gSessionShape = 0.0;
 
 std::mt19937&
 TrafficRng(std::size_t sta)
@@ -798,7 +809,73 @@ ExponentialDraw(double mean, std::size_t sta)
     return std::exponential_distribution<double>(1.0 / mean)(TrafficRng(sta));
 }
 
+// A Pareto length of the given shape whose smallest value is `scale`.
+double
+ParetoDraw(double scale, double shape, std::size_t sta)
+{
+    double u = 1.0 - std::uniform_real_distribution<double>(0.0, 1.0)(TrafficRng(sta));
+    return scale * std::pow(u, -1.0 / shape);
+}
+
+// The smallest length of the Pareto law of shape sessionShape with this mean.
+double
+ParetoScale(double mean)
+{
+    return mean * (gSessionShape - 1.0) / gSessionShape;
+}
+
+// The length of a session or pause that starts now.
+double
+PeriodDraw(double mean, std::size_t sta)
+{
+    return gSessionShape == 0.0 ? ExponentialDraw(mean, sta)
+                                : ParetoDraw(ParetoScale(mean), gSessionShape, sta);
+}
+
+// What remains of the period a flow is found in when it starts, a random
+// moment of a process that has been running for ever. A moment falls in a
+// period with a chance proportional to the period's length, which for a Pareto
+// law lowers the shape by one, and falls anywhere inside it equally.
+double
+RemainingAtStart(double mean, std::size_t sta)
+{
+    double now = Simulator::Now().GetSeconds();
+    if (gSessionShape == 0.0)
+    {
+        gFlows[sta].periodStartS = now;
+        return ExponentialDraw(mean, sta);
+    }
+    double length = ParetoDraw(ParetoScale(mean), gSessionShape - 1.0, sta);
+    double age = length * std::uniform_real_distribution<double>(0.0, 1.0)(TrafficRng(sta));
+    gFlows[sta].periodStartS = now - age;
+    return length - age;
+}
+
+// What remains of the period in force, drawn afresh given how long it has
+// already lasted.
+double
+RemainingGivenAge(double mean, std::size_t sta)
+{
+    if (gSessionShape == 0.0)
+    {
+        return ExponentialDraw(mean, sta);
+    }
+    double age = Simulator::Now().GetSeconds() - gFlows[sta].periodStartS;
+    return ParetoDraw(std::max(age, ParetoScale(mean)), gSessionShape, sta) - age;
+}
+
 void StartSession(std::size_t sta);
+
+// Puts the flow in a pause of the given length. ns-3 cannot schedule past
+// about 292 years, which a heavy-tailed draw can exceed, so a pause that
+// outlasts the simulation is cut to its length.
+void
+BeginPause(std::size_t sta, double lengthS)
+{
+    gFlows[sta].isInSession = false;
+    gFlows[sta].nextSession =
+        Simulator::Schedule(Seconds(std::min(lengthS, kSimulationStopS)), &StartSession, sta);
+}
 
 // Sends one packet and schedules the next, or starts a pause once the session
 // has run out.
@@ -808,40 +885,46 @@ SendInSession(std::size_t sta)
     BackgroundFlow& flow = gFlows[sta];
     if (Simulator::Now().GetSeconds() >= flow.sessionEndS)
     {
-        flow.isInSession = false;
-        flow.nextSession =
-            Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
+        flow.periodStartS = Simulator::Now().GetSeconds();
+        BeginPause(sta, PeriodDraw(flow.meanPauseS, sta));
         return;
     }
     flow.source->Send(Create<Packet>(kPacketSize));
     Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPacketGapS, sta)), &SendInSession, sta);
 }
 
+// Puts the flow in a session of the given length and sends its first packet.
 void
-StartSession(std::size_t sta)
+BeginSession(std::size_t sta, double lengthS)
 {
     gFlows[sta].isInSession = true;
-    gFlows[sta].sessionEndS =
-        Simulator::Now().GetSeconds() + ExponentialDraw(gFlows[sta].meanSessionS, sta);
+    gFlows[sta].sessionEndS = Simulator::Now().GetSeconds() + lengthS;
     SendInSession(sta);
 }
 
-// Redraws how long the flow stays in the session or pause it is in. Both
-// lengths are exponential, so what remains of one is distributed like a new
-// one, and the redrawn future is as likely as the one it replaces.
+void
+StartSession(std::size_t sta)
+{
+    gFlows[sta].periodStartS = Simulator::Now().GetSeconds();
+    BeginSession(sta, PeriodDraw(gFlows[sta].meanSessionS, sta));
+}
+
+// Redraws how long the flow stays in the session or pause it is in, given how
+// long it has been in it, so the redrawn future is as likely as the one it
+// replaces.
 void
 RedrawSession(std::size_t sta)
 {
     BackgroundFlow& flow = gFlows[sta];
     if (flow.isInSession)
     {
-        flow.sessionEndS = Simulator::Now().GetSeconds() + ExponentialDraw(flow.meanSessionS, sta);
+        flow.sessionEndS =
+            Simulator::Now().GetSeconds() + RemainingGivenAge(flow.meanSessionS, sta);
     }
     else
     {
         flow.nextSession.Cancel();
-        flow.nextSession =
-            Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
+        BeginPause(sta, RemainingGivenAge(flow.meanPauseS, sta));
     }
 }
 
@@ -855,12 +938,11 @@ StartFlow(std::size_t sta)
     double sessionShare = flow.meanSessionS / (flow.meanSessionS + flow.meanPauseS);
     if (std::uniform_real_distribution<double>(0.0, 1.0)(TrafficRng(sta)) < sessionShare)
     {
-        StartSession(sta);
+        BeginSession(sta, RemainingAtStart(flow.meanSessionS, sta));
     }
     else
     {
-        flow.nextSession =
-            Simulator::Schedule(Seconds(ExponentialDraw(flow.meanPauseS, sta)), &StartSession, sta);
+        BeginPause(sta, RemainingAtStart(flow.meanPauseS, sta));
     }
 }
 
@@ -1000,6 +1082,7 @@ int
 main(int argc, char* argv[])
 {
     RunConfig config = ParseRunConfig(argc, argv);
+    gSessionShape = config.sessionShape;
     RngSeedManager::SetSeed(config.rngSeed);
     Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(kTcpSegmentBytes));
 
@@ -1227,7 +1310,8 @@ main(int argc, char* argv[])
                           traffic.meanPauseS,
                           0.0,
                           false,
-                          EventId()});
+                          EventId(),
+                          0.0});
         std::uniform_real_distribution<double> phase(0.0, meanPacketGapS);
         Simulator::ScheduleWithContext(
             sender->GetId(),
@@ -1372,6 +1456,7 @@ main(int argc, char* argv[])
     metadata << "    \"candidate_seed\": " << config.candidateSeed << ",\n";
     metadata << "    \"rng_seed\": " << config.rngSeed << ",\n";
     metadata << "    \"future_seed\": " << config.futureSeed << ",\n";
+    metadata << "    \"session_shape\": " << config.sessionShape << ",\n";
     metadata << "    \"redraw_sessions\": " << (config.redrawSessions ? 1 : 0) << ",\n";
     metadata << "    \"n_cols\": " << config.nCols << ",\n";
     metadata << "    \"n_rooms\": " << kRoomRows * config.nCols << ",\n";

@@ -70,6 +70,7 @@ from scripts.tf.layers import TAG_MODES, CellBatch  # noqa: E402
 from scripts.tf.target_ap_model import TargetAPModel  # noqa: E402
 from scripts.common.evaluate import (LABEL_COL, SCAN_COL, all_metrics,  # noqa: E402
                                      selection_metrics, validation_selection_key)
+from scripts.common.projection import SCAN_CHANNELS  # noqa: E402
 from scripts.common.splits import N_FOLDS, split_rows_by_topology  # noqa: E402
 
 CellModel = JointAPModel | TargetAPModel | BinnedModel
@@ -696,6 +697,10 @@ def make_batch(scans: list[CachedScan], scale: Scale, args: argparse.Namespace,
         is_labelled[g, :aps] = np.isfinite(scan.labels)
         target[g, :aps] = scale.target(np.nan_to_num(scan.labels))
 
+    if args.scramble_time:
+        offsets, dwell, cca = scramble_time(offsets, dwell, cca, len(scans[0].dwell_channel),
+                                            rng or np.random.default_rng(0))
+
     to = lambda array: torch.from_numpy(array).to(args.device)  # noqa: E731
     batch = CellBatch(
         frames=to(frames), frame_offsets=to(offsets), frame_categories=to(categories),
@@ -706,6 +711,22 @@ def make_batch(scans: list[CachedScan], scale: Scale, args: argparse.Namespace,
         cell_mask=to(cell_mask), descriptors=to(descriptors),
         ap_channel=to(ap_channel), ap_identity=to(ap_identity), ap_mask=to(ap_mask))
     return batch, to(target), to(is_labelled)
+
+
+def scramble_time(offsets: np.ndarray, dwell: np.ndarray, cca: np.ndarray, n_dwells: int,
+                  rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A batch's time coordinates with what they say about time removed.
+
+    Every frame takes a random offset in its dwell, every scan has its passes
+    over the channels renumbered at random, and every cell's carrier-sense
+    samples are shuffled. Each cell keeps its frames and its channel, so the
+    scan reads as the same bag of dwells with no order among or inside them.
+    """
+    n_channels = len(SCAN_CHANNELS)
+    passes = np.stack([rng.permutation(n_dwells // n_channels) for _ in dwell])
+    renumbered = np.take_along_axis(passes, dwell // n_channels, axis=1) * n_channels
+    return (rng.random(len(offsets), dtype=np.float32), renumbered + dwell % n_channels,
+            rng.permuted(cca, axis=-1))
 
 
 def subsample(rows: np.ndarray, limit: int, rng: np.random.Generator | None) -> np.ndarray:
@@ -830,6 +851,10 @@ def main() -> int:
     parser.add_argument("--no-identity-tag", action="store_true",
                         help="drop the per-AP identity tag from the cell and question "
                              "vectors; for target_ap, drop the role tag instead")
+    parser.add_argument("--scramble-time", action="store_true",
+                        help="hand the model each scan with its time coordinates "
+                             "drawn at random: frame offsets, the order of the "
+                             "passes, and the order of carrier-sense samples")
     parser.add_argument("--fixed-role-codes", action="store_true",
                         help="for target_ap, use fixed orthogonal role directions "
                              "instead of learned role embeddings")

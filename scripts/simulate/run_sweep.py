@@ -88,6 +88,9 @@ def parse_args():
     parser.add_argument("--n-topologies", type=int, default=1000)
     parser.add_argument("--workers", type=int, default=14)
     parser.add_argument("--sweep-seed", type=int, default=1234)
+    parser.add_argument("--session-shape", type=float, default=0.0,
+                        help="Pareto shape of session and pause lengths; "
+                             "0 keeps them exponential")
     parser.add_argument("--timeout", type=float, default=1800.0,
                         help="seconds one run may take")
     return parser.parse_args()
@@ -120,6 +123,7 @@ def plan_scans(args) -> list[Scan]:
             scans.append(Scan(
                 tag=f"t{index:05d}__c{candidate:02d}",
                 arguments={**topology,
+                           "sessionShape": args.session_shape,
                            "candidateSeed": rng.randrange(1, 2**31 - 1),
                            "rngSeed": rng.randrange(1, 2**31 - 1)},
                 is_matched=index % MATCHED_EVERY == 0,
@@ -164,7 +168,11 @@ def simulate_scan(args, scan: Scan) -> tuple[int, int]:
         extras = [(f"{scan.tag}__ap{ap}", {"targetAP": ap})
                   for ap in range(scan.arguments["nAPs"]) if ap != target]
     elif scan.is_replicated:
-        extras = [(f"{scan.tag}__f{future}", {"targetAP": target, "futureSeed": future})
+        # Under heavy-tailed sessions a future also redraws, given its age,
+        # how long each period in force at the join goes on.
+        is_redrawn = int(scan.arguments["sessionShape"] > 0)
+        extras = [(f"{scan.tag}__f{future}", {"targetAP": target, "futureSeed": future,
+                                              "redrawSessions": is_redrawn})
                   for future in range(2, FUTURES_PER_REPLICATED_SCAN + 1)]
     outcomes = [simulate(args, tag, scan.arguments, {**extra, "captureObs": 0})
                 for tag, extra in extras]
