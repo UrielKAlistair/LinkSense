@@ -338,3 +338,6 @@ the v1 simulator, which was tuned to make AP selection non-trivial; these descri
   tell about how long the traffic it heard goes on.
 - **Pilot size:** the first 300 topologies of the v2 plan, so each pilot scan
   has a v2 twin with the same deployment, client and regime.
+- **Per-station check (`scratch_v2/station_features.py`):** airtime is attributed
+  by transmitter address; frames without one count as overhead nobody owns. The
+  five largest transmitters are kept as columns; five is a choice.
